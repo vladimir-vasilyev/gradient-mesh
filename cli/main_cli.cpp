@@ -59,6 +59,7 @@ static void printUsage(const char* prog) {
         "Usage: %s [--input path.ppm|.png] [--out-prefix name] [--rows N] [--cols N]\n"
         "          [--pyramid-levels N] [--margin px] [--width W --height H]\n"
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
+        "          [--tangent-prior W]\n"
         "          [--outer-iters N] [--gn-iters N] [--samples N]\n"
         "  With no --input, a synthetic shaded-sphere test image is generated so the\n"
         "  optimizer can be exercised without any external files.\n"
@@ -88,6 +89,7 @@ int main(int argc, char** argv) {
         else if (a == "--smooth-color") opts.smoothWeightColor = std::stod(next());
         else if (a == "--color-ridge") opts.colorDerivRidge = std::stod(next());
         else if (a == "--boundary-weight") opts.boundaryWeight = std::stod(next());
+        else if (a == "--tangent-prior") opts.geomTangentPriorWeight = std::stod(next());
         else if (a == "--outer-iters") opts.outerIterationsPerLevel = std::stoi(next());
         else if (a == "--gn-iters") opts.geomGaussNewtonItersPerOuter = std::stoi(next());
         else if (a == "--samples") opts.samplesPerPatchEdge = std::stoi(next());
@@ -138,14 +140,18 @@ int main(int argc, char** argv) {
 
     std::printf("Wrote %s_reconstruction.ppm and %s_mesh.svg\n", outPrefix.c_str(), outPrefix.c_str());
 
-    // Diagnostic dump of control-point positions (for overlay visualization).
+    // Diagnostic dump of control-point positions AND free tangents (for
+    // overlay visualization / inspecting whether Pu,Pv actually moved away
+    // from their initial finite-difference seed).
     FILE* mf = std::fopen((outPrefix + "_mesh_points.csv").c_str(), "w");
     if (mf) {
         std::fprintf(mf, "rows,%d,cols,%d\n", mesh.rows, mesh.cols);
+        std::fprintf(mf, "row,col,x,y,pu_x,pu_y,pv_x,pv_y\n");
         for (int r = 0; r < mesh.rows; ++r)
             for (int c = 0; c < mesh.cols; ++c) {
-                Vec2 p = mesh.at(r, c).P;
-                std::fprintf(mf, "%d,%d,%.4f,%.4f\n", r, c, p.x, p.y);
+                const MeshVertex& mv = mesh.at(r, c);
+                std::fprintf(mf, "%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r, c, mv.P.x, mv.P.y,
+                             mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y);
             }
         std::fclose(mf);
     }

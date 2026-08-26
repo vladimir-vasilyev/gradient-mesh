@@ -51,11 +51,11 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // Exact cubic-Bezier control points [B0,B1,B2,B3] (image pixel coords) of
 // the Ferguson-patch-edge curve between two ADJACENT mesh vertices (same
 // row, adjacent col -- or same col, adjacent row). This is the Hermite
-// (position + derived tangent) -> Bezier conversion: B0=P0, B1=P0+T0/3,
-// B2=P1-T1/3, B3=P1, using whichever of tangentU/tangentV runs along that
-// edge. It is exact, not an approximation -- the same math the optimizer's
-// patch surface itself is built from (see FergusonPatch.h). Returns an
-// empty array if the two vertices aren't grid-adjacent or there's no mesh.
+// (position + free tangent) -> Bezier conversion: B0=P0, B1=P0+T0/3,
+// B2=P1-T1/3, B3=P1, using whichever of Pu/Pv runs along that edge. It is
+// exact, not an approximation -- the same math the optimizer's patch
+// surface itself is built from (see FergusonPatch.h). Returns an empty
+// array if the two vertices aren't grid-adjacent or there's no mesh.
 - (NSArray<NSValue*>*)meshEdgeBezierFromRow:(NSInteger)r0 col:(NSInteger)c0
                                        toRow:(NSInteger)r1 col:(NSInteger)c1;
 
@@ -64,13 +64,12 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // hasBoundary is NO (i.e. only the raw traced polygon exists so far).
 - (NSArray<NSArray<NSValue*>*>*)fittedBoundaryCurves;
 
-// Raw derived geometry tangents at a control point (see GradientMesh.h:
-// Pu/Pv are centered-finite-difference derivatives of neighboring
-// positions, NOT free optimization unknowns -- this is the "Known
-// simplifications" item). Returned as (dx,dy) DISPLACEMENT vectors in
-// image pixel units, not absolute points -- add to the vertex position
-// yourself for an arrow endpoint. tangentU runs along increasing column
-// (u/horizontal), tangentV along increasing row (v/vertical).
+// The free geometry tangents Pu/Pv at a control point -- independent
+// optimization unknowns (see GradientMesh.h's MeshVertex comment), not
+// derived from neighboring positions any more. Returned as (dx,dy)
+// DISPLACEMENT vectors in image pixel units, not absolute points -- add to
+// the vertex position yourself for an arrow endpoint. Pu runs along
+// increasing column (u/horizontal), Pv along increasing row (v/vertical).
 - (NSPoint)meshVertexTangentUAtRow:(NSInteger)row col:(NSInteger)col;
 - (NSPoint)meshVertexTangentVAtRow:(NSInteger)row col:(NSInteger)col;
 

@@ -215,12 +215,12 @@
     }
 }
 
-// Diagnostic overlay: draws the DERIVED tangentU (orange) and tangentV
-// (cyan) at every control point as arrows. These are what actually
-// determine each patch edge's curvature (see appendCurveInto:...) --
-// visualizing them directly shows, e.g., a near-rectangular mesh's
-// tangents pointing almost exactly along the grid axes with near-uniform
-// length, versus tangents that have started to swing to track an edge.
+// Diagnostic overlay: draws the FREE tangent unknowns Pu (orange) and Pv
+// (cyan) at every control point as arrows. These are independently
+// optimized (not derived from position any more) and directly determine
+// each patch edge's curvature (see appendCurveInto:...) -- visualizing them
+// shows, e.g., a vertex whose tangent has swung to align with a nearby
+// edge, versus one still close to its axis-aligned initial estimate.
 // Scaled down (0.35x) so arrows don't just retrace the neighbor-to-neighbor
 // mesh-grid spacing.
 - (void)drawTangents {

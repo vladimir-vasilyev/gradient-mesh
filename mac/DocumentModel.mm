@@ -194,13 +194,14 @@ static NSError* gmError(NSString* msg) {
     Vec2 T0, T1;
     if (r0 == r1 && c1 == c0 + 1) {
         // horizontal edge: position varies with col (u); the relevant
-        // derivative is tangentU at each end.
-        T0 = _mesh->tangentU((int)r0, (int)c0);
-        T1 = _mesh->tangentU((int)r1, (int)c1);
+        // derivative is the FREE Pu at each end (Pu/Pv are optimized
+        // unknowns now, not derived -- see GradientMesh.h/MeshOptimizer.h).
+        T0 = _mesh->at((int)r0, (int)c0).Pu;
+        T1 = _mesh->at((int)r1, (int)c1).Pu;
     } else if (c0 == c1 && r1 == r0 + 1) {
-        // vertical edge: position varies with row (v); tangentV at each end.
-        T0 = _mesh->tangentV((int)r0, (int)c0);
-        T1 = _mesh->tangentV((int)r1, (int)c1);
+        // vertical edge: position varies with row (v); the free Pv at each end.
+        T0 = _mesh->at((int)r0, (int)c0).Pv;
+        T1 = _mesh->at((int)r1, (int)c1).Pv;
     } else {
         return @[]; // not a grid-adjacent pair
     }
@@ -233,13 +234,13 @@ static NSError* gmError(NSString* msg) {
 
 - (NSPoint)meshVertexTangentUAtRow:(NSInteger)row col:(NSInteger)col {
     if (!_mesh) return NSZeroPoint;
-    Vec2 t = _mesh->tangentU((int)row, (int)col);
+    Vec2 t = _mesh->at((int)row, (int)col).Pu; // free unknown, not derived
     return NSMakePoint(t.x, t.y);
 }
 
 - (NSPoint)meshVertexTangentVAtRow:(NSInteger)row col:(NSInteger)col {
     if (!_mesh) return NSZeroPoint;
-    Vec2 t = _mesh->tangentV((int)row, (int)col);
+    Vec2 t = _mesh->at((int)row, (int)col).Pv; // free unknown, not derived
     return NSMakePoint(t.x, t.y);
 }
 

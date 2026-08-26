@@ -23,20 +23,36 @@ namespace gmcore {
 
 struct OptimizerOptions {
     int samplesPerPatchEdge = 6;      // data-term sampling density per patch, per axis
-    double smoothWeightGeom = 2.0;    // 2nd-difference regularization on control-point positions.
-                                       // Empirically tuned: much above this (the original default
-                                       // was 40) the regularizer dominates the -- comparatively
-                                       // small, once colors have absorbed most of the local error --
-                                       // data-term gradient, and mesh-lines stop bending to follow
-                                       // internal color/gradient boundaries at all, no matter how
-                                       // sharp the underlying edge is. See README "Known
-                                       // simplifications" for the related line-search-vs-objective
-                                       // bug this was found alongside.
+    double smoothWeightGeom = 0.02;   // 2nd-difference regularization on control-point positions.
+                                       // Empirically tuned (was 40, then 2, now 0.02 -- see README
+                                       // "Known simplifications" for the full history): even at 2,
+                                       // a *coarse* mesh's whole interior line still couldn't snap
+                                       // onto a sharp internal edge the way the paper's Fig. 4 shows
+                                       // -- position moved sub-pixel amounts regardless of how much
+                                       // data-term signal was actually present (confirmed via
+                                       // GMCORE_DEBUG_GEOM instrumentation, not just guessed). This
+                                       // value was found together with making Pu/Pv free unknowns
+                                       // (see GradientMesh.h) and adding geomTangentPriorWeight
+                                       // below to keep THOSE grounded: with geomTangentPriorWeight
+                                       // also set to ~0 (no grounding at all for the free tangents),
+                                       // this produced visibly garbled reconstructions (wildly
+                                       // inconsistent per-vertex Pu/Pv, folded-looking patches) even
+                                       // though the coarse-sample RMSE metric still looked fine --
+                                       // so a low smoothWeightGeom is only safe paired with a
+                                       // meaningfully nonzero geomTangentPriorWeight.
     double smoothWeightColor = 4.0;   // 2nd-difference regularization on control-point base color
     double colorDerivRidge = 1e-3;    // small ridge on Cu,Cv,Cuv for a well-posed linear solve
     double boundaryWeight = 200.0;    // soft pull of boundary vertices back onto their spline
     double vectorLineWeight = 60.0;   // soft alignment of nearby mesh edges to user guide lines
     double vectorLineInfluenceRadius = 25.0; // pixels, in the *current pyramid level's* scale
+    double geomTangentPriorWeight = 0.6; // soft pull of free Pu/Pv toward the position-implied
+                                       // finite-difference estimate (GradientMesh::tangentU/V),
+                                       // re-anchored every GN sub-iteration. 0 = fully free (as in
+                                       // the paper); very large = old fully-derived behavior. Needed
+                                       // because Pu/Pv are now free unknowns (see GradientMesh.h's
+                                       // MeshVertex comment) and, unlike a position, a tangent has no
+                                       // sensible "pull toward zero" prior -- zero would collapse the
+                                       // patch -- so this grounds them near a sane default instead.
     int outerIterationsPerLevel = 8;
     int geomGaussNewtonItersPerOuter = 3;
     int cgMaxIterations = 200;

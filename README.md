@@ -112,10 +112,11 @@ multi-person, multi-month effort. To get something real, working, and checkable 
 this project's scope, a few deliberate simplifications were made -- all noted in code
 comments at the relevant spot too:
 
-* **Geometry tangents are derived, not free.** Each control point's position `P` is a
-  free unknown; its tangents `Pu`, `Pv` and twist `Puv` are computed from neighboring
-  positions via centered finite differences (Catmull-Rom style) rather than kept as
-  independent optimization variables. Color keeps the full independent `(C, Cu, Cv, Cuv)`
+* **Twist (`Puv`) is derived, not free.** Position `P` and tangents `Pu`, `Pv` are all
+  free per-vertex unknowns, jointly refined by the geometry Gauss-Newton step (see "Free
+  Pu/Pv tangents" below) -- only the twist term is still computed from neighboring
+  positions via centered finite differences (Catmull-Rom style) rather than kept as an
+  independent optimization variable. Color keeps the full independent `(C, Cu, Cv, Cuv)`
   unknown set, which is what actually gives a gradient mesh its shading expressiveness.
 * **Block-coordinate descent, not one joint solve.** Colors enter the reconstruction
   error *linearly*, so they're solved exactly with one sparse linear system per outer
@@ -130,9 +131,6 @@ comments at the relevant spot too:
   Lazy-Snapping-style interactive segmentation tool for isolating the object; this
   project's boundary tool is just click-to-add-a-point polygon tracing, fitted with cubic
   Beziers per side afterward.
-* **Mesh-edit overlay draws the control polygon**, i.e. straight lines between
-  neighboring control points, not the true curved iso-parameter lines of the Hermite
-  surface -- a common simplification in mesh editors.
 * **SVG mesh-gradient export uses one `<meshgradient>` per patch** rather than one mesh
   object with SVG2's inter-patch implicit-shared-edge stop omission encoding. A mesh
   gradient only paints inside its own patch boundary, so adjacent patches still tile
@@ -269,17 +267,78 @@ decaying over outer iterations), more outer/GN iterations at coarse
 resolutions, and/or promoting `Pu`/`Pv` from derived (finite-difference)
 values to free per-vertex unknowns as the paper actually does (see "Known
 simplifications" above) -- derived tangents mechanically limit how sharply
-one point can bend without its finite-difference neighbors fighting it. Not
-yet implemented; flagging as an open item rather than guessing at a new
-default without more evidence.
+one point can bend without its finite-difference neighbors fighting it. The
+last option is what was actually implemented -- see "Fixed: Pu/Pv promoted
+to free unknowns" below.
 
-**New diagnostic: tangent visualization.** The app now has a "Show tangents"
-checkbox that draws each control point's derived `tangentU` (orange) and
-`tangentV` (cyan) as arrows (`-[DocumentModel meshVertexTangentUAtRow:col:]`
-/ `...TangentVAtRow:col:]`, drawn by `-[CanvasView drawTangents]`) -- useful
+**Diagnostic: tangent visualization.** The app has a "Show tangents"
+checkbox that draws each control point's `Pu` (orange) and `Pv` (cyan) as
+arrows (`-[DocumentModel meshVertexTangentUAtRow:col:]` /
+`...TangentVAtRow:col:]`, drawn by `-[CanvasView drawTangents]`) -- useful
 for seeing directly whether tangents are actually swinging to track an edge
 or staying axis-aligned/uniform-length like an unbent grid, which is exactly
-the symptom found above.
+the symptom found above. (Originally these read the derived
+`tangentU`/`tangentV` estimate; now that `Pu`/`Pv` are free unknowns, they
+read the actual optimized `MeshVertex::Pu`/`Pv` fields instead, so what you
+see is what the optimizer is actually using.)
+
+### Fixed: Pu/Pv promoted to free unknowns (matching the paper)
+
+Implemented the option flagged above: `Pu` and `Pv` are no longer derived
+via finite differences -- they're free per-vertex unknowns, jointly refined
+alongside `P` by the same geometry Gauss-Newton step (`MeshVertex` gained
+`Pu`, `Pv` fields; `geomCorner()` reads them directly; `buildInitial()`
+seeds them from the old finite-difference estimate as a starting point; the
+GN unknown block grew from 2 components/vertex (`P.x,P.y`) to 6
+(`P.x,P.y,Pu.x,Pu.y,Pv.x,Pv.y`), with the corresponding Jacobian rows for
+`Pu`/`Pv` built directly from `PatchWeights`' `TangentU`/`TangentV` weights
+-- see `MeshOptimizer.cpp`). Twist (`Puv`) stays derived, unchanged.
+
+A free tangent has no sensible "pull toward zero" prior the way a color
+derivative does (`colorDerivRidge`) -- zero tangent collapses the patch.
+Tried it anyway as a control (`--tangent-prior 0`, i.e. completely
+unconstrained `Pu`/`Pv`): `Pu`/`Pv` values went chaotic (e.g. one run's `Pu.x`
+ranged from -53 to +188 across a mesh whose spacing is ~50px) and the
+rendered reconstruction came out visibly warped and torn at the silhouette,
+even though the coarse-sample RMSE metric it was fitting *improved* --
+classic overfitting to a sparse sample grid, invisible to that metric.
+Fixed by adding `geomTangentPriorWeight`: a soft ridge pulling `Pu`/`Pv`
+toward the *current* position-implied finite-difference estimate
+(`GradientMesh::tangentU/V`, recomputed fresh every GN sub-iteration), so
+the data term can pull a tangent away from that estimate where it has real
+signal to, without it drifting unboundedly where the signal is weak.
+`computeGeometryEnergy` was extended to include this term too, for the same
+line-search-consistency reason as everything else in it.
+
+With that grounding in place, `smoothWeightGeom` could be lowered much
+further (0.02, from 2) without the garbling seen above -- on the *same*
+5x5/`gradient.png` case from the table above, with `--tangent-prior 0.6`:
+
+| config | interior column's x-range (px) | reconstruction |
+|---|---|---|
+| old defaults (`smooth-geom 2`, derived tangents) | 106.4-106.9 (~0.5) | boxy, doesn't track the notch |
+| new defaults (`smooth-geom 0.02`, free tangents, `tangent-prior 0.6`) | 100.1-111.4 (~11.3) | visibly bends to follow the zigzag |
+
+Checked with a wireframe overlay (mesh-line Bezier curves drawn over
+`gradient.png`, same technique as the `CanvasView` fix above): with the new
+defaults the interior mesh column visibly kinks to trace the boundary's
+notch, instead of running as a nearly-straight vertical line down the
+middle. Re-checked for regressions: 25x25 on `gradient.png` improved too
+(final RMSE 0.0114 -> 0.0083, i.e. ~2.9 -> ~2.1 in 0-255 terms) and the
+noisy synthetic sphere (smooth image, the regression check for "did this
+break normal images") also improved (45.5% -> 52.6% RMSE reduction, no
+visible artifacts) rather than regressing. New defaults:
+`smoothWeightGeom = 0.02`, `geomTangentPriorWeight = 0.6` (new option;
+`--tangent-prior` in `gmesh_cli`).
+
+Caveat: the geometry unknown block growing 2 -> 6 components/vertex makes
+each Gauss-Newton solve noticeably more expensive (roughly an order of
+magnitude on the 25x25 case in this sandbox, ~3 minutes vs under a minute
+previously, at the CLI's higher-than-default iteration counts used for
+testing) -- the app's own defaults (8 outer iterations, 3 GN iterations/outer,
+per `OptimizerOptions`) stay fast at typical mesh sizes (9x9), but a large
+mesh with many manually-increased iterations will take noticeably longer
+than before. Not yet profiled/optimized.
 
 ## How this was tested
 

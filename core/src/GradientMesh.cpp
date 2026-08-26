@@ -31,10 +31,11 @@ Vec2 GradientMesh::twist(int row, int col) const {
 
 HermiteCorner<Vec2> GradientMesh::geomCorner(int row, int col) const {
     HermiteCorner<Vec2> hc;
-    hc.P = at(row, col).P;
-    hc.Pu = tangentU(row, col);
-    hc.Pv = tangentV(row, col);
-    hc.Puv = twist(row, col);
+    const MeshVertex& v = at(row, col);
+    hc.P = v.P;
+    hc.Pu = v.Pu;  // free unknown (see MeshVertex comment)
+    hc.Pv = v.Pv;  // free unknown
+    hc.Puv = twist(row, col); // still derived
     return hc;
 }
 
@@ -108,11 +109,32 @@ GradientMesh GradientMesh::buildInitial(int rows, int cols, const std::array<Cub
             mv.Cu = cu; mv.Cv = cv; mv.Cuv = Color{0, 0, 0};
         }
     }
+    // Third pass: seed the free geometry tangents Pu/Pv from the
+    // position-implied finite-difference estimate (all positions are
+    // already final at this point, so this can run in any order relative
+    // to the color pass above). The optimizer is then free to move them
+    // away from this starting value.
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            MeshVertex& mv = mesh.at(r, c);
+            mv.Pu = mesh.tangentU(r, c);
+            mv.Pv = mesh.tangentV(r, c);
+        }
+    }
     return mesh;
 }
 
 void GradientMesh::scalePositions(double sx, double sy) {
-    for (auto& v : vertices) { v.P.x *= sx; v.P.y *= sy; }
+    // Pu/Pv are position-derivative-scale quantities (pixels per unit
+    // parametric u/v, over a patch always spanning u,v in [0,1]) -- they
+    // must scale linearly with position when the mesh moves between
+    // pyramid levels, exactly like P itself, or the surface would come out
+    // badly distorted at the next resolution.
+    for (auto& v : vertices) {
+        v.P.x *= sx; v.P.y *= sy;
+        v.Pu.x *= sx; v.Pu.y *= sy;
+        v.Pv.x *= sx; v.Pv.y *= sy;
+    }
     for (auto& b : boundary) {
         b.p0.x *= sx; b.p0.y *= sy; b.p1.x *= sx; b.p1.y *= sy;
         b.p2.x *= sx; b.p2.y *= sy; b.p3.x *= sx; b.p3.y *= sy;

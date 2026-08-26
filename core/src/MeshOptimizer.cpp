@@ -85,6 +85,32 @@ void addSmoothnessTerms(SparseBlockMatrix& H, std::vector<double>& g, const Grad
     }
 }
 
+// Soft ridge pulling each vertex's free Pu/Pv (block subs 2,3,4,5) toward
+// the CURRENT position-implied finite-difference estimate. Re-anchored
+// every GN sub-iteration (tu/tv are recomputed from the mesh's current P
+// each call), so this is a "prior around the current linearization point",
+// not a hard constraint -- it lets the data term pull Pu/Pv away from that
+// estimate when it has real signal to, while keeping them from drifting
+// unboundedly where the signal is weak or absent. The Jacobian only
+// includes the direct d(residual)/d(Pu or Pv) = 1 term, not the indirect
+// dependence of tu/tv on neighboring P's -- same simplifying choice
+// already made for the (derived, unchanged) twist term.
+void addTangentPriorTerms(SparseBlockMatrix& H, std::vector<double>& g, const GradientMesh& mesh,
+                           double weight) {
+    if (weight <= 0.0) return;
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 0; c < mesh.cols; ++c) {
+            int i = mesh.idx(r, c);
+            const MeshVertex& mv = mesh.at(r, c);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
+            accumulateGNRow(H, g, {{i, 2, 1}}, mv.Pu.x - tu.x, weight);
+            accumulateGNRow(H, g, {{i, 3, 1}}, mv.Pu.y - tu.y, weight);
+            accumulateGNRow(H, g, {{i, 4, 1}}, mv.Pv.x - tv.x, weight);
+            accumulateGNRow(H, g, {{i, 5, 1}}, mv.Pv.y - tv.y, weight);
+        }
+    }
+}
+
 // Total weighted energy the geometry Gauss-Newton step actually minimizes:
 // data term (area-weighted reconstruction error) + smoothness + boundary +
 // vector-line terms, using the exact same residual formulas and sample
@@ -130,6 +156,19 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
         for (int r = 1; r < mesh.rows - 1; ++r) {
             Vec2 d = P[mesh.idx(r - 1, c)] - P[mesh.idx(r, c)] * 2.0 + P[mesh.idx(r + 1, c)];
             energy += opts.smoothWeightGeom * (d.x * d.x + d.y * d.y);
+        }
+    }
+
+    // Soft prior pulling the free Pu/Pv tangents toward the position-implied
+    // finite-difference estimate -- must mirror addTangentPriorTerms below
+    // exactly, for the same reason computeGeometryEnergy has to mirror the
+    // rest of the GN assembly (see this function's header comment).
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 0; c < mesh.cols; ++c) {
+            const MeshVertex& mv = mesh.at(r, c);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
+            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
+            energy += opts.geomTangentPriorWeight * (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
         }
     }
 
@@ -275,13 +314,20 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             }
         }
 
-        // 3) Refine geometry (position only) with damped Gauss-Newton + backtracking.
+        // 3) Refine geometry -- position P AND the free tangents Pu, Pv --
+        // with damped Gauss-Newton + backtracking. Each vertex now
+        // contributes a 6-wide unknown block: subs 0,1 = P.x,P.y (as
+        // before), 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y.
         for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
             SparseBlockMatrix H;
-            H.init(2, numV);
-            std::vector<double> g(numV * 2, 0.0);
-            std::vector<Vec2> P(numV);
-            for (int i = 0; i < numV; ++i) P[i] = mesh.vertices[i].P;
+            H.init(6, numV);
+            std::vector<double> g(numV * 6, 0.0);
+            std::vector<Vec2> P(numV), Pu(numV), Pv(numV);
+            for (int i = 0; i < numV; ++i) {
+                P[i] = mesh.vertices[i].P;
+                Pu[i] = mesh.vertices[i].Pu;
+                Pv[i] = mesh.vertices[i].Pv;
+            }
 
             for (int pr = 0; pr < mesh.rows - 1; ++pr) {
                 for (int pc = 0; pc < mesh.cols - 1; ++pc) {
@@ -296,12 +342,26 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                             double w = areaWeightAt(mesh, pr, pc, u, v, duv);
                             PatchWeights pw = PatchWeights::at(u, v);
 
-                            std::vector<RowEntry> rowCorners; // corner vertex + Value-weight only
+                            // corner vertex + weight for each of the 3 FREE
+                            // Hermite kinds this patch corner contributes to
+                            // pos(u,v): Value(P, sub-pair 0,1), TangentU(Pu,
+                            // sub-pair 2,3), TangentV(Pv, sub-pair 4,5) --
+                            // reusing RowEntry, with `sub` repurposed here to
+                            // mean "which sub-pair" (0/1/2), not a literal
+                            // block sub-index (buildChanneled below expands
+                            // it to the real x/y sub-indices). Twist (Puv) is
+                            // still derived, so it has no free-unknown row
+                            // here (same simplification as before -- see
+                            // addTangentPriorTerms's comment).
+                            std::vector<RowEntry> rowCorners;
+                            rowCorners.reserve(12);
                             for (int a = 0; a < 2; ++a) {
                                 for (int b = 0; b < 2; ++b) {
                                     int base = (a * 2 + b) * 4;
                                     int vert = mesh.idx(pr + b, pc + a);
-                                    rowCorners.push_back({vert, -1, pw.w[base + 0]});
+                                    rowCorners.push_back({vert, 0, pw.w[base + 0]}); // P
+                                    rowCorners.push_back({vert, 1, pw.w[base + 1]}); // Pu
+                                    rowCorners.push_back({vert, 2, pw.w[base + 2]}); // Pv
                                 }
                             }
                             double r0r = cmesh.r - ctarget.r;
@@ -312,8 +372,10 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                                 std::vector<RowEntry> row;
                                 row.reserve(rowCorners.size() * 2);
                                 for (auto& rc : rowCorners) {
-                                    row.push_back({rc.vertex, 0, -gx * rc.coeff});
-                                    row.push_back({rc.vertex, 1, -gy * rc.coeff});
+                                    int subX = rc.sub * 2 + 0;
+                                    int subY = rc.sub * 2 + 1;
+                                    row.push_back({rc.vertex, subX, -gx * rc.coeff});
+                                    row.push_back({rc.vertex, subY, -gy * rc.coeff});
                                 }
                                 return row;
                             };
@@ -326,6 +388,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             }
 
             addSmoothnessTerms(H, g, mesh, P, opts.smoothWeightGeom);
+            addTangentPriorTerms(H, g, mesh, opts.geomTangentPriorWeight);
 
             for (int i = 0; i < numV; ++i) {
                 const MeshVertex& mv = mesh.vertices[i];
@@ -356,31 +419,35 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             // Levenberg damping (scale-aware: proportional to each diagonal entry).
             for (int i = 0; i < numV; ++i) {
                 auto it = H.blocks.find(SparseBlockMatrix::key(i, i));
-                double d0 = (it != H.blocks.end()) ? it->second[0] : 1.0;
-                double d1 = (it != H.blocks.end()) ? it->second[3] : 1.0;
-                H.addScalar(i, i, 0, 0, lambda * std::max(d0, 1e-6));
-                H.addScalar(i, i, 1, 1, lambda * std::max(d1, 1e-6));
+                for (int k = 0; k < 6; ++k) {
+                    double dk = (it != H.blocks.end()) ? it->second[k * 6 + k] : 1.0;
+                    H.addScalar(i, i, k, k, lambda * std::max(dk, 1e-6));
+                }
             }
 
-            auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 2, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+            auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 6, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
 #ifdef GMCORE_DEBUG_GEOM
             double maxDelta = 0; for (double d : delta) maxDelta = std::max(maxDelta, std::abs(d));
             double gNorm = 0; for (double v : g) gNorm += v*v; gNorm = std::sqrt(gNorm);
 #endif
 
             // Backtracking must check the step against the SAME objective the
-            // step was computed to reduce (data + smoothness + boundary +
-            // vector-line energy, at the same sample density) -- not a
-            // cheaper, differently-sampled RMSE proxy, which can disagree
-            // with it and reject perfectly good steps. See
+            // step was computed to reduce (data + smoothness + tangent-prior +
+            // boundary + vector-line energy, at the same sample density) --
+            // not a cheaper, differently-sampled RMSE proxy, which can
+            // disagree with it and reject perfectly good steps. See
             // computeGeometryEnergy's comment above for why this matters.
             double baseEnergy = computeGeometryEnergy(mesh, target, vectorLines, opts);
             double alpha = 1.0;
             bool improved = false;
             for (int tries = 0; tries < 4; ++tries) {
                 for (int i = 0; i < numV; ++i) {
-                    mesh.vertices[i].P.x = P[i].x + alpha * delta[i * 2 + 0];
-                    mesh.vertices[i].P.y = P[i].y + alpha * delta[i * 2 + 1];
+                    mesh.vertices[i].P.x  = P[i].x  + alpha * delta[i * 6 + 0];
+                    mesh.vertices[i].P.y  = P[i].y  + alpha * delta[i * 6 + 1];
+                    mesh.vertices[i].Pu.x = Pu[i].x + alpha * delta[i * 6 + 2];
+                    mesh.vertices[i].Pu.y = Pu[i].y + alpha * delta[i * 6 + 3];
+                    mesh.vertices[i].Pv.x = Pv[i].x + alpha * delta[i * 6 + 4];
+                    mesh.vertices[i].Pv.y = Pv[i].y + alpha * delta[i * 6 + 5];
                 }
                 double newEnergy = computeGeometryEnergy(mesh, target, vectorLines, opts);
                 if (newEnergy <= baseEnergy) { improved = true; break; }
@@ -391,7 +458,9 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                          gi, lambda, gNorm, maxDelta, (int)improved, alpha);
 #endif
             if (!improved) {
-                for (int i = 0; i < numV; ++i) mesh.vertices[i].P = P[i]; // revert
+                for (int i = 0; i < numV; ++i) {
+                    mesh.vertices[i].P = P[i]; mesh.vertices[i].Pu = Pu[i]; mesh.vertices[i].Pv = Pv[i]; // revert
+                }
                 lambda = std::min(lambda * 4.0, 1e6);
             } else {
                 lambda = std::max(lambda * 0.6, 1e-8);
