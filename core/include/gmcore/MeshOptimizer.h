@@ -40,6 +40,21 @@ struct OptimizerOptions {
                                        // though the coarse-sample RMSE metric still looked fine --
                                        // so a low smoothWeightGeom is only safe paired with a
                                        // meaningfully nonzero geomTangentPriorWeight.
+    double smoothGeomEdgeGain = 40.0; // Makes smoothWeightGeom ANISOTROPIC: at a vertex sitting
+                                       // near a strong local image gradient, the effective
+                                       // smoothing weight is smoothWeightGeom / (1 + smoothGeomEdgeGain
+                                       // * localGradientMagnitude) (floored by smoothGeomMinFactor
+                                       // below), instead of the flat smoothWeightGeom everywhere.
+                                       // Rationale: the isotropic 2nd-difference term keeps
+                                       // neighboring control points evenly spaced, which is exactly
+                                       // what must NOT hold for two mesh-lines to squeeze together
+                                       // around a sharp edge (Fig. 4-style pinching) -- relaxing it
+                                       // specifically where the image justifies it lets that happen
+                                       // without giving up smoothing in flat regions. 0 = isotropic
+                                       // (old behavior, no relaxation).
+    double smoothGeomMinFactor = 0.05; // floor on the relaxation factor above -- never fully zero
+                                       // out smoothing even directly on the sharpest edge, so the
+                                       // geometry solve stays well-posed.
     double smoothWeightColor = 4.0;   // 2nd-difference regularization on control-point base color
     double colorDerivRidge = 1e-3;    // small ridge on Cu,Cv,Cuv for a well-posed linear solve
     double boundaryWeight = 200.0;    // soft pull of boundary vertices back onto their spline

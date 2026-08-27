@@ -59,7 +59,7 @@ static void printUsage(const char* prog) {
         "Usage: %s [--input path.ppm|.png] [--out-prefix name] [--rows N] [--cols N]\n"
         "          [--pyramid-levels N] [--margin px] [--width W --height H]\n"
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
-        "          [--tangent-prior W]\n"
+        "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--vline \"x,y;x,y;...\"]\n"
         "          [--outer-iters N] [--gn-iters N] [--samples N]\n"
         "  With no --input, a synthetic shaded-sphere test image is generated so the\n"
         "  optimizer can be exercised without any external files.\n"
@@ -73,11 +73,32 @@ int main(int argc, char** argv) {
     std::string inputPath, outPrefix = "gmesh_out";
     int rows = 9, cols = 9, pyramidLevels = 4, margin = 6, synthW = 220, synthH = 220;
     OptimizerOptions opts; // defaults; may be overridden below for experimentation
+    std::vector<VectorLine> vectorLines; // populated by --vline (testing/debugging aid, not in printUsage yet)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
         if (a == "--input") inputPath = next();
+        else if (a == "--vline") {
+            // "x0,y0;x1,y1;..." -- one guide polyline, for testing the
+            // vector-line constraint (Sec 4.3) without the GUI.
+            std::string spec = next();
+            VectorLine line;
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t semi = spec.find(';', pos);
+                std::string pair = spec.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+                size_t comma = pair.find(',');
+                if (comma != std::string::npos) {
+                    double x = std::stod(pair.substr(0, comma));
+                    double y = std::stod(pair.substr(comma + 1));
+                    line.points.push_back({x, y});
+                }
+                if (semi == std::string::npos) break;
+                pos = semi + 1;
+            }
+            if (line.points.size() >= 2) vectorLines.push_back(std::move(line));
+        }
         else if (a == "--out-prefix") outPrefix = next();
         else if (a == "--rows") rows = std::stoi(next());
         else if (a == "--cols") cols = std::stoi(next());
@@ -90,6 +111,8 @@ int main(int argc, char** argv) {
         else if (a == "--color-ridge") opts.colorDerivRidge = std::stod(next());
         else if (a == "--boundary-weight") opts.boundaryWeight = std::stod(next());
         else if (a == "--tangent-prior") opts.geomTangentPriorWeight = std::stod(next());
+        else if (a == "--edge-gain") opts.smoothGeomEdgeGain = std::stod(next());
+        else if (a == "--edge-min-factor") opts.smoothGeomMinFactor = std::stod(next());
         else if (a == "--outer-iters") opts.outerIterationsPerLevel = std::stoi(next());
         else if (a == "--gn-iters") opts.geomGaussNewtonItersPerOuter = std::stoi(next());
         else if (a == "--samples") opts.samplesPerPatchEdge = std::stoi(next());
@@ -123,7 +146,7 @@ int main(int argc, char** argv) {
     double rmseBefore = mesh.reconstructionRMSE(target, 6);
     std::printf("Initial mesh %dx%d control points, RMSE=%.5f\n", rows, cols, rmseBefore);
 
-    MeshOptimizer::optimizeCoarseToFine(mesh, target, {}, pyramidLevels, opts,
+    MeshOptimizer::optimizeCoarseToFine(mesh, target, vectorLines, pyramidLevels, opts,
         [](const OptimizerProgress& p) {
             std::printf("  [level %d/%d] iter %d/%d  RMSE=%.5f\n", p.pyramidLevel, p.totalPyramidLevels - 1,
                         p.outerIteration, p.totalOuterIterations - 1, p.rmse);

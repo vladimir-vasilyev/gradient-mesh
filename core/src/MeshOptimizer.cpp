@@ -42,6 +42,28 @@ double areaWeightAt(const GradientMesh& mesh, int pr, int pc, double u, double v
     return std::max(a, 1e-6);
 }
 
+// Anisotropic relaxation for the position-smoothness term: how much to
+// scale smoothWeightGeom DOWN at a vertex currently sitting near a strong
+// local image gradient, so the isotropic "keep evenly spaced" regularizer
+// doesn't fight a mesh-line trying to bunch up against a sharp edge (which
+// is, almost by definition, a large local departure from even spacing).
+// factor=1 in flat regions (full smoothing, same as before this existed);
+// factor -> smoothGeomMinFactor near a strong edge (smoothing mostly, but
+// not entirely, relaxed -- a hard floor keeps the geometry solve
+// well-posed instead of letting some triple go fully unregularized).
+// Recomputed fresh from the CURRENT position every time it's called (each
+// GN sub-iteration re-linearizes here, same as everywhere else in this
+// file), so it adapts as a vertex approaches an edge rather than being
+// fixed at the mesh's starting shape.
+double edgeRelaxFactor(const Image& target, const Vec2& p, double edgeGain, double minFactor) {
+    ColorGrad grad = target.sampleGradient(p.x, p.y);
+    double mag2 = grad.dx.r * grad.dx.r + grad.dx.g * grad.dx.g + grad.dx.b * grad.dx.b +
+                  grad.dy.r * grad.dy.r + grad.dy.g * grad.dy.g + grad.dy.b * grad.dy.b;
+    double mag = std::sqrt(mag2);
+    double factor = 1.0 / (1.0 + edgeGain * mag);
+    return std::max(factor, minFactor);
+}
+
 Vec2 nearestVectorLineDir(const std::vector<VectorLine>& lines, const Vec2& p, double radius, bool& found) {
     found = false;
     double bestD2 = radius * radius;
@@ -63,11 +85,18 @@ Vec2 nearestVectorLineDir(const std::vector<VectorLine>& lines, const Vec2& p, d
 }
 
 void addSmoothnessTerms(SparseBlockMatrix& H, std::vector<double>& g, const GradientMesh& mesh,
-                         const std::vector<Vec2>& P, double weight) {
+                         const std::vector<Vec2>& P, const Image& target, const OptimizerOptions& opts) {
     // second differences along u (columns) and v (rows), on x and y separately.
+    // Each triple's weight is the base smoothWeightGeom scaled down by
+    // edgeRelaxFactor at the middle vertex's current position -- see that
+    // function's comment. This is what lets two neighboring mesh-lines
+    // actually squeeze together around a sharp edge instead of the
+    // isotropic "stay evenly spaced" pull resisting it everywhere equally.
     for (int r = 0; r < mesh.rows; ++r) {
         for (int c = 1; c < mesh.cols - 1; ++c) {
             int i0 = mesh.idx(r, c - 1), i1 = mesh.idx(r, c), i2 = mesh.idx(r, c + 1);
+            double weight = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
             double rx = P[i0].x - 2 * P[i1].x + P[i2].x;
             double ry = P[i0].y - 2 * P[i1].y + P[i2].y;
             accumulateGNRow(H, g, {{i0, 0, 1}, {i1, 0, -2}, {i2, 0, 1}}, rx, weight);
@@ -77,6 +106,8 @@ void addSmoothnessTerms(SparseBlockMatrix& H, std::vector<double>& g, const Grad
     for (int c = 0; c < mesh.cols; ++c) {
         for (int r = 1; r < mesh.rows - 1; ++r) {
             int i0 = mesh.idx(r - 1, c), i1 = mesh.idx(r, c), i2 = mesh.idx(r + 1, c);
+            double weight = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
             double rx = P[i0].x - 2 * P[i1].x + P[i2].x;
             double ry = P[i0].y - 2 * P[i1].y + P[i2].y;
             accumulateGNRow(H, g, {{i0, 0, 1}, {i1, 0, -2}, {i2, 0, 1}}, rx, weight);
@@ -146,16 +177,24 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
     std::vector<Vec2> P(mesh.vertices.size());
     for (size_t i = 0; i < P.size(); ++i) P[i] = mesh.vertices[i].P;
 
+    // Must mirror addSmoothnessTerms's per-triple edgeRelaxFactor scaling
+    // exactly, for the same line-search-consistency reason noted above.
     for (int r = 0; r < mesh.rows; ++r) {
         for (int c = 1; c < mesh.cols - 1; ++c) {
-            Vec2 d = P[mesh.idx(r, c - 1)] - P[mesh.idx(r, c)] * 2.0 + P[mesh.idx(r, c + 1)];
-            energy += opts.smoothWeightGeom * (d.x * d.x + d.y * d.y);
+            int i1 = mesh.idx(r, c);
+            double w = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
+            Vec2 d = P[mesh.idx(r, c - 1)] - P[i1] * 2.0 + P[mesh.idx(r, c + 1)];
+            energy += w * (d.x * d.x + d.y * d.y);
         }
     }
     for (int c = 0; c < mesh.cols; ++c) {
         for (int r = 1; r < mesh.rows - 1; ++r) {
-            Vec2 d = P[mesh.idx(r - 1, c)] - P[mesh.idx(r, c)] * 2.0 + P[mesh.idx(r + 1, c)];
-            energy += opts.smoothWeightGeom * (d.x * d.x + d.y * d.y);
+            int i1 = mesh.idx(r, c);
+            double w = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
+            Vec2 d = P[mesh.idx(r - 1, c)] - P[i1] * 2.0 + P[mesh.idx(r + 1, c)];
+            energy += w * (d.x * d.x + d.y * d.y);
         }
     }
 
@@ -387,7 +426,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                 }
             }
 
-            addSmoothnessTerms(H, g, mesh, P, opts.smoothWeightGeom);
+            addSmoothnessTerms(H, g, mesh, P, target, opts);
             addTangentPriorTerms(H, g, mesh, opts.geomTangentPriorWeight);
 
             for (int i = 0; i < numV; ++i) {

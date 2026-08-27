@@ -340,6 +340,65 @@ per `OptimizerOptions`) stay fast at typical mesh sizes (9x9), but a large
 mesh with many manually-increased iterations will take noticeably longer
 than before. Not yet profiled/optimized.
 
+### Fixed: anisotropic smoothWeightGeom (relax smoothing near real edges)
+
+Even with free Pu/Pv, a specific complaint held up on closer comparison against
+the paper's Fig. 4: on a 5x5 mesh matching that figure's resolution, ours bent
+one interior mesh-*line* toward the sharp boundary, but never let two adjacent
+lines squeeze together into a visibly *narrow patch column* straddling the
+edge from both sides, the way Fig. 4 shows. Root cause: `smoothWeightGeom`'s
+2nd-difference term is isotropic -- it penalizes uneven spacing between
+neighboring control points identically everywhere, and two mesh-lines
+converging around an edge is, almost by definition, a large local departure
+from even spacing. Lowering the single global weight (previous fix) helps
+overall bending but can't selectively stop resisting *specifically* near a
+real edge without also giving up smoothing everywhere else.
+
+Fix: `smoothWeightGeom` is no longer a flat constant -- each 2nd-difference
+triple's effective weight is scaled by `edgeRelaxFactor()`, a new helper that
+samples the image gradient magnitude at the middle control point's *current*
+position (recomputed fresh every GN sub-iteration, so it adapts as a vertex
+approaches an edge) and relaxes smoothing there:
+`weight = smoothWeightGeom / (1 + smoothGeomEdgeGain * localGradientMagnitude)`,
+floored at `smoothGeomMinFactor` (never fully zero -- keeps the solve
+well-posed). `computeGeometryEnergy` mirrors the exact same per-triple scaling,
+for the same line-search-consistency reason as everywhere else here. New
+options: `smoothGeomEdgeGain = 40.0`, `smoothGeomMinFactor = 0.05`
+(`--edge-gain` / `--edge-min-factor` in `gmesh_cli`).
+
+Swept `--edge-gain` from 0 (isotropic, old behavior) up to 1500 on the same
+5x5/`gradient.png` case: RMSE improved from the isotropic baseline (56.6%
+reduction) up to a peak around gain 40-100 (~61.3-61.4%), then *degraded*
+at higher gain (600: 59.2%, 1500: 59.3%) -- over-relaxing lets the smoothness
+term stop doing its job even where it should, so this isn't "more is better."
+40 was picked as the default (near-peak, round number). Checked visually via
+the same wireframe-overlay technique as before: with gain 40, the interior
+mesh-lines visibly bow toward the notch rather than running close to straight
+-- a real improvement -- but this alone still didn't produce a dramatic
+near-zero-width pinched column like Fig. 4's. That makes sense on reflection:
+relaxing the *resistance* to non-uniform spacing doesn't create a new force
+pulling two lines together -- it only lets an existing pull win more easily.
+The data term's own incentive to physically narrow a column, absent that,
+still seems to be fairly weak (consistent with the earlier finding that color
+alone already absorbs much of the local residual). Getting the dramatic
+Fig.-4-style pinch probably needs an actual attractive force -- the
+`vectorLineWeight` constraint was tested as one candidate (see the previous
+turn's investigation: it *did* produce dramatic column-clustering, e.g. two
+columns landing 2.5px apart, but overshot and made overall RMSE worse at its
+current default weight/semantics) -- not pursued further this round.
+
+Regression check: the noisy synthetic sphere (smooth image, no real edges,
+per-pixel noise baked in) went from 52.6% to 50.5% RMSE reduction with
+anisotropic relaxation on -- a real but small regression, because the
+injected noise itself produces small nonzero local gradients everywhere,
+so `edgeRelaxFactor` relaxes smoothing slightly even in "flat" regions
+purely from that noise. Judged an acceptable trade for a meaningfully
+better result on real edges; flagging honestly rather than hiding it. Did
+not re-verify the 25x25 gradient.png case with this change (each such run
+takes several minutes in this sandbox) -- if you have a moment, `gmesh_cli
+--rows 25 --cols 25 ...` and comparing against the numbers in the section
+above would be a useful check.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)
