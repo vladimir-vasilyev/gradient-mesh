@@ -60,7 +60,11 @@ static void printUsage(const char* prog) {
         "          [--pyramid-levels N] [--margin px] [--width W --height H]\n"
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
         "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--vline \"x,y;x,y;...\"]\n"
-        "          [--outer-iters N] [--gn-iters N] [--samples N]\n"
+        "          [--outer-iters N] [--gn-iters N] [--samples N] [--use-ceres]\n"
+        "  --use-ceres: replace the hand-rolled geometry Gauss-Newton solver with a\n"
+        "  ceres::Problem solve (OptimizerOptions::useCeresGeometry) -- only has any\n"
+        "  effect if this binary was built with Ceres found (see CMakeLists.txt); a\n"
+        "  one-time warning is printed and the hand-rolled path is used otherwise.\n"
         "  With no --input, a synthetic shaded-sphere test image is generated so the\n"
         "  optimizer can be exercised without any external files.\n"
         "  The --smooth-geom/... flags override OptimizerOptions for quick experiments\n"
@@ -116,6 +120,7 @@ int main(int argc, char** argv) {
         else if (a == "--outer-iters") opts.outerIterationsPerLevel = std::stoi(next());
         else if (a == "--gn-iters") opts.geomGaussNewtonItersPerOuter = std::stoi(next());
         else if (a == "--samples") opts.samplesPerPatchEdge = std::stoi(next());
+        else if (a == "--use-ceres") opts.useCeresGeometry = true;
         else if (a == "-h" || a == "--help") { printUsage(argv[0]); return 0; }
         else { std::fprintf(stderr, "Unknown arg: %s\n", a.c_str()); printUsage(argv[0]); return 1; }
     }

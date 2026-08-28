@@ -73,6 +73,22 @@ struct OptimizerOptions {
     int cgMaxIterations = 200;
     double cgRelTolerance = 1e-5;
     double geomDampingInitial = 1e-2; // relative Levenberg damping added to the GN normal equations
+
+    // Opt-in: replace the hand-rolled geometry Gauss-Newton block (assembly
+    // of H/g, our own sparse block CG, manual Levenberg damping and
+    // backtracking) with a ceres::Problem solve, when this binary was built
+    // with Ceres available (GMCORE_WITH_CERES). The residuals/analytic
+    // Jacobians are transcribed 1:1 from the hand-rolled path (see
+    // MeshOptimizerCeres.cpp) and were cross-checked against
+    // ceres::GradientChecker / a standalone finite-difference harness
+    // before being wired in -- see spike/ceres_geom_spike.cpp and the
+    // commit history for that verification. Defaults to false: the
+    // dependency-free hand-rolled path remains the default for everyone
+    // without Ceres installed, and behaves byte-for-byte as before when
+    // this flag is left off even on a Ceres-enabled build. Ignored (with a
+    // one-time stderr warning) if GMCORE_WITH_CERES was not defined at
+    // build time.
+    bool useCeresGeometry = false;
 };
 
 struct OptimizerProgress {
@@ -103,5 +119,15 @@ public:
                                              const OptimizerOptions& opts,
                                              const OptimizerProgressCallback& cb, int level, int totalLevels);
 };
+
+#ifdef GMCORE_WITH_CERES
+// Implemented in MeshOptimizerCeres.cpp (only compiled in when Ceres was
+// found at configure time -- see CMakeLists.txt). Replaces exactly the
+// geometry Gauss-Newton block inside optimizeAtCurrentResolution's outer
+// loop; the color linear-solve step around it is untouched. Mutates
+// mesh.vertices[*].P/Pu/Pv in place, same contract as the hand-rolled path.
+void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
+                            const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts);
+#endif
 
 } // namespace gmcore

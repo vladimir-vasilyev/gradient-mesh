@@ -399,6 +399,76 @@ takes several minutes in this sandbox) -- if you have a moment, `gmesh_cli
 --rows 25 --cols 25 ...` and comparing against the numbers in the section
 above would be a useful check.
 
+### Optional: Ceres-based geometry solver
+
+The geometry Gauss-Newton block (position P + free tangents Pu, Pv) can
+optionally be solved by [Ceres Solver](http://ceres-solver.org/) instead
+of the hand-rolled damped GN + backtracking in `MeshOptimizer.cpp`. This
+is purely additive and off by default: `CMakeLists.txt` does
+`find_package(Ceres QUIET)` (never `REQUIRED`), and `core/src/MeshOptimizerCeres.cpp`
+compiles to an empty translation unit when Ceres isn't found, so the
+default, dependency-free build is completely unaffected -- nothing about
+it changed in this pass.
+
+Motivation: a fully joint (position+tangent+color) optimization pass --
+one of the fidelity options considered for closing the remaining gap to
+the paper's Fig. 4 (see "Deeper finding" above) -- would need a much
+larger per-vertex parameter block than the hand-rolled solver's fixed
+`double tmp[16]` scratch buffers can safely hold (18+ dims: 6 geometry +
+12 color). Ceres's own sparse linear algebra and Levenberg-Marquardt
+trust region don't have that ceiling, and would also remove an entire
+class of hand-derived-Jacobian bugs (the kind that caused the "mesh-lines
+weren't bending" bug above) via analytic verification against
+`ceres::GradientChecker`. This pass ports *only* the existing geometry
+GN step (color stays solved by the exact linear closed form, unchanged)
+as a lower-risk first step and feasibility check before attempting a
+fully joint solve.
+
+Enable with `OptimizerOptions::useCeresGeometry = true` (or `gmesh_cli
+--use-ceres`). Every residual/Jacobian in `MeshOptimizerCeres.cpp` is a
+direct transcription of the corresponding hand-rolled term, not a
+re-derivation -- and each was independently cross-checked before being
+wired in:
+
+- The data term (`PatchDataCostFunction`) was checked with
+  `ceres::GradientChecker` via `spike/ceres_geom_spike.cpp`. First pass
+  found a real bug: the per-sample area weight was being recomputed from
+  the *trial* (perturbed) parameters instead of frozen at the
+  linearization point, giving 906/1800 bad Jacobian entries (max relative
+  error 1.81). Fixed by freezing it from a `snapshot` mesh, matching
+  exactly how the hand-rolled path already treats that weight (frozen per
+  GN sub-iteration there). After the fix: max relative error 0.168,
+  confirmed identical between a standalone (non-Ceres) finite-difference
+  check and the real `ceres::GradientChecker` run -- and that remaining
+  gap is itself not new: it's the pre-existing, already-documented
+  simplification that twist (`Puv`) isn't differentiated w.r.t.
+  neighboring vertex positions (same approximation `addTangentPriorTerms`
+  already accepts).
+- Smoothness, tangent-prior, boundary and vector-line terms were each
+  checked against a standalone finite-difference harness before being
+  transcribed here; all four matched to numerical precision (no
+  approximation involved in any of them).
+
+Design note carried over honestly: every "frozen" quantity above (area
+weight, the anisotropic edge-relax factor, tangent-prior's `tu`/`tv`
+target, the vector-line direction) is evaluated once from a mesh snapshot
+taken at the start of `optimizeGeometryCeres()`, not re-evaluated as
+Ceres's own internal LM iterations move the trial parameters -- the same
+granularity of freezing the hand-rolled path already uses (there, frozen
+per GN sub-iteration; here, frozen for the whole call, since Ceres
+iterates internally rather than the caller re-entering the loop). Not a
+new approximation introduced by this port, but worth knowing if the
+`--use-ceres` RMSE trajectory ever looks different from the hand-rolled
+one in a way that isn't obviously better.
+
+Status as of this pass: default (no-Ceres) build and `--use-ceres`'s
+graceful fallback (one-time stderr warning, hand-rolled path used) were
+both verified in the Linux sandbox. The actual Ceres-linked build and a
+real RMSE/timing comparison against the hand-rolled path have NOT been
+run yet at the time of writing -- this sandbox has no network access to
+install Ceres, so that final verification has to happen on a machine with
+Ceres/Eigen installed (this project's macOS target, via Homebrew).
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

@@ -353,11 +353,39 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             }
         }
 
-        // 3) Refine geometry -- position P AND the free tangents Pu, Pv --
-        // with damped Gauss-Newton + backtracking. Each vertex now
-        // contributes a 6-wide unknown block: subs 0,1 = P.x,P.y (as
-        // before), 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y.
-        for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
+        // 3) Refine geometry -- position P AND the free tangents Pu, Pv.
+        // Either the hand-rolled damped Gauss-Newton + backtracking below
+        // (default, dependency-free), or -- opt-in, see
+        // OptimizerOptions::useCeresGeometry -- a ceres::Problem solve
+        // over the exact same residuals (MeshOptimizerCeres.cpp), when
+        // this binary was built with Ceres available. Both mutate
+        // mesh.vertices[*].P/Pu/Pv in place; nothing below this block
+        // changes based on which path ran. `geometrySolvedByCeres` gates
+        // the hand-rolled loop below so it's a no-op when Ceres already
+        // did the work this outer iteration -- kept as an explicit flag
+        // (rather than if/else across the #ifdef) so this stays easy to
+        // read and can't silently run both paths.
+        bool geometrySolvedByCeres = false;
+#ifdef GMCORE_WITH_CERES
+        if (opts.useCeresGeometry) {
+            optimizeGeometryCeres(mesh, target, vectorLines, opts);
+            geometrySolvedByCeres = true;
+        }
+#else
+        if (opts.useCeresGeometry) {
+            static bool warned = false;
+            if (!warned) {
+                std::fprintf(stderr,
+                    "OptimizerOptions::useCeresGeometry=true but this binary was built "
+                    "without Ceres (GMCORE_WITH_CERES not defined) -- falling back to the "
+                    "hand-rolled geometry solver.\n");
+                warned = true;
+            }
+        }
+#endif
+        // Each vertex contributes a 6-wide unknown block: subs 0,1 =
+        // P.x,P.y (as before), 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y.
+        for (int gi = 0; !geometrySolvedByCeres && gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
             SparseBlockMatrix H;
             H.init(6, numV);
             std::vector<double> g(numV * 6, 0.0);

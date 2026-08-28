@@ -28,6 +28,21 @@ else()
   message(STATUS "gmcore: libpng not found, only the built-in PPM format is available in gmcore/CLI (the macOS app is unaffected -- it uses AppKit ImageIO)")
 endif()
 
+# Optional: Ceres-based geometry solver (see core/src/MeshOptimizerCeres.cpp,
+# OptimizerOptions::useCeresGeometry). Entirely opt-in and additive -- when
+# Ceres isn't found, MeshOptimizerCeres.cpp compiles to an empty
+# translation unit and everything behaves exactly as it did before this
+# option existed. Never REQUIRED, so a plain `cmake ..` with no Ceres
+# installed keeps working with zero extra dependencies, as always.
+find_package(Ceres QUIET)
+if(Ceres_FOUND)
+  target_link_libraries(gmcore PUBLIC Ceres::ceres)
+  target_compile_definitions(gmcore PUBLIC GMCORE_WITH_CERES)
+  message(STATUS "gmcore: Ceres found (${Ceres_VERSION}) -- OptimizerOptions::useCeresGeometry is available")
+else()
+  message(STATUS "gmcore: Ceres not found -- only the hand-rolled geometry solver is available (default, dependency-free build unaffected)")
+endif()
+
 # ---------------------------------------------------------------------------
 # gmesh_cli: dependency-free command-line reference/test harness. Builds
 # and runs on Linux/macOS/Windows -- this is how the algorithm was
