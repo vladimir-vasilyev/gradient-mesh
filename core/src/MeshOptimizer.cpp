@@ -256,8 +256,39 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             v.boundaryT = mesh.boundary[v.boundarySide].closestT(v.P);
         }
 
+        // 2+3) Either solve color (closed form, below) then geometry
+        // (Gauss-Newton or useCeresGeometry, further below) separately --
+        // the block-coordinate-descent scheme this file has always used --
+        // or replace BOTH steps with a single fully-joint Ceres solve over
+        // position, tangents AND all four free color unknowns at once.
+        // See OptimizerOptions::useCeresJoint for the motivation (closing
+        // the remaining gap to the paper's Fig. 4 pinch that
+        // useCeresGeometry alone didn't close). `jointSolvedByCeres` gates
+        // both the color block and the geometry block below so they
+        // become no-ops this outer iteration when the joint solve already
+        // did the work -- same explicit-flag pattern as
+        // `geometrySolvedByCeres` already uses for useCeresGeometry.
+        bool jointSolvedByCeres = false;
+#ifdef GMCORE_WITH_CERES
+        if (opts.useCeresJoint) {
+            optimizeJointCeres(mesh, target, vectorLines, opts);
+            jointSolvedByCeres = true;
+        }
+#else
+        if (opts.useCeresJoint) {
+            static bool warnedJoint = false;
+            if (!warnedJoint) {
+                std::fprintf(stderr,
+                    "OptimizerOptions::useCeresJoint=true but this binary was built "
+                    "without Ceres (GMCORE_WITH_CERES not defined) -- falling back to "
+                    "the hand-rolled color+geometry solve.\n");
+                warnedJoint = true;
+            }
+        }
+#endif
+
         // 2) Solve for colors exactly (data term is linear in color unknowns).
-        {
+        if (!jointSolvedByCeres) {
             SparseBlockMatrix H;
             H.init(4, numV);
             std::vector<double> gR(numV * 4, 0.0), gG(numV * 4, 0.0), gB(numV * 4, 0.0);
@@ -365,14 +396,14 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
         // did the work this outer iteration -- kept as an explicit flag
         // (rather than if/else across the #ifdef) so this stays easy to
         // read and can't silently run both paths.
-        bool geometrySolvedByCeres = false;
+        bool geometrySolvedByCeres = jointSolvedByCeres; // joint solve already did geometry too
 #ifdef GMCORE_WITH_CERES
-        if (opts.useCeresGeometry) {
+        if (!jointSolvedByCeres && opts.useCeresGeometry) {
             optimizeGeometryCeres(mesh, target, vectorLines, opts);
             geometrySolvedByCeres = true;
         }
 #else
-        if (opts.useCeresGeometry) {
+        if (!jointSolvedByCeres && opts.useCeresGeometry) {
             static bool warned = false;
             if (!warned) {
                 std::fprintf(stderr,

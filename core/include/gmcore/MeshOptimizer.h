@@ -89,6 +89,38 @@ struct OptimizerOptions {
     // one-time stderr warning) if GMCORE_WITH_CERES was not defined at
     // build time.
     bool useCeresGeometry = false;
+
+    // Opt-in, stronger than useCeresGeometry: replace BOTH the closed-form
+    // color linear solve AND the geometry Gauss-Newton block with a single
+    // ceres::Problem solving position (P,Pu,Pv), tangents and ALL FOUR
+    // free color unknowns (C,Cu,Cv,Cuv) jointly, in one nonlinear least-
+    // squares problem per re-snapshot -- the fully-joint solve described
+    // in the class header comment above ("rather than one fully-joint LM
+    // solve... this implementation uses block-coordinate descent"), which
+    // was previously blocked by the hand-rolled SparseBlockMatrix's fixed
+    // `double tmp[16]` scratch buffers (a joint block is 6+12=18 doubles/
+    // vertex). Ceres has no such ceiling and doesn't even need geometry
+    // and color unified into one parameter block -- see
+    // MeshOptimizerCeres.cpp's optimizeJointCeres/jointSolveOnce.
+    //
+    // Motivation: investigating why even the geometry-only Ceres path
+    // (useCeresGeometry) still can't reproduce the paper's Fig. 4 pinch on
+    // a 5x5 mesh -- every indirect fix tried (free tangents, tangent-
+    // prior, anisotropic smoothWeightGeom) only relaxes resistance to
+    // pinching, none of them add a force that couples geometry and color
+    // tightly enough to produce it. A true joint solve, where a color
+    // discontinuity can pull geometry toward it in the SAME step that
+    // geometry's own data term does, is a plausible candidate for that
+    // missing coupling; if it still doesn't reproduce Fig. 4, that's
+    // evidence the paper's fold-over technique (Sec. 3.4) is doing
+    // something block-coordinate/joint optimization alone can't.
+    //
+    // If both this and useCeresGeometry are true, this one wins (color
+    // solve and geometry solve are both replaced; useCeresGeometry's
+    // separate geometry-only Ceres call never runs that outer iteration).
+    // Same graceful-fallback contract as useCeresGeometry: ignored with a
+    // one-time stderr warning when GMCORE_WITH_CERES wasn't defined.
+    bool useCeresJoint = false;
 };
 
 struct OptimizerProgress {
@@ -128,6 +160,13 @@ public:
 // mesh.vertices[*].P/Pu/Pv in place, same contract as the hand-rolled path.
 void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
                             const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts);
+
+// Also in MeshOptimizerCeres.cpp: the fully-joint (geometry+color) solve,
+// see OptimizerOptions::useCeresJoint above. Replaces both the color
+// linear-solve step and the geometry GN block; mutates
+// mesh.vertices[*].P/Pu/Pv/C/Cu/Cv/Cuv in place.
+void optimizeJointCeres(GradientMesh& mesh, const Image& target,
+                         const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts);
 #endif
 
 } // namespace gmcore
