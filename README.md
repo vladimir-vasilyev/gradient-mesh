@@ -463,11 +463,23 @@ one in a way that isn't obviously better.
 
 Status as of this pass: default (no-Ceres) build and `--use-ceres`'s
 graceful fallback (one-time stderr warning, hand-rolled path used) were
-both verified in the Linux sandbox. The actual Ceres-linked build and a
-real RMSE/timing comparison against the hand-rolled path have NOT been
-run yet at the time of writing -- this sandbox has no network access to
-install Ceres, so that final verification has to happen on a machine with
-Ceres/Eigen installed (this project's macOS target, via Homebrew).
+verified in the Linux sandbox (this sandbox has no network access to
+install Ceres itself). The real Ceres-linked build was then verified on
+the macOS target (Homebrew `ceres-solver`/`eigen`, `cmake ..
+-DCMAKE_PREFIX_PATH="$(brew --prefix)"`): `gmcore`/`gmesh_cli` link and
+run cleanly against Ceres 2.2.0. A same-seed synthetic-sphere comparison
+(`--rows 9 --cols 9 --pyramid-levels 3 --outer-iters 6 --gn-iters 3`, with
+vs. without `--use-ceres`) converged smoothly on both paths with no
+divergence, and Ceres reached a slightly *better* final RMSE (54.1%
+reduction vs. 52.0% hand-rolled) -- plausibly because Ceres's adaptive
+trust region is a more capable step-acceptance scheme than the hand-rolled
+path's fixed 4-try/0.4-shrink backtracking, though this is one run on one
+test case and not yet a full regression. Not yet done: the harder 25x25
+sharp-edge test that's the actual point of this whole line of work (does
+Ceres's more robust step acceptance help with the Fig. 4 pinching
+question), a wall-clock timing comparison, and a visual wireframe-overlay
+sanity check of the Ceres-produced mesh (same techniques used earlier in
+this file for the hand-rolled path's fidelity checks).
 
 ## How this was tested
 
