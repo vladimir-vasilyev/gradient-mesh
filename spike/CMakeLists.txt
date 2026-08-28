@@ -26,3 +26,14 @@ add_executable(ceres_geom_spike
 )
 target_include_directories(ceres_geom_spike PRIVATE ../core/include)
 target_link_libraries(ceres_geom_spike PRIVATE Ceres::ceres)
+
+# Phase 0 of the full joint (geometry+color) solve investigation -- see
+# ceres_joint_spike.cpp's header comment for why this is a separate,
+# still-throwaway spike rather than an extension of ceres_geom_spike.
+add_executable(ceres_joint_spike
+    ceres_joint_spike.cpp
+    ../core/src/GradientMesh.cpp
+    ../core/src/Image.cpp
+)
+target_include_directories(ceres_joint_spike PRIVATE ../core/include)
+target_link_libraries(ceres_joint_spike PRIVATE Ceres::ceres)
