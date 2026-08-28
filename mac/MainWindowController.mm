@@ -17,6 +17,10 @@
 @property (nonatomic, strong) NSButton* optimizeButton;
 @property (nonatomic, strong) NSButton* exportPNGButton;
 @property (nonatomic, strong) NSButton* exportSVGButton;
+// Solver picker: Hand-rolled (default) / Ceres (geometry) / Ceres (joint) --
+// mirrors gmcore::OptimizerOptions::useCeresGeometry/useCeresJoint via
+// DocumentModel's properties of the same name. See -solverChanged:.
+@property (nonatomic, strong) NSPopUpButton* solverPopup;
 @end
 
 @implementation MainWindowController
@@ -53,6 +57,7 @@
 
     NSView* controlsRow1 = [self makeRow];
     NSView* controlsRow2 = [self makeRow];
+    NSView* controlsRow3 = [self makeRow];
 
     // --- Row 1: file + tool selection ---
     NSButton* openBtn = [self buttonTitled:@"Open Image…" action:@selector(openImage:)];
@@ -99,6 +104,20 @@
                          self.exportPNGButton, self.exportSVGButton])
         [controlsRow2 addSubview:v];
 
+    // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
+    NSTextField* solverLabel = [self makeLabel:@"Solver:"];
+    self.solverPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    self.solverPopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.solverPopup addItemsWithTitles:@[@"Hand-rolled", @"Ceres (geometry)", @"Ceres (joint)"]];
+    [self.solverPopup selectItemAtIndex:0];
+    self.solverPopup.target = self;
+    self.solverPopup.action = @selector(solverChanged:);
+    NSTextField* solverHint = [self makeLabel:@"(Ceres options are a no-op, with a console warning, in a build without Ceres found)"];
+    solverHint.textColor = [NSColor secondaryLabelColor];
+    solverHint.font = [NSFont systemFontOfSize:11];
+
+    for (NSView* v in @[solverLabel, self.solverPopup, solverHint]) [controlsRow3 addSubview:v];
+
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
     self.canvasView.documentModel = self.documentModel;
@@ -106,20 +125,23 @@
 
     [content addSubview:controlsRow1];
     [content addSubview:controlsRow2];
+    [content addSubview:controlsRow3];
     [content addSubview:self.canvasView];
     [content addSubview:self.statusLabel];
 
-    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow2, _canvasView, _statusLabel);
+    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow2, controlsRow3, _canvasView, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow3]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
-        @"V:|-8-[controlsRow1(28)]-6-[controlsRow2(28)]-6-[_canvasView]-4-[_statusLabel(18)]-6-|"
+        @"V:|-8-[controlsRow1(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[_canvasView]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
     [self layoutRowChildren:controlsRow2];
+    [self layoutRowChildren:controlsRow3];
 }
 
 - (NSView*)makeRow {
@@ -275,6 +297,22 @@
 - (void)toggleTangents:(id)sender {
     self.canvasView.showTangents = (self.tangentsCheckbox.state == NSControlStateValueOn);
     [self.canvasView setNeedsDisplay:YES];
+}
+
+- (void)solverChanged:(id)sender {
+    // Index 0 "Hand-rolled": both NO (the original, dependency-free path).
+    // Index 1 "Ceres (geometry)": useCeresGeometry only.
+    // Index 2 "Ceres (joint)": useCeresJoint (which alone implies "joint
+    // wins" even if useCeresGeometry were also left on -- see
+    // DocumentModel.h/MeshOptimizer.cpp's jointSolvedByCeres gating -- so
+    // leaving useCeresGeometry off here is just the clearest way to express
+    // "exactly one of these three modes" from this 3-item picker).
+    NSInteger idx = self.solverPopup.indexOfSelectedItem;
+    self.documentModel.useCeresGeometry = (idx == 1);
+    self.documentModel.useCeresJoint = (idx == 2);
+    NSArray* names = @[@"hand-rolled", @"Ceres (geometry)", @"Ceres (joint)"];
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Solver set to %@. (Next “Optimize” run will use it.)",
+                                     names[(NSUInteger)MAX(0, idx)]];
 }
 
 - (void)exportPNG:(id)sender {

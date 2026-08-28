@@ -26,6 +26,19 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 @property (nonatomic, readonly) NSInteger meshRows;
 @property (nonatomic, readonly) NSInteger meshCols;
 
+// Which geometry/color solver -[optimizeWithPyramidLevels:progress:completion:]
+// uses next -- mirrors gmcore::OptimizerOptions::useCeresGeometry/useCeresJoint
+// (see MeshOptimizer.h for what each does). Both default NO (the original,
+// dependency-free hand-rolled path). Setting useCeresJoint also implies
+// useCeresGeometry is ignored, same "joint wins" precedence as the CLI's
+// --use-ceres/--use-ceres-joint flags and MeshOptimizer.cpp's own gating --
+// see that file's `jointSolvedByCeres` comment. If this binary wasn't built
+// with Ceres found (GMCORE_WITH_CERES), setting either has no effect beyond
+// a one-time warning printed to stderr (visible in Xcode's debug console) --
+// optimization silently falls back to the hand-rolled path.
+@property (nonatomic, assign) BOOL useCeresGeometry;
+@property (nonatomic, assign) BOOL useCeresJoint;
+
 // --- Image ---
 - (BOOL)loadImageAtURL:(NSURL*)url error:(NSError**)error;
 

@@ -287,6 +287,11 @@ static NSError* gmError(NSString* msg) {
     Image targetCopy = _target; // Image is a small value type wrapping a vector; a private copy for thread safety.
     std::vector<VectorLine> linesCopy = _vectorLines;
     OptimizerOptions opts;
+    // See DocumentModel.h's comment on these two properties: "joint wins" if
+    // both are set, mirroring MeshOptimizer.cpp's own jointSolvedByCeres
+    // gating and the CLI's --use-ceres/--use-ceres-joint precedence.
+    opts.useCeresGeometry = self.useCeresGeometry;
+    opts.useCeresJoint = self.useCeresJoint;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts,
