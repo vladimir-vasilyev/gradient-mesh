@@ -25,14 +25,19 @@
 // itself one of this CostFunction's free parameters (the per-sample area
 // weight, the anisotropic edge-relax factor, the tangent-prior's
 // finite-difference target tu/tv, the vector-line direction, the
-// boundary's target point) is evaluated ONCE from a snapshot of the mesh
-// taken at the start of optimizeGeometryCeres(), not re-evaluated as
-// Ceres's own internal LM iterations move the trial parameters. This
-// mirrors exactly how the hand-rolled path already treats these
-// quantities (frozen per GN sub-iteration there; frozen for the whole
-// optimizeGeometryCeres() call here, since Ceres iterates internally
-// where the hand-rolled path re-enters this function's Gauss-Newton loop
-// explicitly) -- it is not a new approximation introduced by this port.
+// boundary's target point) is evaluated ONCE from a snapshot of the mesh,
+// not re-evaluated as Ceres's own internal LM iterations move the trial
+// parameters. optimizeGeometryCeres() re-snapshots and re-solves
+// opts.geomGaussNewtonItersPerOuter times (see ceresSolveOnce's comment)
+// so this freezing happens at the same cadence as the hand-rolled path's
+// GN sub-iterations, not once per outer iteration -- an earlier version
+// of this file froze only once per outer iteration and let Ceres run up
+// to 30 internal iterations against those now-stale weights, which
+// produced a *worse* result than the hand-rolled path on the 25x25
+// gradient.png regression (reconstruction RMSE climbing for several
+// outer iterations instead of decreasing). Not otherwise a new
+// approximation introduced by this port -- the hand-rolled path already
+// freezes these same quantities at GN-sub-iteration granularity.
 #ifdef GMCORE_WITH_CERES
 
 #include "gmcore/MeshOptimizer.h"
@@ -270,11 +275,27 @@ private:
 
 } // namespace
 
-void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
-                            const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
+// Runs ONE Ceres solve using weights/targets frozen from `snapshot`
+// (the current mesh state), for at most `maxIters` of Ceres's own
+// internal LM iterations, then writes the result back into `mesh`.
+// Factored out of optimizeGeometryCeres() so that function can call this
+// repeatedly, re-snapshotting between calls -- see that function's
+// comment for why: letting Ceres run many internal iterations against
+// weights frozen once at the very start let those weights go stale as
+// the mesh moved, which on the harder 25x25 gradient.png regression test
+// produced a *worse* result than the hand-rolled path (reconstruction
+// RMSE climbing for several outer iterations in a row instead of
+// decreasing) -- diagnosed by comparing refresh cadence against the
+// hand-rolled loop, which re-freezes these same quantities every single
+// GN sub-iteration (opts.geomGaussNewtonItersPerOuter times per outer
+// iteration), not once per outer iteration.
+static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
+                            const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts,
+                            int maxIters) {
     int numV = (int)mesh.vertices.size();
     int n = std::max(2, opts.samplesPerPatchEdge);
     double duv = 1.0 / (n * n);
+    (void)duv;
 
     // Snapshot: the frozen linearization point for every weight/target
     // quantity below (area weight, edge-relax factor, tangent-prior
@@ -364,7 +385,7 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
     options.linear_solver_type = ceres::CGNR;
     options.preconditioner_type = ceres::JACOBI;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-    options.max_num_iterations = std::max(10, opts.geomGaussNewtonItersPerOuter * 10);
+    options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
 
@@ -376,6 +397,25 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
         mv.P  = {params[i][0], params[i][1]};
         mv.Pu = {params[i][2], params[i][3]};
         mv.Pv = {params[i][4], params[i][5]};
+    }
+}
+
+void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
+                            const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
+    // Re-snapshot and re-solve opts.geomGaussNewtonItersPerOuter times,
+    // each with a small iteration budget -- matching the hand-rolled
+    // path's refresh cadence (see ceresSolveOnce's comment for why this
+    // matters: on the 25x25 gradient.png regression, one long Ceres solve
+    // against weights frozen only once made the reconstruction *worse*
+    // over successive outer iterations, because those weights went stale
+    // as the mesh moved far from the snapshot). 6 Ceres iterations per
+    // sub-step is a deliberately modest budget: enough for Ceres's trust
+    // region to meaningfully outdo a single hand-rolled GN+backtracking
+    // step, not so many that the frozen weights it's using stop
+    // reflecting the mesh it's actually solving for.
+    const int itersPerSubStep = 6;
+    for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
+        ceresSolveOnce(mesh, target, vectorLines, opts, itersPerSubStep);
     }
 }
 
