@@ -501,12 +501,33 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
 void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
                             const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
     // Re-snapshot and re-solve opts.geomGaussNewtonItersPerOuter times,
-    // each with a small iteration budget and an explicit verify-and-revert
-    // gate against computeTrueGeometryEnergy() -- see that function's
-    // comment for why the gate is the actually-necessary part (refreezing
-    // more often alone slowed but did not stop RMSE from climbing on the
-    // 25x25 gradient.png regression; this gate is what the hand-rolled
-    // path's backtracking already does and what stops it there too).
+    // each with a small iteration budget, checked against
+    // computeTrueGeometryEnergy() -- see that function's comment for why
+    // some such gate is necessary at all (refreezing more often alone
+    // slowed but did not stop RMSE from climbing on the 25x25
+    // gradient.png regression).
+    //
+    // The gate itself must be GRADUAL, not binary accept/revert-all: a
+    // first version that either took the whole Ceres sub-step or threw it
+    // away entirely made things *worse* (25x25: 43.7% vs the hand-rolled
+    // path's 62.0%, down from 58.5% before the gate existed at all).
+    // Ceres's internal trust region only ever checks its own step against
+    // the FROZEN-weight cost function, so by the time a multi-iteration
+    // sub-step is done, the step can be large enough that the frozen
+    // linearization is no longer a good local model of the true
+    // (freshly-reweighted) energy -- at which point the true energy often
+    // *does* increase, and a binary gate has to throw the entire sub-step
+    // away, wasting the (usually still locally-correct) early part of it.
+    // The hand-rolled path never faces this because it only ever takes
+    // ONE linearized GN step before re-checking -- but it still needs its
+    // own alpha-shrinking backtracking (see the `for (int tries...)` loop
+    // above in MeshOptimizer.cpp) to guard against exactly this kind of
+    // over-shoot. So: treat Ceres's proposed sub-step the same way that
+    // loop treats a single GN step -- as a *direction* from `before` to
+    // `after`, and shrink how far along it we actually go (alpha = 1.0,
+    // 0.4, 0.16, 0.064) until computeTrueGeometryEnergy() stops
+    // objecting, before falling back to a full revert.
+    //
     // 6 Ceres iterations per sub-step is a deliberately modest budget:
     // enough for Ceres's trust region to meaningfully outdo a single
     // hand-rolled GN+backtracking step, not so many that the frozen
@@ -518,10 +539,23 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
         double energyBefore = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
 
         ceresSolveOnce(mesh, target, vectorLines, opts, itersPerSubStep);
+        std::vector<MeshVertex> after = mesh.vertices; // full (alpha=1) proposed step
 
-        double energyAfter = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
-        if (energyAfter > energyBefore) {
-            mesh.vertices = before; // reject: revert this sub-step entirely
+        const int numV = (int)mesh.vertices.size();
+        double alpha = 1.0;
+        bool improved = false;
+        for (int tries = 0; tries < 4; ++tries) {
+            for (int i = 0; i < numV; ++i) {
+                mesh.vertices[i].P  = before[i].P  + (after[i].P  - before[i].P)  * alpha;
+                mesh.vertices[i].Pu = before[i].Pu + (after[i].Pu - before[i].Pu) * alpha;
+                mesh.vertices[i].Pv = before[i].Pv + (after[i].Pv - before[i].Pv) * alpha;
+            }
+            double newEnergy = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
+            if (newEnergy <= energyBefore) { improved = true; break; }
+            alpha *= 0.4;
+        }
+        if (!improved) {
+            mesh.vertices = before; // all alphas failed: revert this sub-step entirely
         }
     }
 }
