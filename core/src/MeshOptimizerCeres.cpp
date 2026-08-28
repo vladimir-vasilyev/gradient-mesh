@@ -89,6 +89,104 @@ Vec2 nearestVectorLineDir(const std::vector<VectorLine>& lines, const Vec2& p, d
     return bestDir;
 }
 
+// Direct transcription of MeshOptimizer.cpp's computeGeometryEnergy (same
+// function name there, anonymous-namespace/file-local so not shared
+// directly): the TRUE geometry energy, with every weight/target
+// (area weight, edge-relax factor, tangent-prior tu/tv, vector-line
+// direction) evaluated FRESH from whatever mesh is passed in -- no
+// freezing at all here, unlike ceresSolveOnce's residuals. This exists
+// for exactly the reason MeshOptimizer.cpp's version does (see its own
+// header comment): a step must be judged against the real energy it's
+// supposed to be decreasing, not a cheaper/frozen proxy, or a genuinely
+// energy-increasing step can look like an improvement. Needed here
+// because ceresSolveOnce has no equivalent of the hand-rolled path's
+// backtracking-against-fresh-weights safety net -- Ceres's own trust
+// region only ever checks its *frozen*-weight cost function, so nothing
+// stops it from happily walking uphill in the true energy while still
+// reducing its own frozen approximation of it. Found on the 25x25
+// gradient.png regression: even after re-freezing every GN sub-iteration
+// (see ceresSolveOnce), reconstruction RMSE still climbed steadily after
+// the first sub-step -- refreezing more often slowed the drift but this
+// verify-and-revert gate is what actually stops it.
+double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
+                                  const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
+    int n = std::max(2, opts.samplesPerPatchEdge);
+    double duv = 1.0 / (n * n);
+    double energy = 0.0;
+
+    for (int pr = 0; pr < mesh.rows - 1; ++pr) {
+        for (int pc = 0; pc < mesh.cols - 1; ++pc) {
+            for (int i = 0; i <= n; ++i) {
+                double v = double(i) / n;
+                for (int j = 0; j <= n; ++j) {
+                    double u = double(j) / n;
+                    Vec2 pos = mesh.evalPos(pr, pc, u, v);
+                    Color cmesh = mesh.evalColor(pr, pc, u, v);
+                    Color ctarget = target.sampleBilinear(pos.x, pos.y);
+                    double w = areaWeightAt(mesh, pr, pc, u, v, duv);
+                    Color d = cmesh - ctarget;
+                    energy += w * d.lengthSq();
+                }
+            }
+        }
+    }
+
+    std::vector<Vec2> P(mesh.vertices.size());
+    for (size_t i = 0; i < P.size(); ++i) P[i] = mesh.vertices[i].P;
+
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 1; c < mesh.cols - 1; ++c) {
+            int i1 = mesh.idx(r, c);
+            double w = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
+            Vec2 d = P[mesh.idx(r, c - 1)] - P[i1] * 2.0 + P[mesh.idx(r, c + 1)];
+            energy += w * (d.x * d.x + d.y * d.y);
+        }
+    }
+    for (int c = 0; c < mesh.cols; ++c) {
+        for (int r = 1; r < mesh.rows - 1; ++r) {
+            int i1 = mesh.idx(r, c);
+            double w = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
+            Vec2 d = P[mesh.idx(r - 1, c)] - P[i1] * 2.0 + P[mesh.idx(r + 1, c)];
+            energy += w * (d.x * d.x + d.y * d.y);
+        }
+    }
+
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 0; c < mesh.cols; ++c) {
+            const MeshVertex& mv = mesh.at(r, c);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
+            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
+            energy += opts.geomTangentPriorWeight * (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
+        }
+    }
+
+    for (const auto& mv : mesh.vertices) {
+        if (!mv.isBoundary) continue;
+        Vec2 t = mesh.boundary[mv.boundarySide].eval(mv.boundaryT);
+        Vec2 d = mv.P - t;
+        energy += opts.boundaryWeight * (d.x * d.x + d.y * d.y);
+    }
+
+    if (!vectorLines.empty()) {
+        auto edgeEnergy = [&](int v1, int v2) {
+            Vec2 mid = (P[v1] + P[v2]) * 0.5;
+            bool found = false;
+            Vec2 dir = nearestVectorLineDir(vectorLines, mid, opts.vectorLineInfluenceRadius, found);
+            if (!found) return;
+            double r0 = (P[v2] - P[v1]).cross(dir);
+            energy += opts.vectorLineWeight * r0 * r0;
+        };
+        for (int r = 0; r < mesh.rows; ++r)
+            for (int c = 0; c < mesh.cols - 1; ++c) edgeEnergy(mesh.idx(r, c), mesh.idx(r, c + 1));
+        for (int c = 0; c < mesh.cols; ++c)
+            for (int r = 0; r < mesh.rows - 1; ++r) edgeEnergy(mesh.idx(r, c), mesh.idx(r + 1, c));
+    }
+
+    return energy;
+}
+
 // ---- Data term: one residual block per patch (see spike/ceres_geom_spike.cpp) ----
 class PatchDataCostFunction : public ceres::CostFunction {
 public:
@@ -403,19 +501,28 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
 void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
                             const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
     // Re-snapshot and re-solve opts.geomGaussNewtonItersPerOuter times,
-    // each with a small iteration budget -- matching the hand-rolled
-    // path's refresh cadence (see ceresSolveOnce's comment for why this
-    // matters: on the 25x25 gradient.png regression, one long Ceres solve
-    // against weights frozen only once made the reconstruction *worse*
-    // over successive outer iterations, because those weights went stale
-    // as the mesh moved far from the snapshot). 6 Ceres iterations per
-    // sub-step is a deliberately modest budget: enough for Ceres's trust
-    // region to meaningfully outdo a single hand-rolled GN+backtracking
-    // step, not so many that the frozen weights it's using stop
-    // reflecting the mesh it's actually solving for.
+    // each with a small iteration budget and an explicit verify-and-revert
+    // gate against computeTrueGeometryEnergy() -- see that function's
+    // comment for why the gate is the actually-necessary part (refreezing
+    // more often alone slowed but did not stop RMSE from climbing on the
+    // 25x25 gradient.png regression; this gate is what the hand-rolled
+    // path's backtracking already does and what stops it there too).
+    // 6 Ceres iterations per sub-step is a deliberately modest budget:
+    // enough for Ceres's trust region to meaningfully outdo a single
+    // hand-rolled GN+backtracking step, not so many that the frozen
+    // weights it's using stop reflecting the mesh it's actually solving
+    // for by the time this sub-step's result gets checked.
     const int itersPerSubStep = 6;
     for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
+        std::vector<MeshVertex> before = mesh.vertices;
+        double energyBefore = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
+
         ceresSolveOnce(mesh, target, vectorLines, opts, itersPerSubStep);
+
+        double energyAfter = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
+        if (energyAfter > energyBefore) {
+            mesh.vertices = before; // reject: revert this sub-step entirely
+        }
     }
 }
 
