@@ -164,6 +164,83 @@ struct OptimizerOptions {
                                        // fix's benefit over the old default
                                        // is lost), so 1e-3 is the sweet spot,
                                        // not just "looser is always fine."
+    int outerConvergencePatience = 3; // number of CONSECUTIVE stalled outer
+                                       // iterations (relative improvement
+                                       // below outerConvergenceRelTol)
+                                       // required before the early-exit
+                                       // above actually stops the loop.
+                                       // Added after a follow-up report that
+                                       // "run it twice" still kept improving
+                                       // RMSE even with a single-iteration
+                                       // version of this check: a rejected
+                                       // Gauss-Newton step reverts the mesh
+                                       // and bumps the Levenberg damping
+                                       // (lambda) 4x, so that outer
+                                       // iteration's energy is unchanged for
+                                       // a reason that has nothing to do
+                                       // with having reached a real local
+                                       // optimum -- a single-iteration check
+                                       // can't tell that apart from genuine
+                                       // convergence and stops right there,
+                                       // which is exactly what re-running
+                                       // (which resets lambda back down) was
+                                       // then able to undo. Requiring several
+                                       // stalled iterations in a row before
+                                       // stopping gives lambda room to work
+                                       // back down and try again first. See
+                                       // MeshOptimizer.cpp's early-exit block
+                                       // for the full explanation. 1 recovers
+                                       // the old (buggy) single-iteration
+                                       // behavior.
+    int pyramidRestarts = 1; // number of times optimizeCoarseToFine repeats
+                                       // its FULL descend-to-coarsest /
+                                       // climb-to-finest sweep. Added after
+                                       // isolating a SEPARATE, smaller
+                                       // phenomenon from the
+                                       // outerConvergencePatience bug above:
+                                       // once that bug was fixed, calling
+                                       // optimizeAtCurrentResolution
+                                       // (single, FIXED resolution) twice in
+                                       // a row on its own output showed an
+                                       // honest ~0.00% gap -- genuine
+                                       // convergence, confirmed. But calling
+                                       // the FULL optimizeCoarseToFine
+                                       // pipeline twice still showed a small
+                                       // real gap (~0.2-0.3% RMSE per repeat
+                                       // on a 5x5 gradient.png test case).
+                                       // Root cause: every call re-descends
+                                       // the mesh to the COARSEST pyramid
+                                       // level and re-climbs -- on the
+                                       // second call this happens from an
+                                       // already-refined mesh instead of the
+                                       // crude initial one, and because this
+                                       // is non-convex block-coordinate
+                                       // descent, that different starting
+                                       // point can (and measurably does)
+                                       // land in a marginally better basin
+                                       // by the time it reaches the finest
+                                       // level again -- structurally a
+                                       // multi-restart effect, not a
+                                       // stopping-criterion bug (there's
+                                       // nothing wrong with any single
+                                       // level's convergence; each level
+                                       // genuinely reaches a local optimum
+                                       // given ITS starting point). This
+                                       // field automates exactly the manual
+                                       // "run it again" workaround in a
+                                       // single call: 1 (default) reproduces
+                                       // the old single-sweep behavior
+                                       // exactly; 2-3 harvests most of the
+                                       // measured gain cheaply (each restart
+                                       // costs roughly one more full
+                                       // optimizeCoarseToFine call, ~1-1.4s
+                                       // on that same 5x5 test case -- scale
+                                       // accordingly for larger meshes).
+                                       // Left at 1 by default rather than
+                                       // silently multiplying every job's
+                                       // runtime; the macOS app / CLI can
+                                       // opt in explicitly (see
+                                       // --pyramid-restarts).
     int geomGaussNewtonItersPerOuter = 3;
     int cgMaxIterations = 200;
     double cgRelTolerance = 1e-5;

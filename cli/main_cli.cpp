@@ -61,8 +61,9 @@ static void printUsage(const char* prog) {
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
         "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--vline \"x,y;x,y;...\"]\n"
         "          [--vector-line-weight W]\n"
-        "          [--outer-iters N] [--outer-conv-tol X] [--gn-iters N] [--samples N]\n"
-        "          [--cg-iters N] [--use-ceres]\n"
+        "          [--outer-iters N] [--outer-conv-tol X] [--outer-conv-patience N]\n"
+        "          [--pyramid-restarts N]\n"
+        "          [--gn-iters N] [--samples N] [--cg-iters N] [--use-ceres]\n"
         "          [--use-ceres-joint]\n"
         "  --use-ceres: replace the hand-rolled geometry Gauss-Newton solver with a\n"
         "  ceres::Problem solve (OptimizerOptions::useCeresGeometry) -- only has any\n"
@@ -127,6 +128,8 @@ int main(int argc, char** argv) {
         else if (a == "--edge-min-factor") opts.smoothGeomMinFactor = std::stod(next());
         else if (a == "--outer-iters") opts.outerIterationsPerLevel = std::stoi(next());
         else if (a == "--outer-conv-tol") opts.outerConvergenceRelTol = std::stod(next());
+        else if (a == "--outer-conv-patience") opts.outerConvergencePatience = std::stoi(next());
+        else if (a == "--pyramid-restarts") opts.pyramidRestarts = std::stoi(next());
         else if (a == "--gn-iters") opts.geomGaussNewtonItersPerOuter = std::stoi(next());
         else if (a == "--samples") opts.samplesPerPatchEdge = std::stoi(next());
         else if (a == "--cg-iters") opts.cgMaxIterations = std::stoi(next());

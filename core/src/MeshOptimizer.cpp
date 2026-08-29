@@ -312,6 +312,11 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
     // ceiling than before, and this is what keeps an already-converged
     // case from always burning the whole thing).
     double prevOuterEnergy = std::numeric_limits<double>::infinity();
+    // Consecutive-stall counter -- see the early-exit block below for why a
+    // SINGLE flat outer iteration must not be enough to stop the loop: it
+    // can just mean lambda transiently ratcheted up after an unlucky
+    // rejected GN step, not that a real local optimum was reached.
+    int stalledOuterIters = 0;
 
     for (int outer = 0; outer < opts.outerIterationsPerLevel; ++outer) {
         // 1) Re-project boundary vertices onto their spline (soft constraint target).
@@ -735,10 +740,10 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
         double rmse = mesh.reconstructionRMSE(target, opts.samplesPerPatchEdge);
         if (cb) cb({level, totalLevels, outer, opts.outerIterationsPerLevel, rmse});
 
-        // Early-exit once this outer iteration's relative improvement in
-        // the composite geometry energy (data + vector-line + smoothness +
-        // tangent-prior + boundary -- the same objective backtracking
-        // already checks every GN sub-iteration) drops below
+        // Early-exit once several outer iterations IN A ROW show relative
+        // improvement in the composite geometry energy (data + vector-line
+        // + smoothness + tangent-prior + boundary -- the same objective
+        // backtracking already checks every GN sub-iteration) below
         // outerConvergenceRelTol. Skipped on the very first iteration
         // (nothing to compare against yet) and disabled entirely when
         // outerConvergenceRelTol <= 0. See OptimizerOptions's comment for
@@ -748,12 +753,40 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
         // regression that motivated this), and this is what keeps an
         // already-converged case (e.g. the smooth synthetic sphere) from
         // then always burning the whole, now much larger, ceiling.
+        //
+        // Requiring a RUN of stalled iterations (not just one) fixes a real
+        // bug found after a follow-up report that re-running the optimizer
+        // on its own output still kept improving RMSE even with this
+        // early-exit in place: when a GN sub-iteration's step is rejected
+        // (see the backtracking block above), the mesh is reverted and
+        // `lambda` is bumped 4x -- the geometry genuinely did not change
+        // that outer iteration, so its energy is (near-)identical to the
+        // previous one. A single-iteration check reads that as "converged"
+        // and stops immediately, even though the real cause is just that
+        // `lambda` transiently got too large for THIS outer iteration's
+        // linearization -- the very next outer iteration, still working
+        // from the same (unimproved) point but now with more damping
+        // headroom already spent, can easily find a good step once `lambda`
+        // works back down. Calling optimizeCoarseToFine() a second time
+        // resets `lambda` to opts.geomDampingInitial and gives the solve
+        // exactly that fresh chance -- which is why "run it twice" kept
+        // helping even after the single-iteration version of this check was
+        // added. Requiring outerConvergencePatience consecutive stalled
+        // iterations before actually stopping means a transient lambda
+        // ratchet no longer looks identical to real convergence: a lone
+        // stalled iteration just increments the counter and the loop keeps
+        // going, and the counter resets the moment any iteration improves
+        // enough again.
         if (opts.outerConvergenceRelTol > 0.0 && outer > 0) {
             double energyNow = computeGeometryEnergy(mesh, target, vectorLines, opts);
             double denom = std::max(prevOuterEnergy, 1e-12);
             double relImprovement = (prevOuterEnergy - energyNow) / denom;
             prevOuterEnergy = energyNow;
-            if (relImprovement < opts.outerConvergenceRelTol) break;
+            if (relImprovement < opts.outerConvergenceRelTol) {
+                if (++stalledOuterIters >= std::max(1, opts.outerConvergencePatience)) break;
+            } else {
+                stalledOuterIters = 0;
+            }
         } else if (opts.outerConvergenceRelTol > 0.0) {
             prevOuterEnergy = computeGeometryEnergy(mesh, target, vectorLines, opts);
         }
@@ -767,36 +800,49 @@ void MeshOptimizer::optimizeCoarseToFine(GradientMesh& mesh, const Image& fullRe
     auto levels = Image::buildPyramid(fullResTarget, std::max(1, numPyramidLevels));
     int L = (int)levels.size();
 
-    // Move the (full-resolution) mesh down to the coarsest level.
-    double sxDown = double(levels[L - 1].width) / double(levels[0].width);
-    double syDown = double(levels[L - 1].height) / double(levels[0].height);
-    mesh.scalePositions(sxDown, syDown);
+    // See OptimizerOptions::pyramidRestarts for why this outer loop exists:
+    // a single descend-to-coarsest/climb-to-finest sweep reaches A local
+    // optimum of this non-convex block-coordinate-descent problem, not
+    // necessarily the best one reachable -- re-descending to the coarsest
+    // level and re-climbing from an already-refined mesh can (and does,
+    // measurably) find a marginally better one. Each iteration here is
+    // byte-for-byte the same sweep this function always did; the only
+    // change for the default pyramidRestarts=1 is that this loop now runs
+    // once instead of the sweep being inline, so existing callers see zero
+    // behavior change.
+    int restarts = std::max(1, opts.pyramidRestarts);
+    for (int restart = 0; restart < restarts; ++restart) {
+        // Move the (full-resolution) mesh down to the coarsest level.
+        double sxDown = double(levels[L - 1].width) / double(levels[0].width);
+        double syDown = double(levels[L - 1].height) / double(levels[0].height);
+        mesh.scalePositions(sxDown, syDown);
 
-    for (int li = L - 1; li >= 0; --li) {
-        std::vector<VectorLine> scaledLines;
-        double sx = double(levels[li].width) / double(levels[0].width);
-        double sy = double(levels[li].height) / double(levels[0].height);
-        scaledLines.reserve(vectorLinesFullRes.size());
-        for (const auto& line : vectorLinesFullRes) {
-            VectorLine sl;
-            sl.points.reserve(line.points.size());
-            for (const auto& p : line.points) sl.points.push_back({p.x * sx, p.y * sy});
-            scaledLines.push_back(std::move(sl));
-        }
-        // levelOpts is currently just a copy of opts: the old per-level
-        // vectorLineInfluenceRadius rescaling (levelOpts.vectorLineInfluenceRadius
-        // *= max(sx,sy)) is gone -- the current vector-line term derives its
-        // band width from each (already per-axis-scaled) line's own polyline
-        // length every call (see nearestVectorLineField), so no separate
-        // level-dependent rescaling of a flat radius is needed any more.
-        const OptimizerOptions& levelOpts = opts;
+        for (int li = L - 1; li >= 0; --li) {
+            std::vector<VectorLine> scaledLines;
+            double sx = double(levels[li].width) / double(levels[0].width);
+            double sy = double(levels[li].height) / double(levels[0].height);
+            scaledLines.reserve(vectorLinesFullRes.size());
+            for (const auto& line : vectorLinesFullRes) {
+                VectorLine sl;
+                sl.points.reserve(line.points.size());
+                for (const auto& p : line.points) sl.points.push_back({p.x * sx, p.y * sy});
+                scaledLines.push_back(std::move(sl));
+            }
+            // levelOpts is currently just a copy of opts: the old per-level
+            // vectorLineInfluenceRadius rescaling (levelOpts.vectorLineInfluenceRadius
+            // *= max(sx,sy)) is gone -- the current vector-line term derives its
+            // band width from each (already per-axis-scaled) line's own polyline
+            // length every call (see nearestVectorLineField), so no separate
+            // level-dependent rescaling of a flat radius is needed any more.
+            const OptimizerOptions& levelOpts = opts;
 
-        optimizeAtCurrentResolution(mesh, levels[li], scaledLines, levelOpts, cb, li, L);
+            optimizeAtCurrentResolution(mesh, levels[li], scaledLines, levelOpts, cb, li, L);
 
-        if (li > 0) {
-            double sxUp = double(levels[li - 1].width) / double(levels[li].width);
-            double syUp = double(levels[li - 1].height) / double(levels[li].height);
-            mesh.scalePositions(sxUp, syUp);
+            if (li > 0) {
+                double sxUp = double(levels[li - 1].width) / double(levels[li].width);
+                double syUp = double(levels[li - 1].height) / double(levels[li].height);
+                mesh.scalePositions(sxUp, syUp);
+            }
         }
     }
 }

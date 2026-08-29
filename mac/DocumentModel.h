@@ -39,6 +39,17 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 @property (nonatomic, assign) BOOL useCeresGeometry;
 @property (nonatomic, assign) BOOL useCeresJoint;
 
+// How many times -[optimizeWithPyramidLevels:progress:completion:] repeats
+// the full coarse-to-fine sweep in one call -- mirrors
+// gmcore::OptimizerOptions::pyramidRestarts (see MeshOptimizer.h for the
+// full diagnosis of why this exists: a single sweep already reaches a real
+// local optimum at every pyramid level, but re-descending to the coarsest
+// level from an already-refined mesh can still find a marginally better one,
+// which is exactly what clicking "Optimize" a second time was doing
+// manually). 0 or unset is treated as 1 (the original single-sweep
+// behavior, unchanged) -- see -optimizeWithPyramidLevels:progress:completion:.
+@property (nonatomic, assign) NSInteger pyramidRestarts;
+
 // --- Image ---
 - (BOOL)loadImageAtURL:(NSURL*)url error:(NSError**)error;
 

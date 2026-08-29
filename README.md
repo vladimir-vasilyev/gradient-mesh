@@ -850,6 +850,76 @@ This fix, unlike the two Ceres-path fixes above, is fully verifiable in this san
 (pure hand-rolled C++, no Ceres dependency) -- confirmed end-to-end here, not just
 structurally reasoned about.
 
+### Follow-up: a real bug in the early-exit itself, plus a separate (non-bug) multi-restart effect
+
+Reported by the user immediately after the fix above: it helped, but running the
+hand-rolled optimizer again on its own output *still* measurably improved RMSE.
+That shouldn't happen if the early-exit above genuinely detects convergence, so this
+needed a real second look rather than just nudging `outerConvergenceRelTol` again.
+
+Found an actual bug in the early-exit's logic, not just a mistuned constant: it
+compares this outer iteration's composite energy to the previous one and stops the
+moment the relative improvement drops below `outerConvergenceRelTol` -- but a
+rejected Gauss-Newton step (see the backtracking block in
+`optimizeAtCurrentResolution`) *reverts* the mesh to its pre-step state and only
+bumps the Levenberg damping (`lambda`) up 4x. The geometry genuinely didn't change
+that outer iteration, so of course its energy looks unchanged -- but a
+single-iteration check can't tell that apart from real convergence, and stops right
+there. The very next outer iteration, working from that same point but with more
+damping headroom already spent, can easily find a good step once `lambda` settles --
+which is exactly what calling `optimizeCoarseToFine` a second time was doing by
+accident: it resets `lambda` back to `geomDampingInitial` and gives the solve a fresh
+chance that the premature stop had denied it.
+
+Fix: added `OptimizerOptions::outerConvergencePatience` (default 3) -- the early-exit
+now requires that many CONSECUTIVE stalled outer iterations before it actually
+breaks, instead of trusting a single one. A lone stall (lambda transiently too high)
+just increments a counter and the loop keeps going; the counter resets the moment any
+iteration improves enough again.
+
+Verified this actually fixes the underlying bug, not just moves the symptom, by
+isolating the two effects that were previously tangled together:
+
+- **At a single FIXED resolution** (`optimizeAtCurrentResolution` called directly,
+  no pyramid), with the patience fix in place: calling it again on its own output
+  now shows an honest **~0.00% gap** (0.03066 -> 0.03065 -> 0.03066, i.e. noise) --
+  confirming the early-exit itself now genuinely detects convergence and the
+  original bug is fixed, not just patched over with looser numbers.
+- **Through the FULL `optimizeCoarseToFine` pyramid pipeline**, a small residual gap
+  remains even with the fix (~0.2-0.3% RMSE per repeated call on the 5x5
+  `gradient.png` case) -- but this is a *different, structurally expected*
+  phenomenon, not the same bug resurfacing: every call re-descends the mesh to the
+  COARSEST pyramid level and re-climbs, and on a repeat call that descent starts from
+  an already-refined mesh instead of the crude initial one. Because this is
+  non-convex block-coordinate descent, a different starting point at the coarse
+  level can (and measurably does) lead to a marginally different, sometimes better,
+  local optimum by the time it climbs back to the finest level -- a multi-restart
+  effect inherent to any coarse-to-fine non-convex optimizer, not a sign that any
+  individual level failed to converge.
+
+Rather than leave this as "just run it again if you want the last bit of polish"
+(what the user was already doing manually), added `OptimizerOptions::pyramidRestarts`
+(default 1, so existing behavior is unchanged) so `optimizeCoarseToFine` can repeat
+its own full sweep N times in a single call. Verified bit-exact equivalence:
+`pyramidRestarts=2` in one call produces the identical final RMSE (0.03061) as two
+separate `optimizeCoarseToFine` calls on the same mesh. Exposed as `gmesh_cli
+--pyramid-restarts N` and as a `DocumentModel.pyramidRestarts` property on the macOS
+side (`DocumentModel.mm`'s `-optimizeWithPyramidLevels:progress:completion:`,
+following the same pattern as `useCeresGeometry`/`useCeresJoint`) -- left at the
+default of 1 there too rather than silently multiplying every optimize click's
+runtime; the macOS app doesn't yet have a UI control wired to this property (no
+storyboard/XIB change was made in this pass, since that can't be build-verified in
+this sandbox), so it currently only takes effect if set programmatically. A visible
+control (e.g. a small stepper next to the solver picker) would be a natural,
+low-risk follow-up.
+
+Full regression suite re-run again after this follow-up fix: sphere 9x9, `gradient.png`
+25x25 and 5x5 all build and run cleanly through `gmesh_cli`, including with
+`--pyramid-restarts 2` explicitly passed; `MeshOptimizerCeres.cpp` re-checked against
+the Ceres stub and is untouched/unaffected by this change (the patience and restart
+logic both live in the hand-rolled `optimizeAtCurrentResolution`/`optimizeCoarseToFine`
+control flow, outside the Ceres-specific solve functions those call into).
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

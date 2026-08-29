@@ -10,6 +10,7 @@
 #include <memory>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 
 using gmcore::Vec2;
 using gmcore::Color;
@@ -292,6 +293,8 @@ static NSError* gmError(NSString* msg) {
     // gating and the CLI's --use-ceres/--use-ceres-joint precedence.
     opts.useCeresGeometry = self.useCeresGeometry;
     opts.useCeresJoint = self.useCeresJoint;
+    // 0/unset -> 1: see DocumentModel.h's comment on this property.
+    opts.pyramidRestarts = (int)std::max((NSInteger)1, self.pyramidRestarts);
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts,
