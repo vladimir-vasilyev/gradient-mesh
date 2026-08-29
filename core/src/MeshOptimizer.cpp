@@ -648,6 +648,41 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             }
 
             auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 6, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+
+            // Hard-fix the 4 mesh corners' POSITION (sub-indices 0,1 = P.x,P.y)
+            // -- zero whatever the linear solve proposed for them, at every
+            // backtracking alpha, so they never move at all. Pu/Pv (subs
+            // 2..5) are left free -- only position is being hard-fixed here.
+            //
+            // Each corner is the exact junction of TWO boundary splines, not
+            // an interior point of a single one -- "slide along the spline"
+            // (Sec 4) is ambiguous there (which of the two splines?), and
+            // GradientMesh::buildInitial's boundarySide assignment picks one
+            // somewhat arbitrarily (see its if/else-if chain). The soft
+            // normal-only boundary constraint (see computeGeometryEnergy's
+            // comment) is only a valid linearization for a vertex that
+            // actually lives on the interior of its assigned curve; at a
+            // t=0/1 endpoint shared with a DIFFERENT curve, a large step can
+            // end up "tangential" with respect to the wrong curve's
+            // direction and drift arbitrarily far before the soft penalty
+            // pushes back -- diagnosed this way after the new vector-line
+            // term's stress test moved a corner vertex outside the image
+            // bounds even at low vectorLineWeight (see README). Corners are
+            // also structurally redundant as free unknowns: buildInitial()
+            // sets them to the boundary curves' own endpoints (P00/P10/P01/
+            // P11) exactly, so there's nothing to usefully solve for there
+            // anyway -- hard-fixing removes the failure mode entirely rather
+            // than just mitigating it. Simplest correct way to pin specific
+            // unknowns without restructuring the sparse solve into a smaller
+            // system: solve as if free, then discard the proposed delta for
+            // exactly those components before applying.
+            // (idx() may coincide for degenerate 1-row/1-col meshes -- listing
+            // all 4 corners and zeroing each is harmless even if some alias.)
+            for (int i : {mesh.idx(0, 0), mesh.idx(0, mesh.cols - 1),
+                          mesh.idx(mesh.rows - 1, 0), mesh.idx(mesh.rows - 1, mesh.cols - 1)}) {
+                delta[i * 6 + 0] = 0.0;
+                delta[i * 6 + 1] = 0.0;
+            }
 #ifdef GMCORE_DEBUG_GEOM
             double maxDelta = 0; for (double d : delta) maxDelta = std::max(maxDelta, std::abs(d));
             double gNorm = 0; for (double v : g) gNorm += v*v; gNorm = std::sqrt(gNorm);

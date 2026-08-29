@@ -44,6 +44,7 @@
 #include "gmcore/FergusonPatch.h"
 
 #include <ceres/ceres.h>
+#include <ceres/manifold.h>
 
 #include <algorithm>
 #include <array>
@@ -730,6 +731,29 @@ private:
     std::vector<SampleMatch> matches_;
 };
 
+// Hard-fixes the 4 mesh corners' POSITION (sub-indices 0,1 = P.x,P.y) within
+// their 6-double (P,Pu,Pv) geometry parameter block, via a SubsetManifold
+// that holds those 2 dimensions constant while leaving Pu/Pv (dims 2..5)
+// free -- direct transcription of the equivalent fix in MeshOptimizer.cpp
+// (see that file's comment, in optimizeAtCurrentResolution, for why: each
+// corner is the ambiguous junction of two boundary splines, where the soft
+// normal-only boundary constraint's linearization can badly break down
+// under a large step, e.g. from the new vector-line term). The parameter
+// block must already be known to `problem` (added via AddResidualBlock)
+// before SetManifold is called on it -- so this must run after all
+// residual blocks referencing `geomParams` have been added, not before.
+void fixCornerPositions(ceres::Problem& problem, const GradientMesh& mesh,
+                         std::vector<std::array<double, 6>>& geomParams) {
+    int corners[4] = {mesh.idx(0, 0), mesh.idx(0, mesh.cols - 1),
+                       mesh.idx(mesh.rows - 1, 0), mesh.idx(mesh.rows - 1, mesh.cols - 1)};
+    for (int a = 0; a < 4; ++a) {
+        bool dup = false;
+        for (int b = 0; b < a; ++b) if (corners[b] == corners[a]) dup = true;
+        if (dup) continue;
+        problem.SetManifold(geomParams[corners[a]].data(), new ceres::SubsetManifold(6, {0, 1}));
+    }
+}
+
 } // namespace
 
 // Runs ONE Ceres solve using weights/targets frozen from `snapshot`
@@ -856,6 +880,8 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
             }
         }
     }
+
+    fixCornerPositions(problem, mesh, params);
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::CGNR;
@@ -1004,6 +1030,8 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
         auto* cost = new ColorRidgeCostFunction(opts.colorDerivRidge);
         problem.AddResidualBlock(cost, nullptr, paramsColor[i].data());
     }
+
+    fixCornerPositions(problem, mesh, paramsGeom);
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::CGNR;

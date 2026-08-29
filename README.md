@@ -676,6 +676,59 @@ formulas, same freezing convention), but a real `ceres::GradientChecker` run on 
 `VectorLineCostFunction` hasn't been done yet (see "Optional: Ceres-based geometry
 solver" above for how prior passes did this verification).
 
+### Fixed: the 4 mesh corners are now hard-fixed (never move)
+
+Direct follow-up to the boundary-vertex divergence caveat in the section above: the
+corners (grid positions `(0,0)`, `(0,cols-1)`, `(rows-1,0)`, `(rows-1,cols-1)`) are
+each the exact junction of TWO boundary splines, not an interior point of a single
+one. "Control points on the boundary only move along the splines" (Sec 4) is
+ambiguous at a corner -- along *which* of the two splines? -- and
+`GradientMesh::buildInitial()`'s boundary-side assignment resolves the ambiguity
+somewhat arbitrarily (its `if`/`else-if` chain checks `r==0` before `c==cols-1`
+before `r==rows-1` before `c==0`, so e.g. the bottom-right corner ends up assigned to
+the *right* spline at `t=1`, not the bottom one). The soft normal-only boundary
+constraint's linearization (see "Fixed: boundary vertices were effectively frozen in
+place" above) is only valid for small displacements from that assigned point; at a
+`t=0`/`t=1` endpoint shared with a *different* curve, a large step (as the new,
+much stronger vector-line term can produce) can end up "tangential" with respect to
+the wrong curve's direction entirely and drift arbitrarily far before the soft
+penalty pushes back. That's exactly what the stress-test caveat above was seeing.
+
+Corners are also structurally redundant as free unknowns in the first place:
+`buildInitial()` sets them to the boundary curves' own endpoints (`P00`/`P10`/`P01`/
+`P11`) exactly, so there was never anything for the optimizer to usefully solve for
+there. Hard-fixing removes the failure mode entirely rather than tuning around it.
+
+Only *position* is fixed -- `Pu`/`Pv` (the free tangents) stay free at corner
+vertices, unaffected. Implementation differs by solve path but the effect is
+identical: the hand-rolled path solves the Gauss-Newton step as usual (corners stay
+in the normal equations, so the linear system shape doesn't change) and then simply
+zeroes the proposed position delta for the 4 corner vertices before applying it, at
+every backtracking `alpha` -- the simplest correct way to pin specific unknowns
+without restructuring the sparse solve into a smaller system. The Ceres path uses the
+tool built for exactly this, `ceres::SubsetManifold(6, {0, 1})` applied via
+`Problem::SetManifold` on each corner's 6-double `(P,Pu,Pv)` parameter block, holding
+dimensions 0-1 (`P.x`,`P.y`) constant while leaving 2-5 (`Pu`,`Pv`) free to vary --
+used identically in `ceresSolveOnce` and `jointSolveOnce`.
+
+Verified directly on the same adversarial stress test that surfaced the divergence
+(`gmesh_cli --input gradient.png --rows 5 --cols 5 --vline "106.5,40;106.5,173"`):
+all 4 corners now sit at exactly their fixed positions (`(6,6)`, `(207,6)`, `(6,207)`,
+`(207,207)` for this test's margins) in `_mesh_points.csv`, and the previous
+max-`|y|`-outside-image-bounds reading of ~277 is gone (max now ~207, i.e. within
+bounds) -- while the interior-column pinching effect that the vector-line rewrite was
+built to produce is fully preserved (columns 1-3 still land within a few pixels of
+the guide line's x-coordinate). Regression suite with no vector lines unaffected
+(sphere: 53.8%->55.4%, mildly *improved* since corners no longer waste any GN
+capacity fighting a doomed local linearization; 25x25: 60.6% unchanged; 5x5:
+61.7%->61.3%, within normal run-to-run noise).
+
+Syntax-checked against the local Ceres-API stub, extended with a minimal
+`ceres::SubsetManifold`/`Problem::SetManifold` stand-in for this check (see
+`/tmp/ceres_stub` in the session that made this change -- not checked into this
+repo). A real `ceres::GradientChecker`/build verification on this exact `SetManifold`
+usage against real Ceres hasn't been done yet.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)
