@@ -729,6 +729,59 @@ Syntax-checked against the local Ceres-API stub, extended with a minimal
 repo). A real `ceres::GradientChecker`/build verification on this exact `SetManifold`
 usage against real Ceres hasn't been done yet.
 
+### Diagnosed: useCeresJoint gave visibly the worst reconstruction of the three solver modes
+
+Reported by the user after testing all three solver modes (hand-rolled, `--use-ceres`,
+`--use-ceres-joint`) side by side in the app: the joint solve's output looked
+noticeably worse than either of the other two, not just marginally.
+
+Went through every joint-specific residual and Jacobian line by line looking for an
+actual formula bug -- `JointPatchDataCostFunction` (data term, both geometry and
+color as live parameters), `ColorSmoothTripleCostFunction`, `ColorRidgeCostFunction`,
+and the geometry-side terms it shares with `ceresSolveOnce` (smoothness,
+tangent-prior, boundary, vector-line). None of them showed a sign error, wrong array
+offset, or mismatched weight -- every one matches its corresponding hand-rolled term
+exactly, same as the already-verified `useCeresGeometry` path.
+
+What's structurally different about joint, and the likely actual cause: its
+parameter space is 18 doubles/vertex (6 geometry + 12 color) versus
+`useCeresGeometry`'s 6. Both the hand-rolled path and `useCeresGeometry` solve color
+*exactly*, via its own dedicated closed-form linear system -- up to
+`OptimizerOptions::cgMaxIterations` (200 by default) conjugate-gradient iterations
+against `cgRelTolerance`, freshly every single outer iteration. `useCeresJoint` has no
+such dedicated solve at all: color and geometry are minimized together in one
+`ceres::Problem`, and the internal Ceres iteration cap used for that combined solve
+(`jointSolveOnce`'s `maxIters` argument) was hardcoded to the same value (6) as
+`useCeresGeometry`'s -- appropriate for a 6-dimensional-per-vertex problem, almost
+certainly far too few for one 3x the size that also has to arrive at a good color fit
+with no dedicated linear solve to fall back on. Each of those 6 outer
+Levenberg-Marquardt iterations only gets one shot at an internally-approximated
+linearized step before `optimizeJointCeres`'s own gate (`computeTrueJointEnergy`,
+same verify-and-shrink-or-revert pattern as `optimizeGeometryCeres`) re-checks the
+true energy and, on rejection, throws the whole sub-step away -- so an
+under-converged combined step is exactly the kind of thing that gate would end up
+rejecting most of the time, plausibly explaining reconstructions that look close to
+the un-optimized initial mesh.
+
+Fix: `optimizeJointCeres` now reuses `opts.cgMaxIterations` (200 by default) as
+Ceres's own outer iteration cap for the joint solve, instead of the 6 borrowed from
+`useCeresGeometry`. Ceres's own convergence tolerances (`function_tolerance` etc.)
+still apply, so a well-converged joint step should terminate well before hitting 200
+in practice -- 200 is a ceiling, not a target iteration count. Added
+`OptimizerOptions::cgMaxIterations` as a CLI flag (`gmesh_cli --cg-iters N`) so this
+(and the hand-rolled color solve's own budget, which already used this same field) is
+tunable without recompiling.
+
+**Not yet verified against a real Ceres build** -- this sandbox has no Ceres
+installed, so this fix is syntax-checked and structurally sound but unconfirmed to
+actually fix the visual quality issue; it should be re-tested by rebuilding on macOS
+with the real Homebrew Ceres and comparing `--use-ceres-joint` output before/after
+this change on the same test image. Expect `--use-ceres-joint` to run noticeably
+slower than before as a result of this change (up to ~33x more Ceres-internal
+iterations allowed per call, though real convergence should stop well short of that
+ceiling most of the time) -- a wall-clock timing comparison for this mode still
+hasn't been done (see "Optional: Ceres-based geometry solver" above).
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

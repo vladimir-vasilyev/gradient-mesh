@@ -61,7 +61,8 @@ static void printUsage(const char* prog) {
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
         "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--vline \"x,y;x,y;...\"]\n"
         "          [--vector-line-weight W]\n"
-        "          [--outer-iters N] [--gn-iters N] [--samples N] [--use-ceres] [--use-ceres-joint]\n"
+        "          [--outer-iters N] [--gn-iters N] [--samples N] [--cg-iters N] [--use-ceres]\n"
+        "          [--use-ceres-joint]\n"
         "  --use-ceres: replace the hand-rolled geometry Gauss-Newton solver with a\n"
         "  ceres::Problem solve (OptimizerOptions::useCeresGeometry) -- only has any\n"
         "  effect if this binary was built with Ceres found (see CMakeLists.txt); a\n"
@@ -126,6 +127,7 @@ int main(int argc, char** argv) {
         else if (a == "--outer-iters") opts.outerIterationsPerLevel = std::stoi(next());
         else if (a == "--gn-iters") opts.geomGaussNewtonItersPerOuter = std::stoi(next());
         else if (a == "--samples") opts.samplesPerPatchEdge = std::stoi(next());
+        else if (a == "--cg-iters") opts.cgMaxIterations = std::stoi(next());
         else if (a == "--use-ceres") opts.useCeresGeometry = true;
         else if (a == "--use-ceres-joint") opts.useCeresJoint = true;
         else if (a == "-h" || a == "--help") { printUsage(argv[0]); return 0; }

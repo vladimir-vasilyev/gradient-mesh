@@ -1132,7 +1132,39 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
 // cost function, not the true energy.
 void optimizeJointCeres(GradientMesh& mesh, const Image& target,
                          const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
-    const int itersPerSubStep = 6; // same modest budget as optimizeGeometryCeres, same rationale
+    // NOT the same modest budget as optimizeGeometryCeres -- and using the
+    // same value (6) was likely the actual bug behind a report that
+    // useCeresJoint produced visibly the worst reconstruction of the three
+    // solver modes (worse than both the hand-rolled path and
+    // useCeresGeometry). Extensive review of every joint residual/Jacobian
+    // (JointPatchDataCostFunction, ColorSmoothTripleCostFunction,
+    // ColorRidgeCostFunction, and the geometry-side terms shared with
+    // ceresSolveOnce) found no sign or formula error -- every one matches
+    // its corresponding hand-rolled term exactly (see this file's header
+    // comment and each CostFunction's own comment). What's different about
+    // joint, structurally: its parameter space is 18 doubles/vertex (6
+    // geometry + 12 color), while the hand-rolled and useCeresGeometry
+    // paths solve color EXACTLY via its own dedicated closed-form linear
+    // system -- up to opts.cgMaxIterations (200) conjugate-gradient
+    // iterations against opts.cgRelTolerance, every single outer iteration
+    // (see optimizeAtCurrentResolution's color step). useCeresJoint has no
+    // such dedicated solve: color and geometry are minimized together in
+    // ONE ceres::Problem, and `maxIters` here caps Ceres's own outer
+    // trust-region (Levenberg-Marquardt) iteration count for that combined
+    // problem -- 6 such iterations is a reasonable budget for the
+    // geometry-only problem (6 doubles/vertex, verified working well
+    // against real Ceres per the README), but is very likely far too few
+    // for a problem 3x the size that also has to arrive at a good color
+    // fit with no dedicated linear solve to fall back on -- each outer LM
+    // iteration only gets one shot at an (internally CG-approximated)
+    // linearized step before this function's own gate re-checks the true
+    // energy and, on rejection, throws the whole sub-step away. Reusing
+    // opts.cgMaxIterations (default 200) here gives Ceres's own LM loop
+    // room to actually converge instead of being cut off after 6 steps --
+    // NOT yet verified against a real Ceres build (this sandbox has no
+    // Ceres to run), so treat this as a well-reasoned fix pending that
+    // confirmation, not a proven one.
+    const int itersPerSubStep = std::max(6, opts.cgMaxIterations);
     for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
         std::vector<MeshVertex> before = mesh.vertices;
         double energyBefore = computeTrueJointEnergy(mesh, target, vectorLines, opts);
