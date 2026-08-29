@@ -60,6 +60,7 @@ static void printUsage(const char* prog) {
         "          [--pyramid-levels N] [--margin px] [--width W --height H]\n"
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
         "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--vline \"x,y;x,y;...\"]\n"
+        "          [--vector-line-weight W]\n"
         "          [--outer-iters N] [--gn-iters N] [--samples N] [--use-ceres] [--use-ceres-joint]\n"
         "  --use-ceres: replace the hand-rolled geometry Gauss-Newton solver with a\n"
         "  ceres::Problem solve (OptimizerOptions::useCeresGeometry) -- only has any\n"
@@ -89,7 +90,7 @@ int main(int argc, char** argv) {
         if (a == "--input") inputPath = next();
         else if (a == "--vline") {
             // "x0,y0;x1,y1;..." -- one guide polyline, for testing the
-            // vector-line constraint (Sec 4.3) without the GUI.
+            // vector-line constraint (Sec 4.2) without the GUI.
             std::string spec = next();
             VectorLine line;
             size_t pos = 0;
@@ -118,6 +119,7 @@ int main(int argc, char** argv) {
         else if (a == "--smooth-color") opts.smoothWeightColor = std::stod(next());
         else if (a == "--color-ridge") opts.colorDerivRidge = std::stod(next());
         else if (a == "--boundary-weight") opts.boundaryWeight = std::stod(next());
+        else if (a == "--vector-line-weight") opts.vectorLineWeight = std::stod(next());
         else if (a == "--tangent-prior") opts.geomTangentPriorWeight = std::stod(next());
         else if (a == "--edge-gain") opts.smoothGeomEdgeGain = std::stod(next());
         else if (a == "--edge-min-factor") opts.smoothGeomMinFactor = std::stod(next());

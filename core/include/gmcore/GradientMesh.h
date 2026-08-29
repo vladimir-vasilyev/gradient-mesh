@@ -2,16 +2,20 @@
 // topologically-rectangular arrangement of Ferguson patches, exactly the
 // representation described in Sun et al. 2007, Sec. 3-4.
 //
-// Geometry tangents Pu, Pv AND the twist Puv are all free per-vertex
-// unknowns (as in the paper), jointly optimized alongside P by the
-// geometry Gauss-Newton step in MeshOptimizer -- see MeshVertex below.
-// Puv used to be *derived* from neighboring vertex positions via centered
-// finite differences (Catmull-Rom style); that simplification is gone as
-// of the pass that added Puv to the free-unknown set (see git history --
-// GradientMesh::twist() still exists, now serving only as Puv's initial
-// seed value and the optimizer's soft "prior" target, exactly the role
-// tangentU/V already play for Pu/Pv). Color keeps the full, independent
-// (C, Cu, Cv, Cuv) unknown set per vertex, unaffected by this.
+// Geometry tangents Pu, Pv are free per-vertex unknowns (as in the paper),
+// jointly optimized alongside P by the geometry Gauss-Newton step in
+// MeshOptimizer -- see MeshVertex below. The twist Puv is NOT free: the
+// paper states plainly (Sec 3), "The mu, mv, muv are the partial
+// derivatives. In practice, the values of muv are usually set to zero" --
+// so geomCorner() hardcodes it to {0,0} rather than reading a per-vertex
+// value or deriving it via finite differences. (An earlier pass in this
+// project briefly promoted Puv to a free unknown too, for completeness;
+// reverted after rereading the paper's own text on this point -- see git
+// history.) The MeshVertex::Puv field below is kept only as inert storage
+// (never read by geomCorner/evalPos, never touched by the optimizer) so
+// serialization/CSV code that references it doesn't need to change; it is
+// always {0,0}. Color keeps the full, independent (C, Cu, Cv, Cuv) unknown
+// set per vertex, unaffected by any of this.
 #pragma once
 #include "gmcore/Vec2.h"
 #include "gmcore/Color.h"
@@ -25,13 +29,15 @@ namespace gmcore {
 
 struct MeshVertex {
     Vec2 P;
-    // Geometry tangents Pu, Pv AND the twist Puv are all FREE unknowns
-    // (matching the paper), not derived via finite differences -- see
-    // GradientMesh::tangentU/V/twist, which still exist but now serve only
-    // as (a) the initial value seeded in buildInitial and (b) the
-    // optimizer's soft "prior" target that keeps them grounded near the
-    // position-implied estimate instead of drifting unconstrained (see
-    // MeshOptimizer's geomTangentPriorWeight, which anchors all three).
+    // Geometry tangents Pu, Pv are FREE unknowns (matching the paper), not
+    // derived via finite differences -- see GradientMesh::tangentU/V, which
+    // still exist but now serve only as (a) the initial value seeded in
+    // buildInitial and (b) the optimizer's soft "prior" target that keeps
+    // them grounded near the position-implied estimate instead of drifting
+    // unconstrained (see MeshOptimizer's geomTangentPriorWeight, which
+    // anchors both). Puv (twist) is NOT free -- see the file header comment
+    // above; this field is inert storage, always {0,0}, never read by
+    // geomCorner/evalPos.
     Vec2 Pu, Pv, Puv;
     Color C, Cu, Cv, Cuv;
     bool isBoundary = false;
@@ -56,11 +62,13 @@ public:
                                       const Image& target);
 
     // Position-implied tangent/twist estimate (centered finite difference
-    // of neighboring P's) -- NOT what geomCorner()/evalPos() actually use
-    // for Pu/Pv/Puv any more (those read the free MeshVertex::Pu/Pv/Puv
-    // fields directly). Used only to seed the free unknowns in
-    // buildInitial() and as MeshOptimizer's soft "prior" anchor (see
-    // MeshVertex comment).
+    // of neighboring P's). tangentU/tangentV are NOT what geomCorner()/
+    // evalPos() use for Pu/Pv any more (those read the free
+    // MeshVertex::Pu/Pv fields directly) -- used only to seed the free
+    // unknowns in buildInitial() and as MeshOptimizer's soft "prior" anchor
+    // (see MeshVertex comment). twist() is unused by geomCorner() (which
+    // hardcodes Puv to {0,0} per the paper's Sec 3) but is kept as a
+    // utility / for any future experimentation.
     Vec2 tangentU(int row, int col) const;
     Vec2 tangentV(int row, int col) const;
     Vec2 twist(int row, int col) const;

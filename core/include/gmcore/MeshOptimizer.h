@@ -62,16 +62,41 @@ struct OptimizerOptions {
                                        // computeGeometryEnergy comment) -- along-curve sliding is
                                        // always free, matching the paper's "control points on the
                                        // boundary only move along the splines" (Sec 4)
-    double vectorLineWeight = 60.0;   // soft alignment of nearby mesh edges to user guide lines
-    double vectorLineInfluenceRadius = 25.0; // pixels, in the *current pyramid level's* scale
-    double geomTangentPriorWeight = 0.6; // soft pull of free Pu/Pv/Puv toward the position-implied
-                                       // finite-difference estimate (GradientMesh::tangentU/V/twist),
+    double vectorLineWeight = 20.0;   // soft alignment of the analytic surface tangent (dm/du,
+                                       // dm/dv) to nearby user guide lines, evaluated at every
+                                       // dense data-term sample -- rewritten to match the paper's
+                                       // Sec 4.2 formula exactly (Eq. in that section): for each
+                                       // sample, find the globally nearest guide line, compute a
+                                       // Gaussian weight wu/wv = G(d | 0, sigma^2) where d is the
+                                       // distance to that line and sigma = (line's own polyline
+                                       // length / 5) / 3 (i.e. sigma is 1/3 of a "narrow band" whose
+                                       // width is 1/5 of the line's length -- both straight from the
+                                       // paper's text), hard-cut to zero outside that band, and add
+                                       // weight * (perp-component of the tangent along the line
+                                       // direction)^2. This replaced an older, coarser approximation
+                                       // that only checked discrete straight mesh-edges (not the
+                                       // analytic Hermite tangent) against edge midpoints within a
+                                       // single flat global pixel radius -- see git history and
+                                       // MeshOptimizer.cpp's nearestVectorLineField for the current,
+                                       // paper-faithful version. Default 20.0 matches the paper's
+                                       // stated beta=20 default for this term.
+    double vectorLineInfluenceRadius = 25.0; // UNUSED by the current (Sec-4.2-faithful) vector-line
+                                       // term -- the effective band width is now derived per-line
+                                       // from that line's own length (see vectorLineWeight above),
+                                       // not from a single flat radius. Left in OptimizerOptions,
+                                       // inert, for ABI/config-file compatibility; may be removed
+                                       // later if nothing external depends on it.
+    double geomTangentPriorWeight = 0.6; // soft pull of free Pu/Pv toward the position-implied
+                                       // finite-difference estimate (GradientMesh::tangentU/V),
                                        // re-anchored every GN sub-iteration. 0 = fully free (as in
                                        // the paper); very large = old fully-derived behavior. Needed
-                                       // because Pu/Pv/Puv are now free unknowns (see GradientMesh.h's
-                                       // MeshVertex comment) and, unlike a position, a tangent/twist has
+                                       // because Pu/Pv are free unknowns (see GradientMesh.h's
+                                       // MeshVertex comment) and, unlike a position, a tangent has
                                        // no sensible "pull toward zero" prior -- zero would collapse the
                                        // patch -- so this grounds them near a sane default instead.
+                                       // Puv is NOT included here: it's fixed at {0,0} per the
+                                       // paper's Sec 3 ("the values of muv are usually set to
+                                       // zero"), not free and not derived -- see GradientMesh.h.
     int outerIterationsPerLevel = 8;
     int geomGaussNewtonItersPerOuter = 3;
     int cgMaxIterations = 200;
@@ -96,16 +121,15 @@ struct OptimizerOptions {
 
     // Opt-in, stronger than useCeresGeometry: replace BOTH the closed-form
     // color linear solve AND the geometry Gauss-Newton block with a single
-    // ceres::Problem solving position (P,Pu,Pv,Puv) and ALL FOUR free
+    // ceres::Problem solving position (P,Pu,Pv) and ALL FOUR free
     // color unknowns (C,Cu,Cv,Cuv) jointly, in one nonlinear least-squares
     // problem per re-snapshot -- the fully-joint solve described in the
     // class header comment above ("rather than one fully-joint LM
     // solve... this implementation uses block-coordinate descent"), which
     // was previously blocked by the hand-rolled SparseBlockMatrix's fixed
-    // `double tmp[16]` scratch buffers (a joint block is 8+12=20 doubles/
-    // vertex, now that Puv is also free -- was 6+12=18 before that pass).
-    // Ceres has no such ceiling and doesn't even need geometry and color
-    // unified into one parameter block -- see MeshOptimizerCeres.cpp's
+    // `double tmp[16]` scratch buffers (a joint block is 6+12=18 doubles/
+    // vertex). Ceres has no such ceiling and doesn't even need geometry and
+    // color unified into one parameter block -- see MeshOptimizerCeres.cpp's
     // optimizeJointCeres/jointSolveOnce.
     //
     // Motivation: investigating why even the geometry-only Ceres path

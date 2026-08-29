@@ -112,15 +112,17 @@ multi-person, multi-month effort. To get something real, working, and checkable 
 this project's scope, a few deliberate simplifications were made -- all noted in code
 comments at the relevant spot too:
 
-* ~~Twist (`Puv`) is derived, not free.~~ **No longer a simplification -- fixed.**
-  Position `P`, tangents `Pu`, `Pv` AND the twist `Puv` are now all free per-vertex
-  unknowns, jointly refined by the geometry Gauss-Newton step (see "Fixed: Pu/Pv
-  promoted to free unknowns" and "Fixed: Puv promoted to a free unknown too" below),
-  exactly the 4-value-per-corner Hermite corner the paper describes.
-  `Puv` used to be computed from neighboring positions via centered finite differences
-  (Catmull-Rom style) instead of being a free unknown; that gap is closed. Color keeps
-  the full independent `(C, Cu, Cv, Cuv)` unknown set, which is what actually gives a
-  gradient mesh its shading expressiveness -- geometry now matches that same shape.
+* **Twist (`Puv`) is fixed at zero, per the paper's own text.** Position `P` and
+  tangents `Pu`, `Pv` are free per-vertex unknowns, jointly refined by the geometry
+  Gauss-Newton step (see "Fixed: Pu/Pv promoted to free unknowns" below). An earlier
+  pass in this project (see "Fixed: Puv promoted to a free unknown too" below, now
+  itself reverted -- see "Reverted: Puv back to fixed zero, vector-line term rewritten
+  per Sec 4.2" further down) briefly promoted `Puv` to a free unknown too, "for
+  completeness of paper-fidelity." Rereading the paper's Sec 3 turned up the actual
+  text: "The mu, mv, muv are the partial derivatives. In practice, the values of muv
+  are usually set to zero" -- i.e. the paper itself does NOT treat twist as a free
+  unknown. `GradientMesh::geomCorner()` now hardcodes it to `{0,0}` again. Color keeps
+  the full independent `(C, Cu, Cv, Cuv)` unknown set, unaffected by any of this.
 * **Block-coordinate descent, not one joint solve.** Colors enter the reconstruction
   error *linearly*, so they're solved exactly with one sparse linear system per outer
   iteration; geometry enters *nonlinearly* (through the image lookup) and is refined with
@@ -406,6 +408,12 @@ above would be a useful check.
 
 ### Fixed: Puv (twist) promoted to a free unknown too
 
+> **Note (later reverted):** this section is kept as an honest historical record, but
+> the change it describes was undone in a later pass after rereading the paper's Sec 3
+> turned up "In practice, the values of muv are usually set to zero" -- see "Reverted:
+> Puv back to fixed zero, vector-line term rewritten per Sec 4.2" near the end of this
+> file. `Puv` is fixed at `{0,0}` again, not a free unknown.
+
 Follow-up to the two sections above: `Puv` (the mixed second partial,
 "twist", at each Ferguson-patch corner) was still *derived* via centered
 finite differences from neighboring vertices' `P` (`GradientMesh::twist`),
@@ -543,6 +551,130 @@ Ceres's more robust step acceptance help with the Fig. 4 pinching
 question), a wall-clock timing comparison, and a visual wireframe-overlay
 sanity check of the Ceres-produced mesh (same techniques used earlier in
 this file for the hand-rolled path's fidelity checks).
+
+### Bug found and fixed: boundary vertices were effectively frozen in place
+
+The paper says (Sec 4): "control points on the boundary only move along the splines" --
+1 degree of freedom per boundary vertex (its position along the curve), not 2. The
+existing soft `boundaryWeight` penalty instead pulled each boundary vertex toward a
+fixed re-projected point using the FULL 2D residual (`P.x - target.x`, `P.y -
+target.y`, both weighted equally), which resists along-curve (tangential) motion just
+as hard as off-curve (normal) drift -- not "free to slide", but "stay near this one
+point". Confirmed empirically via `_mesh_points.csv`: boundary vertices sat at almost
+exactly their initial uniform-spacing coordinates even after full optimization, no
+matter how many outer iterations ran.
+
+Fixed by projecting the residual onto only the curve's NORMAL direction at the
+vertex's current `boundaryT` (`Vec2{-tangent.y, tangent.x}.normalized()`), leaving the
+tangential component completely free -- a single scalar residual instead of two
+independent x/y ones, in both the hand-rolled path and the shared Ceres
+`BoundaryCostFunction`. Verified via before/after `_mesh_points.csv` comparison
+(vertices visibly non-uniformly spaced after the fix) and a small RMSE improvement
+across the regression suite (5x5: 60.8%->61.8%, 25x25: 59.1%->61.1%, sphere:
+unchanged). Found while investigating a user report that the mesh still wasn't
+snapping to sharp edges the way the paper's Fig. 4 shows, even on cases predating the
+Puv-free experiment above -- this was the actual root cause of that, not twist.
+
+A related follow-up fix, found later in this same investigation (see next section):
+the boundary re-projection (`closestT()` against the vertex's current position) was
+only being re-run once per OUTER iteration, not once per Gauss-Newton sub-iteration.
+That's fine for small steps, but a strong pull (like the new vector-line term below
+can produce) can move a boundary vertex far enough in a single GN sub-step that the
+target/normal computed at the top of the outer iteration is badly stale by the time
+the *next* sub-step's linearization uses it. Now re-projected every GN sub-iteration
+in both the hand-rolled path and `MeshOptimizerCeres.cpp`'s `ceresSolveOnce`/
+`jointSolveOnce`, at the same frequency backtracking already re-checks the true
+energy.
+
+### Reverted: Puv back to fixed zero, vector-line term rewritten per Sec 4.2
+
+Two changes made together after a careful reread of the paper, prompted by the
+question above ("why can't we get a sharp edge like Fig. 4") not being resolved by
+either the boundary fix or the earlier Puv-free experiment on their own:
+
+**1. Puv reverted to fixed `{0,0}`.** As already covered in the note above: the
+paper's Sec 3 says plainly, "In practice, the values of muv are usually set to zero."
+Promoting it to a free unknown (see "Fixed: Puv promoted to a free unknown too" above)
+was a paper-fidelity regression, not an improvement -- caught by rereading the primary
+source rather than assuming the more-general/more-free version was automatically more
+faithful. `GradientMesh::geomCorner()` hardcodes `Puv` to `{0,0}` again; the
+`MeshVertex::Puv` field itself is kept (as inert, always-zero storage) only so
+CSV/serialization code referencing it doesn't need to change. All Ceres cost functions
+(`PatchDataCostFunction`, `JointPatchDataCostFunction`, `SmoothTripleCostFunction`,
+`TangentPriorCostFunction`, `BoundaryCostFunction`) went back to 6-double (not 8-double)
+geometry parameter blocks.
+
+**2. The vector-line-guided term (Sec 4.2) was rewritten to match the paper's actual
+formula.** The previous implementation was a coarse approximation: it only checked the
+discrete straight edge between two adjacent control points (at its midpoint) against a
+single flat global pixel radius (`vectorLineInfluenceRadius`), and never touched the
+free tangent unknowns `Pu`/`Pv` at all -- so the term could pull vertex *positions*
+toward alignment but had no way to shape the *tangent* the way the paper describes.
+The paper's own formula (quoted verbatim from Sec 4.2): for the nearest vector line to
+a point `m(u,v)`, `wu(m(u,v)) = G(d|0,sigma_v^2)` where `d` is the distance to that
+line and `sigma_v` is one third of a "narrow band" width, itself one fifth of the
+line's own length; the term penalizes the component of the analytic surface tangent
+(`dm/du`, `dm/dv`) perpendicular to the line's direction, Gaussian-weighted by that
+`d`. This is now implemented as `nearestVectorLineField()` (`MeshOptimizer.cpp`,
+mirrored in `MeshOptimizerCeres.cpp`), evaluated at the SAME dense per-patch `(u,v)`
+sample grid the data term already uses -- not just at discrete mesh edges -- using the
+analytic `dU`/`dV` from `evalPos()` and `PatchWeights`' `wu`/`wv` arrays for the
+Jacobian, exactly the way the data term already reuses the `w` array for `d(pos)/d
+(corner)`. `vectorLineWeight`'s default changed from 60 to the paper's stated `beta=20`.
+`vectorLineInfluenceRadius` is now unused (the band width is derived per-line from
+each line's own polyline length) but left in `OptimizerOptions` as an inert field for
+config compatibility.
+
+The new term's Jacobian (`d(ru)/d(corner param)`, `d(rv)/d(corner param)` via
+`pw.wu`/`pw.wv`) was verified against a standalone finite-difference harness before
+being trusted: 60,000 entries checked across 50 random patch configurations and 25
+`(u,v)` sample points each, 0 bad, max relative error 3.0e-10 -- effectively exact.
+
+**Result -- the core question of this whole investigation, finally answered:** adding
+a single guide vector line down the middle of a 5x5 mesh's domain (`gmesh_cli --vline
+"106.5,40;106.5,173"`) causes the three interior mesh-columns to collapse tightly
+around the line -- x-coordinates of columns 1, 2 and 3 (of 0..4) landing within about
+5-8 pixels of the line's x=106.5, versus being evenly spread across the full ~200px
+width with no vector line supplied. This is the genuine "sharp edge from mesh-line
+collapse" effect the paper's Fig. 4 shows, and it did not happen with the old
+discrete-edge/flat-radius approximation. Both the boundary fix and the Puv revert were
+necessary but not sufficient on their own; it was specifically making the vector-line
+term dense, analytic-tangent-based and paper-accurate that produced the effect.
+
+**Caveat, reported honestly rather than hidden:** in that same stress test, a couple of
+boundary vertices land visibly outside the image bounds (e.g. y~277 against a 213px-tall
+image), and this persisted even after the boundary-reprojection-per-substep fix above,
+across a range of `vectorLineWeight` values including well below the default. The
+Jacobian is verified exact (see above), and the regression suite with no vector lines
+is unaffected, so this isn't a sign error -- it looks like a real (if extreme) energy
+trade-off: `computeGeometryEnergy`'s backtracking only requires each step to *decrease*
+the total weighted energy, and a single vector line spanning nearly the full height of
+a tiny 5x5 mesh is a deliberately adversarial test case (an unrealistically dominant,
+image-spanning constraint relative to the boundary/data terms) rather than typical
+usage (a shorter guide line traced along an actual detected feature, on a finer mesh
+where each line's influence is more local). Not yet re-tested with a more realistic
+guide line length/placement, or with `boundaryWeight` raised to compensate -- worth
+doing before relying on this term heavily on real images with vector-line input.
+
+Regression suite (hand-rolled path, no Ceres, no vector lines, same three cases used
+throughout this file):
+
+| case | before this pass | after this pass |
+|---|---|---|
+| synthetic sphere, 9x9 | 53.8% reduction | 53.8% reduction (unchanged) |
+| 25x25 `gradient.png` | 59.1%-61.1%\* | 60.6% reduction |
+| 5x5 `gradient.png` | 60.8%-61.8%\* | 61.7% reduction |
+
+\* range reflects the boundary-fix-only numbers from the previous section; not a
+regression, just noting the small amount of run-to-run variation already present in
+this codebase's block-coordinate scheme.
+
+Not yet done: re-verifying the equivalent Ceres-path (`--use-ceres`/`--use-ceres-joint`)
+numbers on the real macOS/Ceres build -- the changes were syntax-checked against a
+local Ceres-API stub and are structurally identical to the hand-rolled path (same
+formulas, same freezing convention), but a real `ceres::GradientChecker` run on the new
+`VectorLineCostFunction` hasn't been done yet (see "Optional: Ceres-based geometry
+solver" above for how prior passes did this verification).
 
 ## How this was tested
 

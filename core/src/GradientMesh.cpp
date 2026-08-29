@@ -33,9 +33,12 @@ HermiteCorner<Vec2> GradientMesh::geomCorner(int row, int col) const {
     HermiteCorner<Vec2> hc;
     const MeshVertex& v = at(row, col);
     hc.P = v.P;
-    hc.Pu = v.Pu;   // free unknown (see MeshVertex comment)
-    hc.Pv = v.Pv;   // free unknown
-    hc.Puv = v.Puv; // free unknown too, as of the Puv-promotion pass
+    hc.Pu = v.Pu;         // free unknown (see MeshVertex comment)
+    hc.Pv = v.Pv;         // free unknown
+    hc.Puv = Vec2{0, 0};  // fixed at zero, per the paper's Sec 3: "In
+                          // practice, the values of muv are usually set to
+                          // zero" -- NOT read from v.Puv (that field is
+                          // inert storage; see GradientMesh.h)
     return hc;
 }
 
@@ -109,36 +112,35 @@ GradientMesh GradientMesh::buildInitial(int rows, int cols, const std::array<Cub
             mv.Cu = cu; mv.Cv = cv; mv.Cuv = Color{0, 0, 0};
         }
     }
-    // Third pass: seed the free geometry tangents Pu/Pv and twist Puv from
-    // the position-implied finite-difference estimate (all positions are
+    // Third pass: seed the free geometry tangents Pu/Pv from the
+    // position-implied finite-difference estimate (all positions are
     // already final at this point, so this can run in any order relative
     // to the color pass above). The optimizer is then free to move them
-    // away from this starting value.
+    // away from this starting value. Puv is left at its default {0,0} and
+    // stays there -- it's fixed, not seeded/optimized (see GradientMesh.h).
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             MeshVertex& mv = mesh.at(r, c);
             mv.Pu = mesh.tangentU(r, c);
             mv.Pv = mesh.tangentV(r, c);
-            mv.Puv = mesh.twist(r, c);
         }
     }
     return mesh;
 }
 
 void GradientMesh::scalePositions(double sx, double sy) {
-    // Pu/Pv/Puv are position-derivative-scale quantities (pixels per unit
-    // parametric u/v [or u*v for the twist], over a patch always spanning
-    // u,v in [0,1]) -- they must scale linearly with position when the mesh
-    // moves between pyramid levels, exactly like P itself, or the surface
-    // would come out badly distorted at the next resolution. This holds
-    // per-component regardless of which derivative it is: Puv.x is still
-    // just an x-coordinate quantity, so it scales by sx same as P.x/Pu.x/
-    // Pv.x, and likewise Puv.y by sy.
+    // Pu/Pv are position-derivative-scale quantities (pixels per unit
+    // parametric u/v, over a patch always spanning u,v in [0,1]) -- they
+    // must scale linearly with position when the mesh moves between
+    // pyramid levels, exactly like P itself, or the surface would come out
+    // badly distorted at the next resolution. Puv is fixed at {0,0} and
+    // has no free value to rescale, so it's left untouched here (scaling
+    // zero by anything is still zero, but there's no meaningful reason to
+    // even touch the inert field).
     for (auto& v : vertices) {
         v.P.x *= sx; v.P.y *= sy;
         v.Pu.x *= sx; v.Pu.y *= sy;
         v.Pv.x *= sx; v.Pv.y *= sy;
-        v.Puv.x *= sx; v.Puv.y *= sy;
     }
     for (auto& b : boundary) {
         b.p0.x *= sx; b.p0.y *= sy; b.p1.x *= sx; b.p1.y *= sy;

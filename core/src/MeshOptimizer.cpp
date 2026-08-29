@@ -55,6 +55,13 @@ double areaWeightAt(const GradientMesh& mesh, int pr, int pc, double u, double v
 // GN sub-iteration re-linearizes here, same as everywhere else in this
 // file), so it adapts as a vertex approaches an edge rather than being
 // fixed at the mesh's starting shape.
+//
+// NOTE: this whole edgeRelaxFactor/anisotropic-smoothing mechanism is NOT
+// in the paper (Sec 4.1's smoothness term is a single flat isotropic
+// weight lambda, applied to position only) -- it was added earlier in this
+// project as a workaround for pinching resistance. Left in place (default
+// smoothGeomEdgeGain=40) since removing it is a separate, larger change;
+// flagging here for honesty about what is/isn't paper-faithful.
 double edgeRelaxFactor(const Image& target, const Vec2& p, double edgeGain, double minFactor) {
     ColorGrad grad = target.sampleGradient(p.x, p.y);
     double mag2 = grad.dx.r * grad.dx.r + grad.dx.g * grad.dx.g + grad.dx.b * grad.dx.b +
@@ -64,24 +71,51 @@ double edgeRelaxFactor(const Image& target, const Vec2& p, double edgeGain, doub
     return std::max(factor, minFactor);
 }
 
-Vec2 nearestVectorLineDir(const std::vector<VectorLine>& lines, const Vec2& p, double radius, bool& found) {
-    found = false;
-    double bestD2 = radius * radius;
+// Sec 4.2's vector-line-guided term evaluates a local direction field at
+// every interior (u,v) sample of a patch (not just at discrete
+// mesh-vertex edges), with a Gaussian falloff weight based on distance to
+// "the nearest vector line" -- quoting the paper directly: "wu(m(u,v)) =
+// G(d|0,sigma_v^2) where d is the distance from the location m(u,v) to
+// the nearest vector line... We set the standard deviation sigma_v to one
+// third of the width of the narrow band[,] set as one fifth of the length
+// of the vector line." So each line's own band/sigma is derived from ITS
+// OWN length -- not a single global pixel radius (which an earlier,
+// coarser version of this term used, checked only at discrete mesh edges
+// rather than this dense per-sample grid, and never touched Pu/Pv at
+// all). This finds the single globally-nearest (line segment, point) pair
+// first (matching "the nearest vector line", singular), then applies THAT
+// line's own band cutoff and Gaussian using its own sigma.
+struct VectorLineMatch { bool found = false; Vec2 dir{1, 0}; double weight = 0.0; };
+
+VectorLineMatch nearestVectorLineField(const std::vector<VectorLine>& lines, const Vec2& p) {
+    VectorLineMatch result;
+    double bestD2 = 1e300;
     Vec2 bestDir{1, 0};
+    double bestSigma = 0.0;
     for (const auto& line : lines) {
+        double totalLen = 0.0;
+        for (size_t i = 0; i + 1 < line.points.size(); ++i) totalLen += (line.points[i + 1] - line.points[i]).length();
+        if (totalLen < 1e-6) continue;
+        double sigma = (totalLen / 5.0) / 3.0; // sigma = bandWidth/3, bandWidth = length/5
         for (size_t i = 0; i + 1 < line.points.size(); ++i) {
             Vec2 a = line.points[i], b = line.points[i + 1];
             Vec2 ab = b - a;
             double len2 = ab.lengthSq();
             if (len2 < 1e-9) continue;
-            double t = (p - a).dot(ab) / len2;
-            t = std::max(0.0, std::min(1.0, t));
+            double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / len2));
             Vec2 proj = a + ab * t;
             double d2 = (p - proj).lengthSq();
-            if (d2 < bestD2) { bestD2 = d2; bestDir = ab.normalized(); found = true; }
+            if (d2 < bestD2) { bestD2 = d2; bestDir = ab.normalized(); bestSigma = sigma; }
         }
     }
-    return bestDir;
+    if (bestSigma <= 1e-9) return result; // no usable (nonzero-length) line
+    double d = std::sqrt(bestD2);
+    double bandWidth = bestSigma * 3.0;
+    if (d > bandWidth) return result; // outside the narrow band -- "not found", matching Sec 4.2
+    result.found = true;
+    result.dir = bestDir;
+    result.weight = std::exp(-(d * d) / (2.0 * bestSigma * bestSigma));
+    return result;
 }
 
 void addSmoothnessTerms(SparseBlockMatrix& H, std::vector<double>& g, const GradientMesh& mesh,
@@ -116,16 +150,24 @@ void addSmoothnessTerms(SparseBlockMatrix& H, std::vector<double>& g, const Grad
     }
 }
 
-// Soft ridge pulling each vertex's free Pu/Pv/Puv (block subs 2,3,4,5,6,7)
-// toward the CURRENT position-implied finite-difference estimate.
-// Re-anchored every GN sub-iteration (tu/tv/tuv are recomputed from the
-// mesh's current P each call), so this is a "prior around the current
-// linearization point", not a hard constraint -- it lets the data term
-// pull Pu/Pv/Puv away from that estimate when it has real signal to, while
-// keeping them from drifting unboundedly where the signal is weak or
-// absent. The Jacobian only includes the direct d(residual)/d(Pu, Pv or
-// Puv) = 1 term, not the indirect dependence of tu/tv/tuv on neighboring
-// P's.
+// Soft ridge pulling each vertex's free Pu/Pv (block subs 2,3,4,5) toward
+// the CURRENT position-implied finite-difference estimate. Re-anchored
+// every GN sub-iteration (tu/tv are recomputed from the mesh's current P
+// each call), so this is a "prior around the current linearization point",
+// not a hard constraint -- it lets the data term pull Pu/Pv away from that
+// estimate when it has real signal to, while keeping them from drifting
+// unboundedly where the signal is weak or absent. The Jacobian only
+// includes the direct d(residual)/d(Pu or Pv) = 1 term, not the indirect
+// dependence of tu/tv on neighboring P's. (This whole prior is likewise
+// NOT in the paper -- Sec 4.1 has no separate tangent regularizer -- but
+// removing it isn't safe without also revisiting the block-coordinate GN
+// scheme's stability, see MeshOptimizer.h's OptimizerOptions comment.)
+//
+// Puv/twist is NOT included here -- per the paper, Sec 3: "In practice,
+// the values of muv are usually set to zero," so it's fixed at {0,0}
+// rather than free or derived; see GradientMesh::geomCorner. (An earlier
+// pass in this project briefly made Puv free too; reverted after
+// rereading the paper's own text on this point.)
 void addTangentPriorTerms(SparseBlockMatrix& H, std::vector<double>& g, const GradientMesh& mesh,
                            double weight) {
     if (weight <= 0.0) return;
@@ -133,31 +175,31 @@ void addTangentPriorTerms(SparseBlockMatrix& H, std::vector<double>& g, const Gr
         for (int c = 0; c < mesh.cols; ++c) {
             int i = mesh.idx(r, c);
             const MeshVertex& mv = mesh.at(r, c);
-            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c), tuv = mesh.twist(r, c);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
             accumulateGNRow(H, g, {{i, 2, 1}}, mv.Pu.x - tu.x, weight);
             accumulateGNRow(H, g, {{i, 3, 1}}, mv.Pu.y - tu.y, weight);
             accumulateGNRow(H, g, {{i, 4, 1}}, mv.Pv.x - tv.x, weight);
             accumulateGNRow(H, g, {{i, 5, 1}}, mv.Pv.y - tv.y, weight);
-            accumulateGNRow(H, g, {{i, 6, 1}}, mv.Puv.x - tuv.x, weight);
-            accumulateGNRow(H, g, {{i, 7, 1}}, mv.Puv.y - tuv.y, weight);
         }
     }
 }
 
 // Total weighted energy the geometry Gauss-Newton step actually minimizes:
-// data term (area-weighted reconstruction error) + smoothness + boundary +
-// vector-line terms, using the exact same residual formulas and sample
-// density as gaussNewtonGeometryStep's H/g assembly. This -- not a cheap,
-// differently-sampled RMSE proxy -- is what backtracking must check a step
-// against; using a mismatched acceptance metric let the line search reject
-// genuinely energy-decreasing steps (or accept non-decreasing ones), which
-// starved geometry of any real movement after the first couple of outer
-// iterations and left the mesh looking effectively rectangular.
+// data term (area-weighted reconstruction error) + vector-line term +
+// smoothness + tangent-prior + boundary, using the exact same residual
+// formulas and sample density as optimizeAtCurrentResolution's H/g
+// assembly. This -- not a cheap, differently-sampled RMSE proxy -- is
+// what backtracking must check a step against; using a mismatched
+// acceptance metric let the line search reject genuinely energy-decreasing
+// steps (or accept non-decreasing ones), which starved geometry of any
+// real movement after the first couple of outer iterations and left the
+// mesh looking effectively rectangular.
 double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
                               const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
     int n = std::max(2, opts.samplesPerPatchEdge);
     double duv = 1.0 / (n * n);
     double energy = 0.0;
+    bool hasLines = !vectorLines.empty();
 
     for (int pr = 0; pr < mesh.rows - 1; ++pr) {
         for (int pc = 0; pc < mesh.cols - 1; ++pc) {
@@ -165,12 +207,28 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
                 double v = double(i) / n;
                 for (int j = 0; j <= n; ++j) {
                     double u = double(j) / n;
-                    Vec2 pos = mesh.evalPos(pr, pc, u, v);
+                    Vec2 dU, dV;
+                    Vec2 pos = mesh.evalPos(pr, pc, u, v, &dU, &dV);
                     Color cmesh = mesh.evalColor(pr, pc, u, v);
                     Color ctarget = target.sampleBilinear(pos.x, pos.y);
                     double w = areaWeightAt(mesh, pr, pc, u, v, duv);
                     Color d = cmesh - ctarget;
                     energy += w * d.lengthSq();
+
+                    // Vector-line guided term (Sec 4.2), evaluated at this
+                    // same dense sample grid as the data term -- must
+                    // mirror the GN assembly's version of this exactly,
+                    // for the same line-search-consistency reason as
+                    // everything else in this function. See
+                    // nearestVectorLineField's comment for the formula.
+                    if (hasLines) {
+                        VectorLineMatch match = nearestVectorLineField(vectorLines, pos);
+                        if (match.found) {
+                            double ru = dU.cross(match.dir);
+                            double rv = dV.cross(match.dir);
+                            energy += opts.vectorLineWeight * match.weight * (ru * ru + rv * rv);
+                        }
+                    }
                 }
             }
         }
@@ -200,18 +258,16 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
         }
     }
 
-    // Soft prior pulling the free Pu/Pv/Puv tangents toward the
-    // position-implied finite-difference estimate -- must mirror
-    // addTangentPriorTerms below exactly, for the same reason
-    // computeGeometryEnergy has to mirror the rest of the GN assembly (see
-    // this function's header comment).
+    // Soft prior pulling the free Pu/Pv tangents toward the position-implied
+    // finite-difference estimate -- must mirror addTangentPriorTerms above
+    // exactly, for the same reason computeGeometryEnergy has to mirror the
+    // rest of the GN assembly (see this function's header comment).
     for (int r = 0; r < mesh.rows; ++r) {
         for (int c = 0; c < mesh.cols; ++c) {
             const MeshVertex& mv = mesh.at(r, c);
-            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c), tuv = mesh.twist(r, c);
-            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv, duv = mv.Puv - tuv;
-            energy += opts.geomTangentPriorWeight *
-                (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y + duv.x * duv.x + duv.y * duv.y);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
+            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
+            energy += opts.geomTangentPriorWeight * (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
         }
     }
 
@@ -231,21 +287,6 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
         Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
         double d = (mv.P - t).dot(normal);
         energy += opts.boundaryWeight * (d * d);
-    }
-
-    if (!vectorLines.empty()) {
-        auto edgeEnergy = [&](int v1, int v2) {
-            Vec2 mid = (P[v1] + P[v2]) * 0.5;
-            bool found = false;
-            Vec2 dir = nearestVectorLineDir(vectorLines, mid, opts.vectorLineInfluenceRadius, found);
-            if (!found) return;
-            double r0 = (P[v2] - P[v1]).cross(dir);
-            energy += opts.vectorLineWeight * r0 * r0;
-        };
-        for (int r = 0; r < mesh.rows; ++r)
-            for (int c = 0; c < mesh.cols - 1; ++c) edgeEnergy(mesh.idx(r, c), mesh.idx(r, c + 1));
-        for (int c = 0; c < mesh.cols; ++c)
-            for (int r = 0; r < mesh.rows - 1; ++r) edgeEnergy(mesh.idx(r, c), mesh.idx(r + 1, c));
     }
 
     return energy;
@@ -429,23 +470,45 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             }
         }
 #endif
-        // Each vertex contributes an 8-wide unknown block: subs 0,1 =
-        // P.x,P.y (as before), 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y, 6,7 =
-        // Puv.x,Puv.y (the twist, promoted to a free unknown alongside
-        // Pu/Pv -- see MeshVertex/GradientMesh.h comments). Still well
-        // within SparseBlockSolver.h's `double tmp[16]` scratch-buffer
-        // ceiling (needs N<=16; N=8 here).
+        // Each vertex contributes a 6-wide unknown block: subs 0,1 =
+        // P.x,P.y, 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y. Twist (Puv) is fixed
+        // at {0,0} per the paper (Sec 3: "In practice, the values of muv
+        // are usually set to zero") -- it is not a free unknown here; see
+        // GradientMesh::geomCorner.
         for (int gi = 0; !geometrySolvedByCeres && gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
+            // Re-project boundary vertices onto their spline EVERY GN
+            // sub-iteration, not just once per outer iteration (step 1,
+            // above, only runs once per outer loop). The boundary term
+            // below is a LINEARIZATION around (target, normal) taken at the
+            // vertex's current boundaryT -- valid only for small
+            // displacements from that point. Found via a stress test: a
+            // strong vector-line pull (this file's new Sec-4.2-faithful
+            // term) can move a boundary vertex far enough in one GN step
+            // that the stale target/normal from the top of the outer
+            // iteration badly mis-linearizes the constraint, and the
+            // vertex can drift outside the image entirely over a few GN
+            // sub-iterations before the next outer-iteration reprojection
+            // catches it. Re-running closestT() here (global 40-sample +
+            // Newton search, see BezierSpline.h -- correct regardless of
+            // how far P has drifted) keeps the linearization point current
+            // within an outer iteration too, at the same per-substep
+            // frequency backtracking already re-checks the true energy at.
+            for (auto& v : mesh.vertices) {
+                if (!v.isBoundary) continue;
+                v.boundaryT = mesh.boundary[v.boundarySide].closestT(v.P);
+            }
+
             SparseBlockMatrix H;
-            H.init(8, numV);
-            std::vector<double> g(numV * 8, 0.0);
-            std::vector<Vec2> P(numV), Pu(numV), Pv(numV), Puv(numV);
+            H.init(6, numV);
+            std::vector<double> g(numV * 6, 0.0);
+            std::vector<Vec2> P(numV), Pu(numV), Pv(numV);
             for (int i = 0; i < numV; ++i) {
                 P[i] = mesh.vertices[i].P;
                 Pu[i] = mesh.vertices[i].Pu;
                 Pv[i] = mesh.vertices[i].Pv;
-                Puv[i] = mesh.vertices[i].Puv;
             }
+
+            bool hasLines = !vectorLines.empty();
 
             for (int pr = 0; pr < mesh.rows - 1; ++pr) {
                 for (int pc = 0; pc < mesh.cols - 1; ++pc) {
@@ -453,24 +516,24 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                         double v = double(i) / n;
                         for (int j = 0; j <= n; ++j) {
                             double u = double(j) / n;
-                            Vec2 pos = mesh.evalPos(pr, pc, u, v);
+                            Vec2 dU, dV;
+                            Vec2 pos = mesh.evalPos(pr, pc, u, v, &dU, &dV);
                             Color cmesh = mesh.evalColor(pr, pc, u, v);
                             Color ctarget = target.sampleBilinear(pos.x, pos.y);
                             ColorGrad grad = target.sampleGradient(pos.x, pos.y);
                             double w = areaWeightAt(mesh, pr, pc, u, v, duv);
                             PatchWeights pw = PatchWeights::at(u, v);
 
-                            // corner vertex + weight for each of the 4 FREE
+                            // corner vertex + weight for each of the 3 FREE
                             // Hermite kinds this patch corner contributes to
                             // pos(u,v): Value(P, sub-pair 0,1), TangentU(Pu,
-                            // sub-pair 2,3), TangentV(Pv, sub-pair 4,5),
-                            // Twist(Puv, sub-pair 6,7) -- reusing RowEntry,
-                            // with `sub` repurposed here to mean "which
-                            // sub-pair" (0/1/2/3), not a literal block
-                            // sub-index (buildChanneled below expands it to
-                            // the real x/y sub-indices).
+                            // sub-pair 2,3), TangentV(Pv, sub-pair 4,5) --
+                            // reusing RowEntry, with `sub` repurposed here to
+                            // mean "which sub-pair" (0/1/2), not a literal
+                            // block sub-index (buildChanneled below expands
+                            // it to the real x/y sub-indices).
                             std::vector<RowEntry> rowCorners;
-                            rowCorners.reserve(16);
+                            rowCorners.reserve(12);
                             for (int a = 0; a < 2; ++a) {
                                 for (int b = 0; b < 2; ++b) {
                                     int base = (a * 2 + b) * 4;
@@ -478,7 +541,6 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                                     rowCorners.push_back({vert, 0, pw.w[base + 0]}); // P
                                     rowCorners.push_back({vert, 1, pw.w[base + 1]}); // Pu
                                     rowCorners.push_back({vert, 2, pw.w[base + 2]}); // Pv
-                                    rowCorners.push_back({vert, 3, pw.w[base + 3]}); // Puv
                                 }
                             }
                             double r0r = cmesh.r - ctarget.r;
@@ -499,6 +561,59 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                             accumulateGNRow(H, g, buildChanneled(grad.dx.r, grad.dy.r), r0r, w);
                             accumulateGNRow(H, g, buildChanneled(grad.dx.g, grad.dy.g), r0g, w);
                             accumulateGNRow(H, g, buildChanneled(grad.dx.b, grad.dy.b), r0b, w);
+
+                            // Vector-line guided term (Sec 4.2): penalizes
+                            // the component of the ANALYTIC surface tangent
+                            // (dU=d(pos)/du, dV=d(pos)/dv -- already
+                            // computed above for free via evalPos's output
+                            // params) that is perpendicular to the nearest
+                            // guide line's direction, Gaussian-weighted by
+                            // distance to that line (see
+                            // nearestVectorLineField). Evaluated at this
+                            // same dense per-patch sample grid as the data
+                            // term -- unlike an earlier version of this
+                            // term, which only ever checked the coarse
+                            // straight edge between two adjacent control
+                            // points at its midpoint, with a flat pixel-
+                            // radius cutoff, and never touched Pu/Pv at
+                            // all. d(dU)/d(corner param) uses PatchWeights'
+                            // `wu` array (the u-partial of the Hermite
+                            // basis weight) exactly the way the data term
+                            // above uses the plain `w` array for d(pos);
+                            // d(dV)/d(corner param) likewise uses `wv`.
+                            if (hasLines) {
+                                VectorLineMatch match = nearestVectorLineField(vectorLines, pos);
+                                if (match.found) {
+                                    double weight = opts.vectorLineWeight * match.weight;
+                                    double ru = dU.cross(match.dir);
+                                    double rv = dV.cross(match.dir);
+                                    std::vector<RowEntry> rowU, rowV;
+                                    rowU.reserve(12);
+                                    rowV.reserve(12);
+                                    for (int a = 0; a < 2; ++a) {
+                                        for (int b = 0; b < 2; ++b) {
+                                            int base = (a * 2 + b) * 4;
+                                            int vert = mesh.idx(pr + b, pc + a);
+                                            double wuP = pw.wu[base + 0], wuPu = pw.wu[base + 1], wuPv = pw.wu[base + 2];
+                                            double wvP = pw.wv[base + 0], wvPu = pw.wv[base + 1], wvPv = pw.wv[base + 2];
+                                            rowU.push_back({vert, 0,  wuP  * match.dir.y});
+                                            rowU.push_back({vert, 1, -wuP  * match.dir.x});
+                                            rowU.push_back({vert, 2,  wuPu * match.dir.y});
+                                            rowU.push_back({vert, 3, -wuPu * match.dir.x});
+                                            rowU.push_back({vert, 4,  wuPv * match.dir.y});
+                                            rowU.push_back({vert, 5, -wuPv * match.dir.x});
+                                            rowV.push_back({vert, 0,  wvP  * match.dir.y});
+                                            rowV.push_back({vert, 1, -wvP  * match.dir.x});
+                                            rowV.push_back({vert, 2,  wvPu * match.dir.y});
+                                            rowV.push_back({vert, 3, -wvPu * match.dir.x});
+                                            rowV.push_back({vert, 4,  wvPv * match.dir.y});
+                                            rowV.push_back({vert, 5, -wvPv * match.dir.x});
+                                        }
+                                    }
+                                    accumulateGNRow(H, g, rowU, ru, weight);
+                                    accumulateGNRow(H, g, rowV, rv, weight);
+                                }
+                            }
                         }
                     }
                 }
@@ -523,42 +638,24 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                 accumulateGNRow(H, g, {{i, 0, normal.x}, {i, 1, normal.y}}, r0, opts.boundaryWeight);
             }
 
-            if (!vectorLines.empty()) {
-                auto addEdge = [&](int v1, int v2) {
-                    Vec2 mid = (P[v1] + P[v2]) * 0.5;
-                    bool found = false;
-                    Vec2 dir = nearestVectorLineDir(vectorLines, mid, opts.vectorLineInfluenceRadius, found);
-                    if (!found) return;
-                    Vec2 e = P[v2] - P[v1];
-                    double r0 = e.cross(dir);
-                    accumulateGNRow(H, g,
-                                     {{v1, 0, -dir.y}, {v1, 1, dir.x}, {v2, 0, dir.y}, {v2, 1, -dir.x}},
-                                     r0, opts.vectorLineWeight);
-                };
-                for (int r = 0; r < mesh.rows; ++r)
-                    for (int c = 0; c < mesh.cols - 1; ++c) addEdge(mesh.idx(r, c), mesh.idx(r, c + 1));
-                for (int c = 0; c < mesh.cols; ++c)
-                    for (int r = 0; r < mesh.rows - 1; ++r) addEdge(mesh.idx(r, c), mesh.idx(r + 1, c));
-            }
-
             // Levenberg damping (scale-aware: proportional to each diagonal entry).
             for (int i = 0; i < numV; ++i) {
                 auto it = H.blocks.find(SparseBlockMatrix::key(i, i));
-                for (int k = 0; k < 8; ++k) {
-                    double dk = (it != H.blocks.end()) ? it->second[k * 8 + k] : 1.0;
+                for (int k = 0; k < 6; ++k) {
+                    double dk = (it != H.blocks.end()) ? it->second[k * 6 + k] : 1.0;
                     H.addScalar(i, i, k, k, lambda * std::max(dk, 1e-6));
                 }
             }
 
-            auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 8, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+            auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 6, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
 #ifdef GMCORE_DEBUG_GEOM
             double maxDelta = 0; for (double d : delta) maxDelta = std::max(maxDelta, std::abs(d));
             double gNorm = 0; for (double v : g) gNorm += v*v; gNorm = std::sqrt(gNorm);
 #endif
 
             // Backtracking must check the step against the SAME objective the
-            // step was computed to reduce (data + smoothness + tangent-prior +
-            // boundary + vector-line energy, at the same sample density) --
+            // step was computed to reduce (data + vector-line + smoothness +
+            // tangent-prior + boundary energy, at the same sample density) --
             // not a cheaper, differently-sampled RMSE proxy, which can
             // disagree with it and reject perfectly good steps. See
             // computeGeometryEnergy's comment above for why this matters.
@@ -567,14 +664,12 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             bool improved = false;
             for (int tries = 0; tries < 4; ++tries) {
                 for (int i = 0; i < numV; ++i) {
-                    mesh.vertices[i].P.x   = P[i].x   + alpha * delta[i * 8 + 0];
-                    mesh.vertices[i].P.y   = P[i].y   + alpha * delta[i * 8 + 1];
-                    mesh.vertices[i].Pu.x  = Pu[i].x  + alpha * delta[i * 8 + 2];
-                    mesh.vertices[i].Pu.y  = Pu[i].y  + alpha * delta[i * 8 + 3];
-                    mesh.vertices[i].Pv.x  = Pv[i].x  + alpha * delta[i * 8 + 4];
-                    mesh.vertices[i].Pv.y  = Pv[i].y  + alpha * delta[i * 8 + 5];
-                    mesh.vertices[i].Puv.x = Puv[i].x + alpha * delta[i * 8 + 6];
-                    mesh.vertices[i].Puv.y = Puv[i].y + alpha * delta[i * 8 + 7];
+                    mesh.vertices[i].P.x  = P[i].x  + alpha * delta[i * 6 + 0];
+                    mesh.vertices[i].P.y  = P[i].y  + alpha * delta[i * 6 + 1];
+                    mesh.vertices[i].Pu.x = Pu[i].x + alpha * delta[i * 6 + 2];
+                    mesh.vertices[i].Pu.y = Pu[i].y + alpha * delta[i * 6 + 3];
+                    mesh.vertices[i].Pv.x = Pv[i].x + alpha * delta[i * 6 + 4];
+                    mesh.vertices[i].Pv.y = Pv[i].y + alpha * delta[i * 6 + 5];
                 }
                 double newEnergy = computeGeometryEnergy(mesh, target, vectorLines, opts);
                 if (newEnergy <= baseEnergy) { improved = true; break; }
@@ -586,8 +681,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
 #endif
             if (!improved) {
                 for (int i = 0; i < numV; ++i) {
-                    mesh.vertices[i].P = P[i]; mesh.vertices[i].Pu = Pu[i]; mesh.vertices[i].Pv = Pv[i];
-                    mesh.vertices[i].Puv = Puv[i]; // revert
+                    mesh.vertices[i].P = P[i]; mesh.vertices[i].Pu = Pu[i]; mesh.vertices[i].Pv = Pv[i]; // revert
                 }
                 lambda = std::min(lambda * 4.0, 1e6);
             } else {
@@ -623,8 +717,13 @@ void MeshOptimizer::optimizeCoarseToFine(GradientMesh& mesh, const Image& fullRe
             for (const auto& p : line.points) sl.points.push_back({p.x * sx, p.y * sy});
             scaledLines.push_back(std::move(sl));
         }
-        OptimizerOptions levelOpts = opts;
-        levelOpts.vectorLineInfluenceRadius *= std::max(sx, sy);
+        // levelOpts is currently just a copy of opts: the old per-level
+        // vectorLineInfluenceRadius rescaling (levelOpts.vectorLineInfluenceRadius
+        // *= max(sx,sy)) is gone -- the current vector-line term derives its
+        // band width from each (already per-axis-scaled) line's own polyline
+        // length every call (see nearestVectorLineField), so no separate
+        // level-dependent rescaling of a flat radius is needed any more.
+        const OptimizerOptions& levelOpts = opts;
 
         optimizeAtCurrentResolution(mesh, levels[li], scaledLines, levelOpts, cb, li, L);
 
