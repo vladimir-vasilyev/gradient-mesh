@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace gmcore {
 
@@ -304,6 +305,13 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
     double duv = 1.0 / (n * n);
 
     double lambda = opts.geomDampingInitial;
+
+    // Convergence tracking for the early-exit check at the bottom of this
+    // loop -- see OptimizerOptions::outerConvergenceRelTol's comment for
+    // why this exists (outerIterationsPerLevel is now a much higher
+    // ceiling than before, and this is what keeps an already-converged
+    // case from always burning the whole thing).
+    double prevOuterEnergy = std::numeric_limits<double>::infinity();
 
     for (int outer = 0; outer < opts.outerIterationsPerLevel; ++outer) {
         // 1) Re-project boundary vertices onto their spline (soft constraint target).
@@ -726,6 +734,29 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
 
         double rmse = mesh.reconstructionRMSE(target, opts.samplesPerPatchEdge);
         if (cb) cb({level, totalLevels, outer, opts.outerIterationsPerLevel, rmse});
+
+        // Early-exit once this outer iteration's relative improvement in
+        // the composite geometry energy (data + vector-line + smoothness +
+        // tangent-prior + boundary -- the same objective backtracking
+        // already checks every GN sub-iteration) drops below
+        // outerConvergenceRelTol. Skipped on the very first iteration
+        // (nothing to compare against yet) and disabled entirely when
+        // outerConvergenceRelTol <= 0. See OptimizerOptions's comment for
+        // why this exists: outerIterationsPerLevel is a much higher
+        // ceiling than before specifically so genuinely-still-improving
+        // cases aren't cut off early (see that field's comment for the
+        // regression that motivated this), and this is what keeps an
+        // already-converged case (e.g. the smooth synthetic sphere) from
+        // then always burning the whole, now much larger, ceiling.
+        if (opts.outerConvergenceRelTol > 0.0 && outer > 0) {
+            double energyNow = computeGeometryEnergy(mesh, target, vectorLines, opts);
+            double denom = std::max(prevOuterEnergy, 1e-12);
+            double relImprovement = (prevOuterEnergy - energyNow) / denom;
+            prevOuterEnergy = energyNow;
+            if (relImprovement < opts.outerConvergenceRelTol) break;
+        } else if (opts.outerConvergenceRelTol > 0.0) {
+            prevOuterEnergy = computeGeometryEnergy(mesh, target, vectorLines, opts);
+        }
     }
 }
 

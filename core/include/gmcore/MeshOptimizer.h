@@ -97,7 +97,73 @@ struct OptimizerOptions {
                                        // Puv is NOT included here: it's fixed at {0,0} per the
                                        // paper's Sec 3 ("the values of muv are usually set to
                                        // zero"), not free and not derived -- see GradientMesh.h.
-    int outerIterationsPerLevel = 8;
+    int outerIterationsPerLevel = 40;  // upper CEILING, not a target -- see
+                                       // outerConvergenceRelTol below. Was 8;
+                                       // raised after a report that running
+                                       // the hand-rolled optimizer a SECOND
+                                       // time on its own already-optimized
+                                       // output kept reducing RMSE
+                                       // substantially (one 5x5 gradient.png
+                                       // case: 0.0315 -> 0.0260) -- i.e. 8
+                                       // outer iterations/level was simply
+                                       // stopping before convergence, not
+                                       // reaching a real local optimum.
+                                       // Reproduced directly: on that same
+                                       // test case, 1 pass at outer-iters=8
+                                       // gave RMSE 0.03147; running that same
+                                       // 8-iteration pass twice in a row
+                                       // (16 total, but through the full
+                                       // coarse-to-fine pyramid schedule
+                                       // twice) reached 0.03101; a single
+                                       // pass at outer-iters=40 (through the
+                                       // pyramid schedule once) reached
+                                       // 0.02817 -- clearly still a real gap
+                                       // at 8, and 40 closes most of it in
+                                       // one pass. See outerConvergenceRelTol
+                                       // for why raising this ceiling 5x
+                                       // doesn't make every run 5x slower.
+    double outerConvergenceRelTol = 1e-3; // early-exit the outer loop once
+                                       // the per-outer-iteration relative
+                                       // improvement in computeGeometryEnergy
+                                       // (the same composite data+vector-line
+                                       // +smoothness+tangent-prior+boundary
+                                       // energy backtracking already checks
+                                       // every GN sub-iteration) drops below
+                                       // this fraction -- added alongside the
+                                       // outerIterationsPerLevel bump above
+                                       // so an already-converged case (e.g.
+                                       // the smooth synthetic sphere) still
+                                       // stops in a handful of iterations
+                                       // instead of always burning the full,
+                                       // now much higher, ceiling. Set to 0
+                                       // to disable early-exit entirely and
+                                       // always run the full
+                                       // outerIterationsPerLevel count (the
+                                       // old, pre-this-change behavior,
+                                       // modulo the new default ceiling).
+                                       //
+                                       // Value tuned by sweeping 1e-5..3e-3 on
+                                       // three cases (synthetic sphere 9x9,
+                                       // gradient.png 25x25 and 5x5): 1e-5 is
+                                       // needlessly tight -- it costs 24-40%
+                                       // more wall-clock than 1e-3 on EVERY
+                                       // case (e.g. sphere: 6703ms vs 4027ms;
+                                       // gradient 25x25: 42750ms vs 32583ms)
+                                       // for no measurable RMSE benefit (often
+                                       // slightly worse, since a Levenberg
+                                       // step accepted late can still be a
+                                       // small net negative -- stopping a
+                                       // touch earlier isn't strictly a
+                                       // quality tradeoff here). 1e-3 matches
+                                       // or beats 1e-5's RMSE on all three
+                                       // cases while being consistently
+                                       // faster. Looser still (3e-3) starts
+                                       // to cost real quality on the hard
+                                       // case (5x5 gradient.png RMSE 0.03107
+                                       // vs 0.03041 at 1e-3 -- most of the
+                                       // fix's benefit over the old default
+                                       // is lost), so 1e-3 is the sweet spot,
+                                       // not just "looser is always fine."
     int geomGaussNewtonItersPerOuter = 3;
     int cgMaxIterations = 200;
     double cgRelTolerance = 1e-5;

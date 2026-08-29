@@ -782,6 +782,74 @@ iterations allowed per call, though real convergence should stop well short of t
 ceiling most of the time) -- a wall-clock timing comparison for this mode still
 hasn't been done (see "Optional: Ceres-based geometry solver" above).
 
+### Fixed: hand-rolled optimizer's default iteration budget was too low to converge
+
+Reported by the user: running the hand-rolled optimizer a SECOND time on its own
+already-optimized output (same mesh, same image, `optimizeCoarseToFine` called
+again) kept reducing RMSE substantially -- one 5x5-mesh `gradient.png` case went
+from 0.0315 to 0.0260. That should not happen at a real local optimum: a converged
+solve re-run on its own output should barely move.
+
+Reproduced directly with a standalone harness (`/tmp/converge_test.cpp`, exact same
+5x5-mesh-against-`gradient.png` setup as `gmesh_cli`'s defaults): one pass at the old
+default (`outerIterationsPerLevel=8`) reached RMSE 0.03147; running that same 8-outer-
+iteration pass twice in a row reached 0.03101; a single pass at
+`outerIterationsPerLevel=40` (same pyramid schedule, run once) reached 0.02817 --
+confirming 8 was simply stopping short of a real local optimum, not the run-twice
+result being an artifact of some other bug. Raising the ceiling to 100 produced
+*identical* per-level stopping iteration counts and final RMSE as 40, confirming 40
+isn't itself truncating anything -- it's a genuine ceiling, not a new bottleneck.
+
+Root cause: `outerIterationsPerLevel` defaulted to 8, a budget that was apparently
+tuned (or just guessed) against easier cases and never re-checked once other terms
+(vector-line, boundary, tangent-prior, corner-fixing) were added to the energy this
+loop is minimizing -- a harder case like a 5x5 mesh fitting a full-color gradient
+image needs meaningfully more outer Levenberg-Marquardt iterations than that to
+settle. (Also checked whether `geomGaussNewtonItersPerOuter`, the *inner* GN
+iteration count, was the real lever instead -- doubling it from 3 to 6 barely moved
+RMSE, 0.03146 vs the 8-outer-iteration baseline's 0.03147 -- so the outer count, not
+the inner one, was the actual bottleneck.)
+
+Fix, in two parts:
+
+1. Raised `OptimizerOptions::outerIterationsPerLevel`'s default from 8 to 40 (an
+   upper ceiling, not a target).
+2. Added `OptimizerOptions::outerConvergenceRelTol` (new field, default `1e-3`): the
+   outer loop now exits early once the relative improvement in
+   `computeGeometryEnergy` (the same composite data+vector-line+smoothness+tangent-
+   prior+boundary energy backtracking already checks every GN sub-iteration) between
+   successive outer iterations drops below this fraction. Without this, simply
+   raising the ceiling to 40 would make every case -- including already-converged
+   easy ones like the synthetic sphere -- 5x slower for no benefit. Set to 0 to
+   disable early-exit entirely.
+
+Verified with the same harness: a single pass at the new defaults (40 + early-stop)
+reaches RMSE 0.03065 on the 5x5 `gradient.png` case, better than manually running the
+old 8-iteration default twice (0.03101), in one `optimizeCoarseToFine` call.
+
+`outerConvergenceRelTol`'s default was then tuned by sweeping 1e-5 through 3e-3
+across three cases (synthetic sphere 9x9, `gradient.png` 25x25, `gradient.png` 5x5,
+via `/tmp/converge_test3.cpp`): the initially-chosen 1e-5 turned out needlessly
+tight -- it cost 24-40% more wall-clock than 1e-3 on *every* case (sphere: 6703ms vs
+4027ms; gradient 25x25: 42750ms vs 32583ms) for no measurable quality benefit (on the
+hard 5x5 case, 1e-3 actually reached a slightly *better* RMSE than 1e-5, 0.03041 vs
+0.03065 -- late Levenberg steps aren't guaranteed net-positive, so stopping a touch
+earlier isn't strictly a quality/speed tradeoff here). Looser still (3e-3) starts
+losing real quality on the hard case (RMSE back up to 0.03107, most of this fix's
+benefit given up), so 1e-3 was kept as the default -- a genuine sweet spot, not just
+"as loose as possible."
+
+Full regression suite (`/tmp/build_check2`, no-Ceres CMake build) re-run against the
+standard three cases (synthetic sphere 9x9, `gradient.png` 25x25, `gradient.png` 5x5)
+with these new defaults: all three run cleanly through `gmesh_cli`, early-stopping
+sensibly per pyramid level, no crashes or divergence, corner-fixing and the Sec-4.2
+vector-line term unaffected (this fix only touches the outer-loop stopping
+condition, not any residual or Jacobian).
+
+This fix, unlike the two Ceres-path fixes above, is fully verifiable in this sandbox
+(pure hand-rolled C++, no Ceres dependency) -- confirmed end-to-end here, not just
+structurally reasoned about.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)
