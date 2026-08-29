@@ -215,11 +215,22 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
         }
     }
 
+    // Boundary control points should be free to slide ALONG their spline
+    // (Sec 4: "control points on the boundary only move along the
+    // splines") -- only the off-curve (normal) component should be
+    // penalized, never the along-curve (tangential) one. Penalizing the
+    // full 2D displacement from a fixed re-projected point, as an earlier
+    // version of this did, resists tangential motion just as strongly as
+    // normal motion -- which is NOT "free to slide", it's "stay near this
+    // one point", and pins boundary vertices in place far more than the
+    // paper intends. Must mirror the GN boundary term below exactly.
     for (const auto& mv : mesh.vertices) {
         if (!mv.isBoundary) continue;
-        Vec2 t = mesh.boundary[mv.boundarySide].eval(mv.boundaryT);
-        Vec2 d = mv.P - t;
-        energy += opts.boundaryWeight * (d.x * d.x + d.y * d.y);
+        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        Vec2 t = spline.eval(mv.boundaryT);
+        Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
+        double d = (mv.P - t).dot(normal);
+        energy += opts.boundaryWeight * (d * d);
     }
 
     if (!vectorLines.empty()) {
@@ -496,12 +507,20 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             addSmoothnessTerms(H, g, mesh, P, target, opts);
             addTangentPriorTerms(H, g, mesh, opts.geomTangentPriorWeight);
 
+            // Normal-only soft constraint -- see computeGeometryEnergy's
+            // comment above for why (must mirror it exactly). A single
+            // scalar residual (displacement projected onto the curve
+            // normal) instead of two independent x/y residuals, so
+            // along-curve motion is completely free and only off-curve
+            // drift is resisted.
             for (int i = 0; i < numV; ++i) {
                 const MeshVertex& mv = mesh.vertices[i];
                 if (!mv.isBoundary) continue;
-                Vec2 target_ = mesh.boundary[mv.boundarySide].eval(mv.boundaryT);
-                accumulateGNRow(H, g, {{i, 0, 1}}, mv.P.x - target_.x, opts.boundaryWeight);
-                accumulateGNRow(H, g, {{i, 1, 1}}, mv.P.y - target_.y, opts.boundaryWeight);
+                const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+                Vec2 target_ = spline.eval(mv.boundaryT);
+                Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
+                double r0 = (mv.P - target_).dot(normal);
+                accumulateGNRow(H, g, {{i, 0, normal.x}, {i, 1, normal.y}}, r0, opts.boundaryWeight);
             }
 
             if (!vectorLines.empty()) {

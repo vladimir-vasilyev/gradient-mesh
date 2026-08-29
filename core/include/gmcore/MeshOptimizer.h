@@ -57,7 +57,11 @@ struct OptimizerOptions {
                                        // geometry solve stays well-posed.
     double smoothWeightColor = 4.0;   // 2nd-difference regularization on control-point base color
     double colorDerivRidge = 1e-3;    // small ridge on Cu,Cv,Cuv for a well-posed linear solve
-    double boundaryWeight = 200.0;    // soft pull of boundary vertices back onto their spline
+    double boundaryWeight = 200.0;    // soft pull of boundary vertices back onto their spline,
+                                       // NORMAL direction only (see MeshOptimizer.cpp's
+                                       // computeGeometryEnergy comment) -- along-curve sliding is
+                                       // always free, matching the paper's "control points on the
+                                       // boundary only move along the splines" (Sec 4)
     double vectorLineWeight = 60.0;   // soft alignment of nearby mesh edges to user guide lines
     double vectorLineInfluenceRadius = 25.0; // pixels, in the *current pyramid level's* scale
     double geomTangentPriorWeight = 0.6; // soft pull of free Pu/Pv/Puv toward the position-implied

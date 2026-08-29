@@ -163,11 +163,17 @@ double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
         }
     }
 
+    // Normal-only soft constraint -- see MeshOptimizer.cpp's
+    // computeGeometryEnergy for why (must mirror it exactly): boundary
+    // vertices should be free to slide ALONG their spline (Sec 4), so only
+    // the off-curve (normal) displacement component is penalized.
     for (const auto& mv : mesh.vertices) {
         if (!mv.isBoundary) continue;
-        Vec2 t = mesh.boundary[mv.boundarySide].eval(mv.boundaryT);
-        Vec2 d = mv.P - t;
-        energy += opts.boundaryWeight * (d.x * d.x + d.y * d.y);
+        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        Vec2 t = spline.eval(mv.boundaryT);
+        Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
+        double d = (mv.P - t).dot(normal);
+        energy += opts.boundaryWeight * (d * d);
     }
 
     if (!vectorLines.empty()) {
@@ -575,25 +581,33 @@ private:
     double sw_; Vec2 tu_, tv_, tuv_;
 };
 
-// ---- Boundary: one residual block per boundary vertex ----
+// ---- Boundary: one residual block per boundary vertex. Normal-only (see
+// MeshOptimizer.cpp's computeGeometryEnergy comment): boundary control
+// points must stay free to slide ALONG their spline (Sec 4: "control
+// points on the boundary only move along the splines"), so this penalizes
+// only the displacement component along the curve's normal at the current
+// boundaryT -- a single scalar residual, not two independent x/y ones,
+// which would resist along-curve motion exactly as hard as off-curve
+// drift and effectively pin the vertex in place instead of letting it
+// slide. ----
 class BoundaryCostFunction : public ceres::CostFunction {
 public:
-    BoundaryCostFunction(double weight, Vec2 targetPos)
-        : sw_(std::sqrt(std::max(weight, 0.0))), target_(targetPos) {
-        set_num_residuals(2);
+    BoundaryCostFunction(double weight, Vec2 targetPos, Vec2 normal)
+        : sw_(std::sqrt(std::max(weight, 0.0))), target_(targetPos), normal_(normal) {
+        set_num_residuals(1);
         mutable_parameter_block_sizes()->push_back(8);
     }
     bool Evaluate(double const* const* p, double* residuals, double** jacobians) const override {
-        residuals[0] = sw_ * (p[0][0] - target_.x);
-        residuals[1] = sw_ * (p[0][1] - target_.y);
+        double dx = p[0][0] - target_.x, dy = p[0][1] - target_.y;
+        residuals[0] = sw_ * (dx * normal_.x + dy * normal_.y);
         if (!jacobians || !jacobians[0]) return true;
         double* J = jacobians[0];
-        std::fill(J, J + 2 * 8, 0.0);
-        J[0 * 8 + 0] = sw_; J[1 * 8 + 1] = sw_;
+        std::fill(J, J + 1 * 8, 0.0);
+        J[0] = sw_ * normal_.x; J[1] = sw_ * normal_.y;
         return true;
     }
 private:
-    double sw_; Vec2 target_;
+    double sw_; Vec2 target_; Vec2 normal_;
 };
 
 // ---- Vector-line: one residual block per near-line mesh edge ----
@@ -715,8 +729,10 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
     for (int i = 0; i < numV; ++i) {
         const MeshVertex& mv = mesh.vertices[i];
         if (!mv.isBoundary) continue;
-        Vec2 targetPos = mesh.boundary[mv.boundarySide].eval(mv.boundaryT);
-        auto* cost = new BoundaryCostFunction(opts.boundaryWeight, targetPos);
+        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        Vec2 targetPos = spline.eval(mv.boundaryT);
+        Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
+        auto* cost = new BoundaryCostFunction(opts.boundaryWeight, targetPos, normal);
         problem.AddResidualBlock(cost, nullptr, params[i].data());
     }
 
@@ -832,8 +848,10 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
     for (int i = 0; i < numV; ++i) {
         const MeshVertex& mv = mesh.vertices[i];
         if (!mv.isBoundary) continue;
-        Vec2 targetPos = mesh.boundary[mv.boundarySide].eval(mv.boundaryT);
-        auto* cost = new BoundaryCostFunction(opts.boundaryWeight, targetPos);
+        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        Vec2 targetPos = spline.eval(mv.boundaryT);
+        Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
+        auto* cost = new BoundaryCostFunction(opts.boundaryWeight, targetPos, normal);
         problem.AddResidualBlock(cost, nullptr, paramsGeom[i].data());
     }
     if (!vectorLines.empty()) {
