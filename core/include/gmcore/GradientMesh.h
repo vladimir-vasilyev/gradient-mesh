@@ -2,12 +2,15 @@
 // topologically-rectangular arrangement of Ferguson patches, exactly the
 // representation described in Sun et al. 2007, Sec. 3-4.
 //
-// Geometry tangents Pu, Pv are free per-vertex unknowns (as in the paper),
-// jointly optimized alongside P by the geometry Gauss-Newton step in
-// MeshOptimizer -- see MeshVertex below. Puv (twist) remains *derived* from
-// neighboring vertex positions via centered finite differences
-// (Catmull-Rom style), a documented simplification vs. the paper (see
-// README "Known simplifications"). Color keeps the full, independent
+// Geometry tangents Pu, Pv AND the twist Puv are all free per-vertex
+// unknowns (as in the paper), jointly optimized alongside P by the
+// geometry Gauss-Newton step in MeshOptimizer -- see MeshVertex below.
+// Puv used to be *derived* from neighboring vertex positions via centered
+// finite differences (Catmull-Rom style); that simplification is gone as
+// of the pass that added Puv to the free-unknown set (see git history --
+// GradientMesh::twist() still exists, now serving only as Puv's initial
+// seed value and the optimizer's soft "prior" target, exactly the role
+// tangentU/V already play for Pu/Pv). Color keeps the full, independent
 // (C, Cu, Cv, Cuv) unknown set per vertex, unaffected by this.
 #pragma once
 #include "gmcore/Vec2.h"
@@ -22,15 +25,14 @@ namespace gmcore {
 
 struct MeshVertex {
     Vec2 P;
-    // Geometry tangents Pu, Pv are now FREE unknowns (matching the paper),
-    // not derived via finite differences -- see GradientMesh::tangentU/V,
-    // which still exist but now serve only as (a) the initial value seeded
-    // in buildInitial and (b) the optimizer's soft "prior" target that
-    // keeps them grounded near the position-implied estimate instead of
-    // drifting unconstrained (see MeshOptimizer's geomTangentPriorWeight).
-    // Puv (twist) is still derived, unchanged -- promoting it too was out
-    // of scope for this pass; see README "Known simplifications".
-    Vec2 Pu, Pv;
+    // Geometry tangents Pu, Pv AND the twist Puv are all FREE unknowns
+    // (matching the paper), not derived via finite differences -- see
+    // GradientMesh::tangentU/V/twist, which still exist but now serve only
+    // as (a) the initial value seeded in buildInitial and (b) the
+    // optimizer's soft "prior" target that keeps them grounded near the
+    // position-implied estimate instead of drifting unconstrained (see
+    // MeshOptimizer's geomTangentPriorWeight, which anchors all three).
+    Vec2 Pu, Pv, Puv;
     Color C, Cu, Cv, Cuv;
     bool isBoundary = false;
     int boundarySide = -1;   // which of the 4 CubicBezier boundary segments, or -1
@@ -53,11 +55,12 @@ public:
     static GradientMesh buildInitial(int rows, int cols, const std::array<CubicBezier, 4>& boundary,
                                       const Image& target);
 
-    // Position-implied tangent estimate (centered finite difference of
-    // neighboring P's) -- NOT what geomCorner()/evalPos() actually use for
-    // Pu/Pv any more (those read the free MeshVertex::Pu/Pv fields
-    // directly). Used only to seed the free tangents in buildInitial() and
-    // as MeshOptimizer's soft "prior" anchor (see MeshVertex comment).
+    // Position-implied tangent/twist estimate (centered finite difference
+    // of neighboring P's) -- NOT what geomCorner()/evalPos() actually use
+    // for Pu/Pv/Puv any more (those read the free MeshVertex::Pu/Pv/Puv
+    // fields directly). Used only to seed the free unknowns in
+    // buildInitial() and as MeshOptimizer's soft "prior" anchor (see
+    // MeshVertex comment).
     Vec2 tangentU(int row, int col) const;
     Vec2 tangentV(int row, int col) const;
     Vec2 twist(int row, int col) const;

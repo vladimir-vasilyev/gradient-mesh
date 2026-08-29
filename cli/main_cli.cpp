@@ -179,12 +179,12 @@ int main(int argc, char** argv) {
     FILE* mf = std::fopen((outPrefix + "_mesh_points.csv").c_str(), "w");
     if (mf) {
         std::fprintf(mf, "rows,%d,cols,%d\n", mesh.rows, mesh.cols);
-        std::fprintf(mf, "row,col,x,y,pu_x,pu_y,pv_x,pv_y\n");
+        std::fprintf(mf, "row,col,x,y,pu_x,pu_y,pv_x,pv_y,puv_x,puv_y\n");
         for (int r = 0; r < mesh.rows; ++r)
             for (int c = 0; c < mesh.cols; ++c) {
                 const MeshVertex& mv = mesh.at(r, c);
-                std::fprintf(mf, "%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r, c, mv.P.x, mv.P.y,
-                             mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y);
+                std::fprintf(mf, "%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r, c, mv.P.x, mv.P.y,
+                             mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y, mv.Puv.x, mv.Puv.y);
             }
         std::fclose(mf);
     }

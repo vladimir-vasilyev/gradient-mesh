@@ -156,9 +156,10 @@ double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
     for (int r = 0; r < mesh.rows; ++r) {
         for (int c = 0; c < mesh.cols; ++c) {
             const MeshVertex& mv = mesh.at(r, c);
-            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
-            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
-            energy += opts.geomTangentPriorWeight * (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c), tuv = mesh.twist(r, c);
+            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv, duv = mv.Puv - tuv;
+            energy += opts.geomTangentPriorWeight *
+                (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y + duv.x * duv.x + duv.y * duv.y);
         }
     }
 
@@ -236,7 +237,7 @@ public:
           n_(std::max(2, samplesPerEdge)) {
         int numSamples = (n_ + 1) * (n_ + 1);
         set_num_residuals(3 * numSamples);
-        for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(6);
+        for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(8);
     }
 
     bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override {
@@ -246,9 +247,10 @@ public:
                 int k = a * 2 + b;
                 int vert = mesh.idx(pr_ + b, pc_ + a);
                 const double* p = parameters[k];
-                mesh.vertices[vert].P  = {p[0], p[1]};
-                mesh.vertices[vert].Pu = {p[2], p[3]};
-                mesh.vertices[vert].Pv = {p[4], p[5]};
+                mesh.vertices[vert].P   = {p[0], p[1]};
+                mesh.vertices[vert].Pu  = {p[2], p[3]};
+                mesh.vertices[vert].Pv  = {p[4], p[5]};
+                mesh.vertices[vert].Puv = {p[6], p[7]};
             }
         }
 
@@ -256,7 +258,7 @@ public:
         int rowsTotal = num_residuals();
         if (jacobians) {
             for (int k = 0; k < 4; ++k)
-                if (jacobians[k]) std::fill(jacobians[k], jacobians[k] + rowsTotal * 6, 0.0);
+                if (jacobians[k]) std::fill(jacobians[k], jacobians[k] + rowsTotal * 8, 0.0);
         }
 
         int row = 0;
@@ -286,16 +288,18 @@ public:
                         int k = a * 2 + b;
                         if (!jacobians[k]) continue;
                         int base = (a * 2 + b) * 4;
-                        double wP = pw.w[base + 0], wPu = pw.w[base + 1], wPv = pw.w[base + 2];
+                        double wP = pw.w[base + 0], wPu = pw.w[base + 1], wPv = pw.w[base + 2], wPuv = pw.w[base + 3];
                         double* J = jacobians[k];
                         for (int c = 0; c < 3; ++c) {
-                            int rr = (row + c) * 6;
+                            int rr = (row + c) * 8;
                             J[rr + 0] = sw * (-gx[c] * wP);
                             J[rr + 1] = sw * (-gy[c] * wP);
                             J[rr + 2] = sw * (-gx[c] * wPu);
                             J[rr + 3] = sw * (-gy[c] * wPu);
                             J[rr + 4] = sw * (-gx[c] * wPv);
                             J[rr + 5] = sw * (-gy[c] * wPv);
+                            J[rr + 6] = sw * (-gx[c] * wPuv);
+                            J[rr + 7] = sw * (-gy[c] * wPuv);
                         }
                     }
                 }
@@ -313,24 +317,34 @@ private:
 // ---- Joint data term: same as PatchDataCostFunction above, but color is
 // now a LIVE parameter block too, not frozen -- see
 // OptimizerOptions::useCeresJoint and spike/ceres_joint_spike.cpp (this
-// class is a direct copy of that spike's JointPatchDataCostFunction,
-// cross-checked there against both a standalone finite-difference harness
-// and the real ceres::GradientChecker before being transcribed here: 49
-// bad entries out of 5400 checked, all in the geometry block at max
-// relative error 0.168399 -- numerically identical to the pre-existing,
-// already-accepted twist/Puv-not-differentiated-w.r.t.-neighbors
-// approximation from PatchDataCostFunction above; the color block itself
-// was clean, max relative error 3.5e-8 (FD noise)). Used ONLY by
-// optimizeJointCeres/jointSolveOnce -- optimizeGeometryCeres keeps using
-// the frozen-color PatchDataCostFunction above, unchanged. ----
+// class started as a direct copy of that spike's JointPatchDataCostFunction;
+// that original 6-double-geometry version was cross-checked there against
+// both a standalone finite-difference harness and the real
+// ceres::GradientChecker before being transcribed here: 49 bad entries out
+// of 5400 checked, all in the geometry block at max relative error
+// 0.168399. That mismatch was because Puv (twist) was still *derived* via
+// finite difference from NEIGHBORING vertices' P (see GradientMesh::twist)
+// at evaluation time, but those neighbors generally aren't among this
+// residual block's own 4 corner parameter blocks -- so a true numeric
+// gradient sees nonzero partials this Jacobian couldn't represent. Now
+// that Puv is a free per-corner unknown too (see MeshVertex/GradientMesh.h),
+// geomCorner() reads it directly off the same 4 corners already in this
+// residual's own parameter blocks, so that indirect-neighbor dependency is
+// gone and the geometry-side Jacobian below is exact again, same as
+// P/Pu/Pv always were -- reverified with the same FD-harness-then-
+// ceres::GradientChecker method before being pushed (see commit history
+// for that verification's numbers). The color block was already clean
+// (max relative error 3.5e-8, pure FD noise) and is unaffected by this.
+// Used ONLY by optimizeJointCeres/jointSolveOnce -- optimizeGeometryCeres
+// keeps using the frozen-color PatchDataCostFunction above, unchanged. ----
 //
-// 8 parameter blocks per patch: [0..3] = geometry corners (6 doubles:
-// P.x,P.y,Pu.x,Pu.y,Pv.x,Pv.y -- same layout/order as PatchDataCostFunction),
-// [4..7] = color corners (12 doubles: C.r,C.g,C.b, Cu.r,Cu.g,Cu.b,
-// Cv.r,Cv.g,Cv.b, Cuv.r,Cuv.g,Cuv.b). Block k and block 4+k are always the
-// SAME physical vertex. Unlike geometry's twist (Puv, still derived), all
-// four color kinds are free unknowns (matches MeshVertex/colorCorner), so
-// the color Jacobian uses all four PatchWeights kinds, not just three.
+// 8 parameter blocks per patch: [0..3] = geometry corners (8 doubles:
+// P.x,P.y,Pu.x,Pu.y,Pv.x,Pv.y,Puv.x,Puv.y -- same layout/order as
+// PatchDataCostFunction), [4..7] = color corners (12 doubles: C.r,C.g,C.b,
+// Cu.r,Cu.g,Cu.b, Cv.r,Cv.g,Cv.b, Cuv.r,Cuv.g,Cuv.b). Block k and block 4+k
+// are always the SAME physical vertex. All four geometry kinds AND all
+// four color kinds are free unknowns now, so both Jacobians use all four
+// PatchWeights kinds.
 class JointPatchDataCostFunction : public ceres::CostFunction {
 public:
     JointPatchDataCostFunction(const GradientMesh& snapshot, const Image& target,
@@ -339,7 +353,7 @@ public:
           n_(std::max(2, samplesPerEdge)) {
         int numSamples = (n_ + 1) * (n_ + 1);
         set_num_residuals(3 * numSamples);
-        for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(6);   // geometry
+        for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(8);   // geometry
         for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(12);  // color
     }
 
@@ -350,9 +364,10 @@ public:
                 int k = a * 2 + b;
                 int vert = mesh.idx(pr_ + b, pc_ + a);
                 const double* pg = parameters[k];
-                mesh.vertices[vert].P  = {pg[0], pg[1]};
-                mesh.vertices[vert].Pu = {pg[2], pg[3]};
-                mesh.vertices[vert].Pv = {pg[4], pg[5]};
+                mesh.vertices[vert].P   = {pg[0], pg[1]};
+                mesh.vertices[vert].Pu  = {pg[2], pg[3]};
+                mesh.vertices[vert].Pv  = {pg[4], pg[5]};
+                mesh.vertices[vert].Puv = {pg[6], pg[7]};
                 const double* pc = parameters[4 + k];
                 mesh.vertices[vert].C   = {pc[0],  pc[1],  pc[2]};
                 mesh.vertices[vert].Cu  = {pc[3],  pc[4],  pc[5]};
@@ -365,7 +380,7 @@ public:
         int rowsTotal = num_residuals();
         if (jacobians) {
             for (int k = 0; k < 4; ++k) {
-                if (jacobians[k]) std::fill(jacobians[k], jacobians[k] + rowsTotal * 6, 0.0);
+                if (jacobians[k]) std::fill(jacobians[k], jacobians[k] + rowsTotal * 8, 0.0);
                 if (jacobians[4 + k]) std::fill(jacobians[4 + k], jacobians[4 + k] + rowsTotal * 12, 0.0);
             }
         }
@@ -404,18 +419,21 @@ public:
                         // cmesh doesn't depend on geometry (color surface
                         // evaluated at fixed parametric (u,v)).
                         if (jacobians[k]) {
-                            double wP  = pw.w[base + 0];
-                            double wPu = pw.w[base + 1];
-                            double wPv = pw.w[base + 2];
+                            double wP   = pw.w[base + 0];
+                            double wPu  = pw.w[base + 1];
+                            double wPv  = pw.w[base + 2];
+                            double wPuv = pw.w[base + 3];
                             double* J = jacobians[k];
                             for (int c = 0; c < 3; ++c) {
-                                int rr = (row + c) * 6;
+                                int rr = (row + c) * 8;
                                 J[rr + 0] = sw * (-gx[c] * wP);
                                 J[rr + 1] = sw * (-gy[c] * wP);
                                 J[rr + 2] = sw * (-gx[c] * wPu);
                                 J[rr + 3] = sw * (-gy[c] * wPu);
                                 J[rr + 4] = sw * (-gx[c] * wPv);
                                 J[rr + 5] = sw * (-gy[c] * wPv);
+                                J[rr + 6] = sw * (-gx[c] * wPuv);
+                                J[rr + 7] = sw * (-gy[c] * wPuv);
                             }
                         }
 
@@ -497,12 +515,16 @@ private:
     double sw_;
 };
 
-// ---- Smoothness: one residual block per row/col triple (mirrors addSmoothnessTerms) ----
+// ---- Smoothness: one residual block per row/col triple (mirrors addSmoothnessTerms).
+// Only ever reads/writes P.x,P.y (indices 0,1) -- untouched by Puv's
+// promotion to a free unknown, but the parameter block itself is now the
+// full 8-wide geometry block (same array every other geometry term shares),
+// so the declared block size and Jacobian buffer stride below must match. ----
 class SmoothTripleCostFunction : public ceres::CostFunction {
 public:
     explicit SmoothTripleCostFunction(double weight) : sw_(std::sqrt(std::max(weight, 0.0))) {
         set_num_residuals(2); // rx, ry
-        for (int k = 0; k < 3; ++k) mutable_parameter_block_sizes()->push_back(6);
+        for (int k = 0; k < 3; ++k) mutable_parameter_block_sizes()->push_back(8);
     }
     bool Evaluate(double const* const* p, double* residuals, double** jacobians) const override {
         double rx = p[0][0] - 2 * p[1][0] + p[2][0];
@@ -514,9 +536,9 @@ public:
         for (int k = 0; k < 3; ++k) {
             if (!jacobians[k]) continue;
             double* J = jacobians[k];
-            std::fill(J, J + 2 * 6, 0.0);
-            J[0 * 6 + 0] = sw_ * coeff[k]; // d(rx)/d(P.x)
-            J[1 * 6 + 1] = sw_ * coeff[k]; // d(ry)/d(P.y)
+            std::fill(J, J + 2 * 8, 0.0);
+            J[0 * 8 + 0] = sw_ * coeff[k]; // d(rx)/d(P.x)
+            J[1 * 8 + 1] = sw_ * coeff[k]; // d(ry)/d(P.y)
         }
         return true;
     }
@@ -524,27 +546,33 @@ private:
     double sw_;
 };
 
-// ---- Tangent-prior: one residual block per vertex (mirrors addTangentPriorTerms) ----
+// ---- Tangent/twist-prior: one residual block per vertex (mirrors
+// addTangentPriorTerms, which now also grounds Puv toward GradientMesh::
+// twist() the same way Pu/Pv are grounded toward tangentU/V). 6 residuals:
+// Pu.x,Pu.y,Pv.x,Pv.y,Puv.x,Puv.y vs. their finite-difference targets. ----
 class TangentPriorCostFunction : public ceres::CostFunction {
 public:
-    TangentPriorCostFunction(double weight, Vec2 tu, Vec2 tv)
-        : sw_(std::sqrt(std::max(weight, 0.0))), tu_(tu), tv_(tv) {
-        set_num_residuals(4);
-        mutable_parameter_block_sizes()->push_back(6);
+    TangentPriorCostFunction(double weight, Vec2 tu, Vec2 tv, Vec2 tuv)
+        : sw_(std::sqrt(std::max(weight, 0.0))), tu_(tu), tv_(tv), tuv_(tuv) {
+        set_num_residuals(6);
+        mutable_parameter_block_sizes()->push_back(8);
     }
     bool Evaluate(double const* const* p, double* residuals, double** jacobians) const override {
         residuals[0] = sw_ * (p[0][2] - tu_.x);
         residuals[1] = sw_ * (p[0][3] - tu_.y);
         residuals[2] = sw_ * (p[0][4] - tv_.x);
         residuals[3] = sw_ * (p[0][5] - tv_.y);
+        residuals[4] = sw_ * (p[0][6] - tuv_.x);
+        residuals[5] = sw_ * (p[0][7] - tuv_.y);
         if (!jacobians || !jacobians[0]) return true;
         double* J = jacobians[0];
-        std::fill(J, J + 4 * 6, 0.0);
-        J[0 * 6 + 2] = sw_; J[1 * 6 + 3] = sw_; J[2 * 6 + 4] = sw_; J[3 * 6 + 5] = sw_;
+        std::fill(J, J + 6 * 8, 0.0);
+        J[0 * 8 + 2] = sw_; J[1 * 8 + 3] = sw_; J[2 * 8 + 4] = sw_;
+        J[3 * 8 + 5] = sw_; J[4 * 8 + 6] = sw_; J[5 * 8 + 7] = sw_;
         return true;
     }
 private:
-    double sw_; Vec2 tu_, tv_;
+    double sw_; Vec2 tu_, tv_, tuv_;
 };
 
 // ---- Boundary: one residual block per boundary vertex ----
@@ -553,15 +581,15 @@ public:
     BoundaryCostFunction(double weight, Vec2 targetPos)
         : sw_(std::sqrt(std::max(weight, 0.0))), target_(targetPos) {
         set_num_residuals(2);
-        mutable_parameter_block_sizes()->push_back(6);
+        mutable_parameter_block_sizes()->push_back(8);
     }
     bool Evaluate(double const* const* p, double* residuals, double** jacobians) const override {
         residuals[0] = sw_ * (p[0][0] - target_.x);
         residuals[1] = sw_ * (p[0][1] - target_.y);
         if (!jacobians || !jacobians[0]) return true;
         double* J = jacobians[0];
-        std::fill(J, J + 2 * 6, 0.0);
-        J[0 * 6 + 0] = sw_; J[1 * 6 + 1] = sw_;
+        std::fill(J, J + 2 * 8, 0.0);
+        J[0 * 8 + 0] = sw_; J[1 * 8 + 1] = sw_;
         return true;
     }
 private:
@@ -574,8 +602,8 @@ public:
     VectorLineCostFunction(double weight, Vec2 dir)
         : sw_(std::sqrt(std::max(weight, 0.0))), dir_(dir) {
         set_num_residuals(1);
-        mutable_parameter_block_sizes()->push_back(6);
-        mutable_parameter_block_sizes()->push_back(6);
+        mutable_parameter_block_sizes()->push_back(8);
+        mutable_parameter_block_sizes()->push_back(8);
     }
     bool Evaluate(double const* const* p, double* residuals, double** jacobians) const override {
         Vec2 e{p[1][0] - p[0][0], p[1][1] - p[0][1]};
@@ -583,12 +611,12 @@ public:
         residuals[0] = sw_ * r0;
         if (!jacobians) return true;
         if (jacobians[0]) {
-            std::fill(jacobians[0], jacobians[0] + 6, 0.0);
+            std::fill(jacobians[0], jacobians[0] + 8, 0.0);
             jacobians[0][0] = sw_ * (-dir_.y);
             jacobians[0][1] = sw_ * (dir_.x);
         }
         if (jacobians[1]) {
-            std::fill(jacobians[1], jacobians[1] + 6, 0.0);
+            std::fill(jacobians[1], jacobians[1] + 8, 0.0);
             jacobians[1][0] = sw_ * (dir_.y);
             jacobians[1][1] = sw_ * (-dir_.x);
         }
@@ -629,12 +657,13 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
     // by Ceres's own trial evaluations via the parameter-block pointers.
     GradientMesh snapshot = mesh;
 
-    // One 6-double parameter block per vertex: 0,1=P.x,P.y; 2,3=Pu.x,Pu.y;
-    // 4,5=Pv.x,Pv.y -- same layout as the hand-rolled path's H/g blocks.
-    std::vector<std::array<double, 6>> params(numV);
+    // One 8-double parameter block per vertex: 0,1=P.x,P.y; 2,3=Pu.x,Pu.y;
+    // 4,5=Pv.x,Pv.y; 6,7=Puv.x,Puv.y -- same layout as the hand-rolled
+    // path's H/g blocks.
+    std::vector<std::array<double, 8>> params(numV);
     for (int i = 0; i < numV; ++i) {
         const MeshVertex& mv = mesh.vertices[i];
-        params[i] = {mv.P.x, mv.P.y, mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y};
+        params[i] = {mv.P.x, mv.P.y, mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y, mv.Puv.x, mv.Puv.y};
     }
 
     ceres::Problem problem;
@@ -676,8 +705,8 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
         for (int r = 0; r < mesh.rows; ++r) {
             for (int c = 0; c < mesh.cols; ++c) {
                 int i = mesh.idx(r, c);
-                Vec2 tu = snapshot.tangentU(r, c), tv = snapshot.tangentV(r, c);
-                auto* cost = new TangentPriorCostFunction(opts.geomTangentPriorWeight, tu, tv);
+                Vec2 tu = snapshot.tangentU(r, c), tv = snapshot.tangentV(r, c), tuv = snapshot.twist(r, c);
+                auto* cost = new TangentPriorCostFunction(opts.geomTangentPriorWeight, tu, tv, tuv);
                 problem.AddResidualBlock(cost, nullptr, params[i].data());
             }
         }
@@ -719,19 +748,20 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
 
     for (int i = 0; i < numV; ++i) {
         MeshVertex& mv = mesh.vertices[i];
-        mv.P  = {params[i][0], params[i][1]};
-        mv.Pu = {params[i][2], params[i][3]};
-        mv.Pv = {params[i][4], params[i][5]};
+        mv.P   = {params[i][0], params[i][1]};
+        mv.Pu  = {params[i][2], params[i][3]};
+        mv.Pv  = {params[i][4], params[i][5]};
+        mv.Puv = {params[i][6], params[i][7]};
     }
 }
 
 // Same idea as ceresSolveOnce (frozen snapshot, one ceres::Problem, at
 // most maxIters of Ceres's own internal LM iterations), but for the FULL
-// joint problem: geometry (P,Pu,Pv, 6 doubles/vertex) AND color (C,Cu,Cv,
-// Cuv, 12 doubles/vertex) as separate-but-simultaneously-solved parameter
-// blocks. Geometry-side residuals (smoothness, tangent-prior, boundary,
-// vector-line) are UNCHANGED from ceresSolveOnce -- they don't involve
-// color at all, so the existing SmoothTripleCostFunction/
+// joint problem: geometry (P,Pu,Pv,Puv, 8 doubles/vertex) AND color (C,Cu,
+// Cv,Cuv, 12 doubles/vertex) as separate-but-simultaneously-solved
+// parameter blocks. Geometry-side residuals (smoothness, tangent/twist-
+// prior, boundary, vector-line) are UNCHANGED from ceresSolveOnce -- they
+// don't involve color at all, so the existing SmoothTripleCostFunction/
 // TangentPriorCostFunction/BoundaryCostFunction/VectorLineCostFunction
 // are reused verbatim, just fed the geometry half of `paramsGeom`. Only
 // the data term (now JointPatchDataCostFunction, with both geometry AND
@@ -745,11 +775,11 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
 
     GradientMesh snapshot = mesh; // frozen linearization point, same convention as ceresSolveOnce
 
-    std::vector<std::array<double, 6>> paramsGeom(numV);
+    std::vector<std::array<double, 8>> paramsGeom(numV);
     std::vector<std::array<double, 12>> paramsColor(numV);
     for (int i = 0; i < numV; ++i) {
         const MeshVertex& mv = mesh.vertices[i];
-        paramsGeom[i] = {mv.P.x, mv.P.y, mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y};
+        paramsGeom[i] = {mv.P.x, mv.P.y, mv.Pu.x, mv.Pu.y, mv.Pv.x, mv.Pv.y, mv.Puv.x, mv.Puv.y};
         paramsColor[i] = {mv.C.r, mv.C.g, mv.C.b, mv.Cu.r, mv.Cu.g, mv.Cu.b,
                            mv.Cv.r, mv.Cv.g, mv.Cv.b, mv.Cuv.r, mv.Cuv.g, mv.Cuv.b};
     }
@@ -793,8 +823,8 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
         for (int r = 0; r < mesh.rows; ++r) {
             for (int c = 0; c < mesh.cols; ++c) {
                 int i = mesh.idx(r, c);
-                Vec2 tu = snapshot.tangentU(r, c), tv = snapshot.tangentV(r, c);
-                auto* cost = new TangentPriorCostFunction(opts.geomTangentPriorWeight, tu, tv);
+                Vec2 tu = snapshot.tangentU(r, c), tv = snapshot.tangentV(r, c), tuv = snapshot.twist(r, c);
+                auto* cost = new TangentPriorCostFunction(opts.geomTangentPriorWeight, tu, tv, tuv);
                 problem.AddResidualBlock(cost, nullptr, paramsGeom[i].data());
             }
         }
@@ -854,9 +884,10 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
 
     for (int i = 0; i < numV; ++i) {
         MeshVertex& mv = mesh.vertices[i];
-        mv.P  = {paramsGeom[i][0], paramsGeom[i][1]};
-        mv.Pu = {paramsGeom[i][2], paramsGeom[i][3]};
-        mv.Pv = {paramsGeom[i][4], paramsGeom[i][5]};
+        mv.P   = {paramsGeom[i][0], paramsGeom[i][1]};
+        mv.Pu  = {paramsGeom[i][2], paramsGeom[i][3]};
+        mv.Pv  = {paramsGeom[i][4], paramsGeom[i][5]};
+        mv.Puv = {paramsGeom[i][6], paramsGeom[i][7]};
         mv.C   = {paramsColor[i][0], paramsColor[i][1], paramsColor[i][2]};
         mv.Cu  = {paramsColor[i][3], paramsColor[i][4], paramsColor[i][5]};
         mv.Cv  = {paramsColor[i][6], paramsColor[i][7], paramsColor[i][8]};
@@ -912,9 +943,10 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
         bool improved = false;
         for (int tries = 0; tries < 4; ++tries) {
             for (int i = 0; i < numV; ++i) {
-                mesh.vertices[i].P  = before[i].P  + (after[i].P  - before[i].P)  * alpha;
-                mesh.vertices[i].Pu = before[i].Pu + (after[i].Pu - before[i].Pu) * alpha;
-                mesh.vertices[i].Pv = before[i].Pv + (after[i].Pv - before[i].Pv) * alpha;
+                mesh.vertices[i].P   = before[i].P   + (after[i].P   - before[i].P)   * alpha;
+                mesh.vertices[i].Pu  = before[i].Pu  + (after[i].Pu  - before[i].Pu)  * alpha;
+                mesh.vertices[i].Pv  = before[i].Pv  + (after[i].Pv  - before[i].Pv)  * alpha;
+                mesh.vertices[i].Puv = before[i].Puv + (after[i].Puv - before[i].Puv) * alpha;
             }
             double newEnergy = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
             if (newEnergy <= energyBefore) { improved = true; break; }
@@ -956,6 +988,7 @@ void optimizeJointCeres(GradientMesh& mesh, const Image& target,
                 mesh.vertices[i].P   = before[i].P   + (after[i].P   - before[i].P)   * alpha;
                 mesh.vertices[i].Pu  = before[i].Pu  + (after[i].Pu  - before[i].Pu)  * alpha;
                 mesh.vertices[i].Pv  = before[i].Pv  + (after[i].Pv  - before[i].Pv)  * alpha;
+                mesh.vertices[i].Puv = before[i].Puv + (after[i].Puv - before[i].Puv) * alpha;
                 mesh.vertices[i].C   = before[i].C   + (after[i].C   - before[i].C)   * alpha;
                 mesh.vertices[i].Cu  = before[i].Cu  + (after[i].Cu  - before[i].Cu)  * alpha;
                 mesh.vertices[i].Cv  = before[i].Cv  + (after[i].Cv  - before[i].Cv)  * alpha;

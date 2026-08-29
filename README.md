@@ -112,12 +112,15 @@ multi-person, multi-month effort. To get something real, working, and checkable 
 this project's scope, a few deliberate simplifications were made -- all noted in code
 comments at the relevant spot too:
 
-* **Twist (`Puv`) is derived, not free.** Position `P` and tangents `Pu`, `Pv` are all
-  free per-vertex unknowns, jointly refined by the geometry Gauss-Newton step (see "Free
-  Pu/Pv tangents" below) -- only the twist term is still computed from neighboring
-  positions via centered finite differences (Catmull-Rom style) rather than kept as an
-  independent optimization variable. Color keeps the full independent `(C, Cu, Cv, Cuv)`
-  unknown set, which is what actually gives a gradient mesh its shading expressiveness.
+* ~~Twist (`Puv`) is derived, not free.~~ **No longer a simplification -- fixed.**
+  Position `P`, tangents `Pu`, `Pv` AND the twist `Puv` are now all free per-vertex
+  unknowns, jointly refined by the geometry Gauss-Newton step (see "Fixed: Pu/Pv
+  promoted to free unknowns" and "Fixed: Puv promoted to a free unknown too" below),
+  exactly the 4-value-per-corner Hermite corner the paper describes.
+  `Puv` used to be computed from neighboring positions via centered finite differences
+  (Catmull-Rom style) instead of being a free unknown; that gap is closed. Color keeps
+  the full independent `(C, Cu, Cv, Cuv)` unknown set, which is what actually gives a
+  gradient mesh its shading expressiveness -- geometry now matches that same shape.
 * **Block-coordinate descent, not one joint solve.** Colors enter the reconstruction
   error *linearly*, so they're solved exactly with one sparse linear system per outer
   iteration; geometry enters *nonlinearly* (through the image lookup) and is refined with
@@ -292,7 +295,9 @@ seeds them from the old finite-difference estimate as a starting point; the
 GN unknown block grew from 2 components/vertex (`P.x,P.y`) to 6
 (`P.x,P.y,Pu.x,Pu.y,Pv.x,Pv.y`), with the corresponding Jacobian rows for
 `Pu`/`Pv` built directly from `PatchWeights`' `TangentU`/`TangentV` weights
--- see `MeshOptimizer.cpp`). Twist (`Puv`) stays derived, unchanged.
+-- see `MeshOptimizer.cpp`). Twist (`Puv`) stayed derived, unchanged, at the
+time this was written -- see the next section for the follow-up pass that
+closed that gap too.
 
 A free tangent has no sensible "pull toward zero" prior the way a color
 derivative does (`colorDerivRidge`) -- zero tangent collapses the patch.
@@ -399,9 +404,65 @@ takes several minutes in this sandbox) -- if you have a moment, `gmesh_cli
 --rows 25 --cols 25 ...` and comparing against the numbers in the section
 above would be a useful check.
 
+### Fixed: Puv (twist) promoted to a free unknown too
+
+Follow-up to the two sections above: `Puv` (the mixed second partial,
+"twist", at each Ferguson-patch corner) was still *derived* via centered
+finite differences from neighboring vertices' `P` (`GradientMesh::twist`),
+the one remaining gap vs. the paper's fully-free 4-value-per-corner Hermite
+corner (`P`, `Pu`, `Pv`, `Puv` all independent). Promoting it too, for
+completeness of paper-fidelity rather than as a targeted fix for the Fig. 4
+pinch investigation above (a derived-vs-free twist term was never a leading
+hypothesis for *that* -- it only ever contributes a general surface-shape
+degree of freedom, not a force pulling mesh-lines together).
+
+Mechanically: `MeshVertex` gained a `Puv` field (`GradientMesh.h`);
+`geomCorner()` reads it directly instead of calling `twist()`;
+`buildInitial()` seeds it from `twist()` as a starting point, same pattern
+already used for `Pu`/`Pv` and `tangentU`/`tangentV`; `scalePositions()`
+scales it the same linear per-component way as `P`/`Pu`/`Pv` between
+pyramid levels; the geometry GN unknown block grew from 6 components/vertex
+to 8 (`...,Puv.x,Puv.y`, still comfortably under `SparseBlockSolver.h`'s
+`double tmp[16]` ceiling); `addTangentPriorTerms`/`computeGeometryEnergy`
+extended to also ground `Puv` toward the current `twist()` estimate via the
+same `geomTangentPriorWeight`, for the same well-posedness reason `Pu`/`Pv`
+needed grounding. The Ceres path (both `useCeresGeometry` and
+`useCeresJoint`) got the matching treatment: `PatchDataCostFunction`/
+`JointPatchDataCostFunction`'s geometry parameter block grew 6->8 doubles
+with a new Jacobian column pair using `PatchWeights`' already-existing
+`Twist` kind weight, and `TangentPriorCostFunction` grew from 4 to 6
+residuals to also ground `Puv`. This incidentally makes the joint data-term
+Jacobian *more* exact than before: the 0.168 max-relative-error gap found
+during the joint-solve `ceres::GradientChecker` verification (see below) was
+specifically because derived-`Puv` depended on neighboring vertices outside
+a residual block's own 4 corners, which the Jacobian couldn't represent --
+with `Puv` now a direct per-corner parameter, that gap is gone (reverified
+with the same finite-difference-harness method, 200 entries checked, 0 bad,
+max relative error 4e-5 -- pure FD noise).
+
+Regression-checked on the same three cases used throughout this section
+(hand-rolled path, no Ceres, defaults unchanged otherwise):
+
+| case | before (Puv derived) | after (Puv free) |
+|---|---|---|
+| synthetic sphere, 9x9 | 53.2% reduction | 54.1% reduction |
+| 25x25 `gradient.png` | 61.4% reduction | 59.1% reduction |
+| 5x5 `gradient.png` | 61.0% reduction | 60.8% reduction |
+
+No divergence or instability in any case -- RMSE still decreases smoothly
+through the optimization in all three. The 25x25 case regressed a couple of
+points; plausible since `smoothWeightGeom`/`geomTangentPriorWeight`/
+`smoothGeomEdgeGain` were all empirically tuned earlier assuming a derived
+(FD-smoothed, implicitly regularized) twist, and an unconstrained `Puv` now
+has one more way to (slightly) overfit the coarse sample grid before the
+prior fully catches it. Reporting honestly rather than re-tuning weights to
+paper over it; if it matters in practice, retuning `geomTangentPriorWeight`
+specifically for the twist term (splitting it from the shared weight `Pu`/
+`Pv` use) would be the first thing to try.
+
 ### Optional: Ceres-based geometry solver
 
-The geometry Gauss-Newton block (position P + free tangents Pu, Pv) can
+The geometry Gauss-Newton block (position P + free tangents Pu, Pv, Puv) can
 optionally be solved by [Ceres Solver](http://ceres-solver.org/) instead
 of the hand-rolled damped GN + backtracking in `MeshOptimizer.cpp`. This
 is purely additive and off by default: `CMakeLists.txt` does
@@ -414,8 +475,9 @@ Motivation: a fully joint (position+tangent+color) optimization pass --
 one of the fidelity options considered for closing the remaining gap to
 the paper's Fig. 4 (see "Deeper finding" above) -- would need a much
 larger per-vertex parameter block than the hand-rolled solver's fixed
-`double tmp[16]` scratch buffers can safely hold (18+ dims: 6 geometry +
-12 color). Ceres's own sparse linear algebra and Levenberg-Marquardt
+`double tmp[16]` scratch buffers can safely hold (20 dims: 8 geometry --
+`P,Pu,Pv,Puv` -- + 12 color, now that `Puv` is also free; was 18 = 6+12
+before that pass). Ceres's own sparse linear algebra and Levenberg-Marquardt
 trust region don't have that ceiling, and would also remove an entire
 class of hand-derived-Jacobian bugs (the kind that caused the "mesh-lines
 weren't bending" bug above) via analytic verification against
@@ -440,10 +502,11 @@ wired in:
   GN sub-iteration there). After the fix: max relative error 0.168,
   confirmed identical between a standalone (non-Ceres) finite-difference
   check and the real `ceres::GradientChecker` run -- and that remaining
-  gap is itself not new: it's the pre-existing, already-documented
-  simplification that twist (`Puv`) isn't differentiated w.r.t.
-  neighboring vertex positions (same approximation `addTangentPriorTerms`
-  already accepts).
+  gap was itself not new at the time: it was the then-still-open
+  simplification that twist (`Puv`) wasn't differentiated w.r.t.
+  neighboring vertex positions. **Now closed** -- see "Fixed: Puv promoted
+  to a free unknown too" above; with `Puv` a direct per-corner parameter,
+  this Jacobian is exact again (reverified the same way, 0 bad entries).
 - Smoothness, tangent-prior, boundary and vector-line terms were each
   checked against a standalone finite-difference harness before being
   transcribed here; all four matched to numerical precision (no

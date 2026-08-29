@@ -60,13 +60,13 @@ struct OptimizerOptions {
     double boundaryWeight = 200.0;    // soft pull of boundary vertices back onto their spline
     double vectorLineWeight = 60.0;   // soft alignment of nearby mesh edges to user guide lines
     double vectorLineInfluenceRadius = 25.0; // pixels, in the *current pyramid level's* scale
-    double geomTangentPriorWeight = 0.6; // soft pull of free Pu/Pv toward the position-implied
-                                       // finite-difference estimate (GradientMesh::tangentU/V),
+    double geomTangentPriorWeight = 0.6; // soft pull of free Pu/Pv/Puv toward the position-implied
+                                       // finite-difference estimate (GradientMesh::tangentU/V/twist),
                                        // re-anchored every GN sub-iteration. 0 = fully free (as in
                                        // the paper); very large = old fully-derived behavior. Needed
-                                       // because Pu/Pv are now free unknowns (see GradientMesh.h's
-                                       // MeshVertex comment) and, unlike a position, a tangent has no
-                                       // sensible "pull toward zero" prior -- zero would collapse the
+                                       // because Pu/Pv/Puv are now free unknowns (see GradientMesh.h's
+                                       // MeshVertex comment) and, unlike a position, a tangent/twist has
+                                       // no sensible "pull toward zero" prior -- zero would collapse the
                                        // patch -- so this grounds them near a sane default instead.
     int outerIterationsPerLevel = 8;
     int geomGaussNewtonItersPerOuter = 3;
@@ -92,16 +92,17 @@ struct OptimizerOptions {
 
     // Opt-in, stronger than useCeresGeometry: replace BOTH the closed-form
     // color linear solve AND the geometry Gauss-Newton block with a single
-    // ceres::Problem solving position (P,Pu,Pv), tangents and ALL FOUR
-    // free color unknowns (C,Cu,Cv,Cuv) jointly, in one nonlinear least-
-    // squares problem per re-snapshot -- the fully-joint solve described
-    // in the class header comment above ("rather than one fully-joint LM
+    // ceres::Problem solving position (P,Pu,Pv,Puv) and ALL FOUR free
+    // color unknowns (C,Cu,Cv,Cuv) jointly, in one nonlinear least-squares
+    // problem per re-snapshot -- the fully-joint solve described in the
+    // class header comment above ("rather than one fully-joint LM
     // solve... this implementation uses block-coordinate descent"), which
     // was previously blocked by the hand-rolled SparseBlockMatrix's fixed
-    // `double tmp[16]` scratch buffers (a joint block is 6+12=18 doubles/
-    // vertex). Ceres has no such ceiling and doesn't even need geometry
-    // and color unified into one parameter block -- see
-    // MeshOptimizerCeres.cpp's optimizeJointCeres/jointSolveOnce.
+    // `double tmp[16]` scratch buffers (a joint block is 8+12=20 doubles/
+    // vertex, now that Puv is also free -- was 6+12=18 before that pass).
+    // Ceres has no such ceiling and doesn't even need geometry and color
+    // unified into one parameter block -- see MeshOptimizerCeres.cpp's
+    // optimizeJointCeres/jointSolveOnce.
     //
     // Motivation: investigating why even the geometry-only Ceres path
     // (useCeresGeometry) still can't reproduce the paper's Fig. 4 pinch on
@@ -111,9 +112,12 @@ struct OptimizerOptions {
     // tightly enough to produce it. A true joint solve, where a color
     // discontinuity can pull geometry toward it in the SAME step that
     // geometry's own data term does, is a plausible candidate for that
-    // missing coupling; if it still doesn't reproduce Fig. 4, that's
-    // evidence the paper's fold-over technique (Sec. 3.4) is doing
-    // something block-coordinate/joint optimization alone can't.
+    // missing coupling. (NOTE: an earlier version of this comment cited a
+    // paper "fold-over technique, Sec. 3.4" as a fallback explanation if
+    // joint-solve didn't close the gap -- that section/technique does not
+    // exist in the actual paper, see the project history; the paper's real,
+    // already-implemented mechanism for sharp edges is Sec 4.2's vector-
+    // line guidance, VectorLine/vectorLineWeight above.)
     //
     // If both this and useCeresGeometry are true, this one wins (color
     // solve and geometry solve are both replaced; useCeresGeometry's

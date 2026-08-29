@@ -116,16 +116,16 @@ void addSmoothnessTerms(SparseBlockMatrix& H, std::vector<double>& g, const Grad
     }
 }
 
-// Soft ridge pulling each vertex's free Pu/Pv (block subs 2,3,4,5) toward
-// the CURRENT position-implied finite-difference estimate. Re-anchored
-// every GN sub-iteration (tu/tv are recomputed from the mesh's current P
-// each call), so this is a "prior around the current linearization point",
-// not a hard constraint -- it lets the data term pull Pu/Pv away from that
-// estimate when it has real signal to, while keeping them from drifting
-// unboundedly where the signal is weak or absent. The Jacobian only
-// includes the direct d(residual)/d(Pu or Pv) = 1 term, not the indirect
-// dependence of tu/tv on neighboring P's -- same simplifying choice
-// already made for the (derived, unchanged) twist term.
+// Soft ridge pulling each vertex's free Pu/Pv/Puv (block subs 2,3,4,5,6,7)
+// toward the CURRENT position-implied finite-difference estimate.
+// Re-anchored every GN sub-iteration (tu/tv/tuv are recomputed from the
+// mesh's current P each call), so this is a "prior around the current
+// linearization point", not a hard constraint -- it lets the data term
+// pull Pu/Pv/Puv away from that estimate when it has real signal to, while
+// keeping them from drifting unboundedly where the signal is weak or
+// absent. The Jacobian only includes the direct d(residual)/d(Pu, Pv or
+// Puv) = 1 term, not the indirect dependence of tu/tv/tuv on neighboring
+// P's.
 void addTangentPriorTerms(SparseBlockMatrix& H, std::vector<double>& g, const GradientMesh& mesh,
                            double weight) {
     if (weight <= 0.0) return;
@@ -133,11 +133,13 @@ void addTangentPriorTerms(SparseBlockMatrix& H, std::vector<double>& g, const Gr
         for (int c = 0; c < mesh.cols; ++c) {
             int i = mesh.idx(r, c);
             const MeshVertex& mv = mesh.at(r, c);
-            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c), tuv = mesh.twist(r, c);
             accumulateGNRow(H, g, {{i, 2, 1}}, mv.Pu.x - tu.x, weight);
             accumulateGNRow(H, g, {{i, 3, 1}}, mv.Pu.y - tu.y, weight);
             accumulateGNRow(H, g, {{i, 4, 1}}, mv.Pv.x - tv.x, weight);
             accumulateGNRow(H, g, {{i, 5, 1}}, mv.Pv.y - tv.y, weight);
+            accumulateGNRow(H, g, {{i, 6, 1}}, mv.Puv.x - tuv.x, weight);
+            accumulateGNRow(H, g, {{i, 7, 1}}, mv.Puv.y - tuv.y, weight);
         }
     }
 }
@@ -198,16 +200,18 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
         }
     }
 
-    // Soft prior pulling the free Pu/Pv tangents toward the position-implied
-    // finite-difference estimate -- must mirror addTangentPriorTerms below
-    // exactly, for the same reason computeGeometryEnergy has to mirror the
-    // rest of the GN assembly (see this function's header comment).
+    // Soft prior pulling the free Pu/Pv/Puv tangents toward the
+    // position-implied finite-difference estimate -- must mirror
+    // addTangentPriorTerms below exactly, for the same reason
+    // computeGeometryEnergy has to mirror the rest of the GN assembly (see
+    // this function's header comment).
     for (int r = 0; r < mesh.rows; ++r) {
         for (int c = 0; c < mesh.cols; ++c) {
             const MeshVertex& mv = mesh.at(r, c);
-            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
-            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
-            energy += opts.geomTangentPriorWeight * (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c), tuv = mesh.twist(r, c);
+            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv, duv = mv.Puv - tuv;
+            energy += opts.geomTangentPriorWeight *
+                (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y + duv.x * duv.x + duv.y * duv.y);
         }
     }
 
@@ -414,17 +418,22 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             }
         }
 #endif
-        // Each vertex contributes a 6-wide unknown block: subs 0,1 =
-        // P.x,P.y (as before), 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y.
+        // Each vertex contributes an 8-wide unknown block: subs 0,1 =
+        // P.x,P.y (as before), 2,3 = Pu.x,Pu.y, 4,5 = Pv.x,Pv.y, 6,7 =
+        // Puv.x,Puv.y (the twist, promoted to a free unknown alongside
+        // Pu/Pv -- see MeshVertex/GradientMesh.h comments). Still well
+        // within SparseBlockSolver.h's `double tmp[16]` scratch-buffer
+        // ceiling (needs N<=16; N=8 here).
         for (int gi = 0; !geometrySolvedByCeres && gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
             SparseBlockMatrix H;
-            H.init(6, numV);
-            std::vector<double> g(numV * 6, 0.0);
-            std::vector<Vec2> P(numV), Pu(numV), Pv(numV);
+            H.init(8, numV);
+            std::vector<double> g(numV * 8, 0.0);
+            std::vector<Vec2> P(numV), Pu(numV), Pv(numV), Puv(numV);
             for (int i = 0; i < numV; ++i) {
                 P[i] = mesh.vertices[i].P;
                 Pu[i] = mesh.vertices[i].Pu;
                 Pv[i] = mesh.vertices[i].Pv;
+                Puv[i] = mesh.vertices[i].Puv;
             }
 
             for (int pr = 0; pr < mesh.rows - 1; ++pr) {
@@ -440,19 +449,17 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                             double w = areaWeightAt(mesh, pr, pc, u, v, duv);
                             PatchWeights pw = PatchWeights::at(u, v);
 
-                            // corner vertex + weight for each of the 3 FREE
+                            // corner vertex + weight for each of the 4 FREE
                             // Hermite kinds this patch corner contributes to
                             // pos(u,v): Value(P, sub-pair 0,1), TangentU(Pu,
-                            // sub-pair 2,3), TangentV(Pv, sub-pair 4,5) --
-                            // reusing RowEntry, with `sub` repurposed here to
-                            // mean "which sub-pair" (0/1/2), not a literal
-                            // block sub-index (buildChanneled below expands
-                            // it to the real x/y sub-indices). Twist (Puv) is
-                            // still derived, so it has no free-unknown row
-                            // here (same simplification as before -- see
-                            // addTangentPriorTerms's comment).
+                            // sub-pair 2,3), TangentV(Pv, sub-pair 4,5),
+                            // Twist(Puv, sub-pair 6,7) -- reusing RowEntry,
+                            // with `sub` repurposed here to mean "which
+                            // sub-pair" (0/1/2/3), not a literal block
+                            // sub-index (buildChanneled below expands it to
+                            // the real x/y sub-indices).
                             std::vector<RowEntry> rowCorners;
-                            rowCorners.reserve(12);
+                            rowCorners.reserve(16);
                             for (int a = 0; a < 2; ++a) {
                                 for (int b = 0; b < 2; ++b) {
                                     int base = (a * 2 + b) * 4;
@@ -460,6 +467,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                                     rowCorners.push_back({vert, 0, pw.w[base + 0]}); // P
                                     rowCorners.push_back({vert, 1, pw.w[base + 1]}); // Pu
                                     rowCorners.push_back({vert, 2, pw.w[base + 2]}); // Pv
+                                    rowCorners.push_back({vert, 3, pw.w[base + 3]}); // Puv
                                 }
                             }
                             double r0r = cmesh.r - ctarget.r;
@@ -517,13 +525,13 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             // Levenberg damping (scale-aware: proportional to each diagonal entry).
             for (int i = 0; i < numV; ++i) {
                 auto it = H.blocks.find(SparseBlockMatrix::key(i, i));
-                for (int k = 0; k < 6; ++k) {
-                    double dk = (it != H.blocks.end()) ? it->second[k * 6 + k] : 1.0;
+                for (int k = 0; k < 8; ++k) {
+                    double dk = (it != H.blocks.end()) ? it->second[k * 8 + k] : 1.0;
                     H.addScalar(i, i, k, k, lambda * std::max(dk, 1e-6));
                 }
             }
 
-            auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 6, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+            auto delta = solveSPD_PCG(H, g, std::vector<double>(numV * 8, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
 #ifdef GMCORE_DEBUG_GEOM
             double maxDelta = 0; for (double d : delta) maxDelta = std::max(maxDelta, std::abs(d));
             double gNorm = 0; for (double v : g) gNorm += v*v; gNorm = std::sqrt(gNorm);
@@ -540,12 +548,14 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             bool improved = false;
             for (int tries = 0; tries < 4; ++tries) {
                 for (int i = 0; i < numV; ++i) {
-                    mesh.vertices[i].P.x  = P[i].x  + alpha * delta[i * 6 + 0];
-                    mesh.vertices[i].P.y  = P[i].y  + alpha * delta[i * 6 + 1];
-                    mesh.vertices[i].Pu.x = Pu[i].x + alpha * delta[i * 6 + 2];
-                    mesh.vertices[i].Pu.y = Pu[i].y + alpha * delta[i * 6 + 3];
-                    mesh.vertices[i].Pv.x = Pv[i].x + alpha * delta[i * 6 + 4];
-                    mesh.vertices[i].Pv.y = Pv[i].y + alpha * delta[i * 6 + 5];
+                    mesh.vertices[i].P.x   = P[i].x   + alpha * delta[i * 8 + 0];
+                    mesh.vertices[i].P.y   = P[i].y   + alpha * delta[i * 8 + 1];
+                    mesh.vertices[i].Pu.x  = Pu[i].x  + alpha * delta[i * 8 + 2];
+                    mesh.vertices[i].Pu.y  = Pu[i].y  + alpha * delta[i * 8 + 3];
+                    mesh.vertices[i].Pv.x  = Pv[i].x  + alpha * delta[i * 8 + 4];
+                    mesh.vertices[i].Pv.y  = Pv[i].y  + alpha * delta[i * 8 + 5];
+                    mesh.vertices[i].Puv.x = Puv[i].x + alpha * delta[i * 8 + 6];
+                    mesh.vertices[i].Puv.y = Puv[i].y + alpha * delta[i * 8 + 7];
                 }
                 double newEnergy = computeGeometryEnergy(mesh, target, vectorLines, opts);
                 if (newEnergy <= baseEnergy) { improved = true; break; }
@@ -557,7 +567,8 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
 #endif
             if (!improved) {
                 for (int i = 0; i < numV; ++i) {
-                    mesh.vertices[i].P = P[i]; mesh.vertices[i].Pu = Pu[i]; mesh.vertices[i].Pv = Pv[i]; // revert
+                    mesh.vertices[i].P = P[i]; mesh.vertices[i].Pu = Pu[i]; mesh.vertices[i].Pv = Pv[i];
+                    mesh.vertices[i].Puv = Puv[i]; // revert
                 }
                 lambda = std::min(lambda * 4.0, 1e6);
             } else {
