@@ -1021,7 +1021,7 @@ with what's on screen, rather than requiring any change on their end.
 
 **Confirmed on-device**: after this fix, the loaded photo displays right-side-up.
 
-### Still open: the optimized mesh looked flipped even with the photo now displaying correctly
+### Resolved: the `_target` CTM flip was backwards -- removed
 
 Immediately after confirming the photo displays correctly, a follow-up report: the
 *optimized mesh* still looks flipped (or isn't sampling from the right place during
@@ -1053,17 +1053,32 @@ remaining ambiguity -- unlike inferring it indirectly from how an optimized mesh
 which depends on several other steps (mesh construction, the optimizer, rendering) all
 working correctly too.
 
-**Status: unresolved, pending that diagnostic's on-device output.** Two things worth
-checking together: (1) what the `[GMCORE _target orientation check]` log line says
-right after a fresh `gradient.png` load, and (2) whether a FRESH mesh (reload the
-image, rebuild the boundary/mesh, then optimize -- not reusing a mesh or document state
-from before these fixes, which would still carry stale, pre-fix-era vertex colors/
-positions) still looks flipped. If the log shows the wrong corners, the fix is to
-simply remove the `CGContextTranslateCTM`/`CGContextScaleCTM(1,-1)` pair added in the
-`_target` fix above (reverting `loadImageAtURL:` to a plain, unflipped
-`CGContextDrawImage` call) -- no other change needed, since everything downstream of
-`_target` (mesh construction, the optimizer, `GradientMesh::render`) was independently
-confirmed to consistently assume "row 0 / y=0 = top" and never introduces its own flip.
+The diagnostic settled it: loading `gradient.png` with the flip in place logged
+`TL=(3,3,254) TR=(254,254,3) BL=(254,1,1) BR=(2,254,2)` -- i.e. TL=blue, TR=yellow,
+BL=red, BR=green, exactly top and bottom swapped relative to the file's real corners
+(TL=red, TR=green, BL=blue, BR=yellow). The flip was backwards.
+
+Fix: removed the `CGContextTranslateCTM`/`CGContextScaleCTM(1.0, -1.0)` pair added
+earlier, back to a plain, unflipped `CGContextDrawImage` call. No other change was
+needed -- everything downstream of `_target` (mesh construction, the optimizer,
+`GradientMesh::render`) was independently confirmed to already consistently assume
+"row 0 / y=0 = top" and never introduces its own flip, so once `_target` itself is
+right, the rest of the pipeline should already agree with it.
+
+The takeaway for this whole saga (three rounds: the original `_target` fix, the
+`CanvasView` display fix, and this correction): Core Graphics' exact flip behavior for
+`CGContextDrawImage` genuinely depends on subtle context (a bare `CGBitmapContext` vs.
+a view-backed one with `isFlipped`), confident-sounding reasoning about it was wrong
+twice in a row even when it cited real, well-known gotchas, and a cheap, direct,
+on-device diagnostic (log 4 known corner colors, compare against ground truth) settled
+in one rebuild what several rounds of documentation research and first-principles
+re-derivation couldn't. The `NSLog` diagnostic is left in place in `loadImageAtURL:`
+as a cheap regression check for this exact class of bug.
+
+**Confirm after rebuilding**: load `gradient.png` fresh (not a mesh/document left over
+from before this fix -- that would still carry stale, pre-fix-era vertex colors), build
+the mesh, and check that it now visually tracks the image correctly both before and
+after optimizing.
 
 ## How this was tested
 

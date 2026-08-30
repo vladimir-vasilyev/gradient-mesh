@@ -70,33 +70,31 @@ static NSError* gmError(NSString* msg) {
     CGColorSpaceRelease(cs);
     if (!ctx) { CGImageRelease(cgImage); if (error) *error = gmError(@"Could not create bitmap context."); return NO; }
     CGContextSetBlendMode(ctx, kCGBlendModeCopy);
-    // CGBitmapContextCreate's default CTM is Quartz/PDF-style: origin at the
-    // BOTTOM-left, y increasing upward. Without this flip, CGContextDrawImage
-    // draws the source image right-side-up in that y-up space, which means
-    // row 0 of `buffer` below ends up holding the image's BOTTOM row, not
-    // its top -- the classic "CGContextDrawImage draws upside down" Quartz
-    // gotcha. Every other part of this codebase (Image::loadPNG/loadPPM in
-    // core/src/Image.cpp, GradientMesh's boundary/vertex construction,
-    // CanvasView's isFlipped=YES display+click mapping, SVGExporter) uses
-    // "row 0 / y=0 = top, y grows down" consistently -- this flip makes
-    // `_target` (below) match that same convention instead of being
-    // vertically mirrored relative to it. Found after a report that the
-    // mesh grid looked inconsistent with the displayed image.
+    // NO flip here -- confirmed on-device via the "[GMCORE _target
+    // orientation check]" NSLog below: a plain CGContextDrawImage into a
+    // freshly created (non-view-backed) CGBitmapContext already puts row 0
+    // of `buffer` at the image's true TOP row. An earlier version of this
+    // code added a CGContextTranslateCTM/CGContextScaleCTM(1,-1) flip here,
+    // reasoning (by analogy with the well-known "CGContextDrawImage draws
+    // upside down" gotcha, which is real but applies to a DIFFERENT
+    // scenario -- see below) that it was needed; the diagnostic log proved
+    // that reasoning backwards -- loading gradient.png with that flip in
+    // place printed TL=blue/TR=yellow/BL=red/BR=green, i.e. top and bottom
+    // swapped relative to the file's real corners (TL=red/TR=green/
+    // BL=blue/BR=yellow). Removing the flip is what actually matches.
     //
-    // CORRECTION: an earlier version of this comment claimed NSImage's own
-    // -drawInRect: "self-orients regardless of a flipped destination" and
-    // that self.displayImage was therefore unaffected by any flip issue --
-    // that claim was WRONG (see CanvasView.mm's -drawRect:, which turned
-    // out to have its own, separate flip bug for exactly that call) and
-    // should not be trusted as supporting evidence for whether THIS flip
-    // (below) is correct. The actual, on-device, ground-truth check is the
-    // "[GMCORE _target orientation check]" NSLog a few lines down: it
-    // should print TL=red/TR=green/BL=blue/BR=yellow when loading
-    // gradient.png. If it doesn't, this flip is backwards and should be
-    // removed instead -- see README's writeup of this fix for the full,
-    // honest back-and-forth on which direction is actually correct.
-    CGContextTranslateCTM(ctx, 0, h);
-    CGContextScaleCTM(ctx, 1.0, -1.0);
+    // For anyone re-deriving this: the classic gotcha the earlier comment
+    // invoked is real, but it's specifically about drawing into a context
+    // that ALREADY has a flip applied to its CTM by something else (most
+    // commonly an AppKit view with isFlipped=YES compensating for its own
+    // top-left/y-down convention -- see CanvasView.mm's -drawRect:, which
+    // had exactly that bug for its NSImage draw and needed exactly that
+    // fix). A bare CGBitmapContextCreate context here has no such
+    // pre-existing flip to compensate for, so adding one manually
+    // over-corrected. Every other part of this codebase (Image::loadPNG/
+    // loadPPM in core/src/Image.cpp, GradientMesh's boundary/vertex
+    // construction, CanvasView's click mapping, SVGExporter) already uses
+    // "row 0 / y=0 = top, y grows down" -- this now matches them too.
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
 
     Image img((int)w, (int)h);
