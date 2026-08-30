@@ -1019,10 +1019,51 @@ mapping already confirmed correct) are unaffected -- they already assumed a righ
 image, so fixing the image draw to actually be right-side-up is what makes them agree
 with what's on screen, rather than requiring any change on their end.
 
-**Not yet confirmed on-device** -- unlike the `_target` fix above, this one hasn't had
-its own dedicated rebuild-and-look test yet at the time of writing; needs the same
-on-device confirmation loop (load a photo, check it now displays right-side-up, check
-the grid/boundary still track it correctly).
+**Confirmed on-device**: after this fix, the loaded photo displays right-side-up.
+
+### Still open: the optimized mesh looked flipped even with the photo now displaying correctly
+
+Immediately after confirming the photo displays correctly, a follow-up report: the
+*optimized mesh* still looks flipped (or isn't sampling from the right place during
+optimization) relative to the now-correctly-displayed photo.
+
+This raised a real concern about the FIRST fix in this sequence (the `_target` CTM flip
+in `DocumentModel.mm`, above): that fix was justified partly by the claim "the displayed
+NSImage was never affected -- `-drawInRect:` self-orients regardless of a flipped
+destination" -- a claim the very next fix (`CanvasView.mm`) proved WRONG for exactly
+that call. That undermines confidence in the reasoning used to justify the `_target`
+fix's direction, even though it doesn't by itself prove that fix is backwards --- an
+honest re-derivation from Quartz first principles was attempted and produced, once
+again, a result that contradicts the original justification (this time suggesting NO
+flip should have been needed for a freestanding, non-view-backed `CGBitmapContext`,
+since only an AppKit `isFlipped` view's compensating CTM -- not a raw bitmap context --
+would make `-drawInRect:`-style "always draw upright in current user space" logic
+produce an upside-down result). Given this analysis has now flip-flopped multiple times
+under supposedly careful reasoning, and given the CanvasView fix already showed that
+confident-sounding Core Graphics reasoning can be wrong here, theory alone isn't a
+reliable arbiter for this specific question any more.
+
+Rather than guess a third time, added a direct, unambiguous, on-device diagnostic
+instead: `loadImageAtURL:` now `NSLog`s `_target`'s 4 corner colors right after
+building it (`"[GMCORE _target orientation check] TL=... TR=... BL=... BR=..."`).
+Loading `gradient.png` and checking Xcode's console against that file's actual corner
+colors (TL red, TR green, BL blue, BR yellow -- confirmed independently, outside the
+app) settles definitively whether the existing CTM flip is right or backwards, with no
+remaining ambiguity -- unlike inferring it indirectly from how an optimized mesh looks,
+which depends on several other steps (mesh construction, the optimizer, rendering) all
+working correctly too.
+
+**Status: unresolved, pending that diagnostic's on-device output.** Two things worth
+checking together: (1) what the `[GMCORE _target orientation check]` log line says
+right after a fresh `gradient.png` load, and (2) whether a FRESH mesh (reload the
+image, rebuild the boundary/mesh, then optimize -- not reusing a mesh or document state
+from before these fixes, which would still carry stale, pre-fix-era vertex colors/
+positions) still looks flipped. If the log shows the wrong corners, the fix is to
+simply remove the `CGContextTranslateCTM`/`CGContextScaleCTM(1,-1)` pair added in the
+`_target` fix above (reverting `loadImageAtURL:` to a plain, unflipped
+`CGContextDrawImage` call) -- no other change needed, since everything downstream of
+`_target` (mesh construction, the optimizer, `GradientMesh::render`) was independently
+confirmed to consistently assume "row 0 / y=0 = top" and never introduces its own flip.
 
 ## How this was tested
 

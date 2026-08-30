@@ -81,13 +81,20 @@ static NSError* gmError(NSString* msg) {
     // "row 0 / y=0 = top, y grows down" consistently -- this flip makes
     // `_target` (below) match that same convention instead of being
     // vertically mirrored relative to it. Found after a report that the
-    // mesh grid looked inconsistent with the displayed image: the displayed
-    // NSImage (self.displayImage, set from the same file below) was never
-    // affected -- NSImage's own -drawInRect: self-orients regardless of a
-    // flipped destination -- but `_target`, used internally for all color
-    // sampling and the optimizer's data/gradient terms, WAS mirrored,
-    // producing exactly that mismatch (initial vertex colors sampled from
-    // the wrong row, and the optimizer chasing mirrored image features).
+    // mesh grid looked inconsistent with the displayed image.
+    //
+    // CORRECTION: an earlier version of this comment claimed NSImage's own
+    // -drawInRect: "self-orients regardless of a flipped destination" and
+    // that self.displayImage was therefore unaffected by any flip issue --
+    // that claim was WRONG (see CanvasView.mm's -drawRect:, which turned
+    // out to have its own, separate flip bug for exactly that call) and
+    // should not be trusted as supporting evidence for whether THIS flip
+    // (below) is correct. The actual, on-device, ground-truth check is the
+    // "[GMCORE _target orientation check]" NSLog a few lines down: it
+    // should print TL=red/TR=green/BL=blue/BR=yellow when loading
+    // gradient.png. If it doesn't, this flip is backwards and should be
+    // removed instead -- see README's writeup of this fix for the full,
+    // honest back-and-forth on which direction is actually correct.
     CGContextTranslateCTM(ctx, 0, h);
     CGContextScaleCTM(ctx, 1.0, -1.0);
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
@@ -103,6 +110,33 @@ static NSError* gmError(NSString* msg) {
     CGImageRelease(cgImage);
 
     _target = std::move(img);
+
+    // Diagnostic: log _target's 4 corner colors so orientation can be
+    // checked directly against a known test image (e.g. a corner-colored
+    // gradient.png) rather than inferred indirectly from how the mesh looks
+    // after optimizing -- added after a report that, even after fixing the
+    // on-screen display flip (see CanvasView.mm's -drawRect:), the
+    // OPTIMIZED mesh still looked wrong, raising the question of whether
+    // THIS flip (the CGContextDrawImage one, below) is actually correct or
+    // was itself backwards. _target.at(0,0) should equal the image's real
+    // top-left pixel -- for gradient.png specifically, that's red
+    // (~254,1,1); top-right ~green, bottom-left ~blue, bottom-right
+    // ~yellow, per the file's own actual pixel data (confirmed with an
+    // independent tool, outside this app). Check Xcode's debug console
+    // after loading gradient.png and compare.
+    {
+        int iw = (int)w, ih = (int)h;
+        Color tl = _target.at(0, 0);
+        Color tr = _target.at(iw - 1, 0);
+        Color bl = _target.at(0, ih - 1);
+        Color br = _target.at(iw - 1, ih - 1);
+        NSLog(@"[GMCORE _target orientation check] TL=(%.0f,%.0f,%.0f) TR=(%.0f,%.0f,%.0f) "
+              @"BL=(%.0f,%.0f,%.0f) BR=(%.0f,%.0f,%.0f) -- expect TL=red TR=green BL=blue BR=yellow "
+              @"for gradient.png",
+              tl.r * 255, tl.g * 255, tl.b * 255, tr.r * 255, tr.g * 255, tr.b * 255,
+              bl.r * 255, bl.g * 255, bl.b * 255, br.r * 255, br.g * 255, br.b * 255);
+    }
+
     _hasImage = YES;
     _hasBoundary = NO;
     _mesh.reset();
