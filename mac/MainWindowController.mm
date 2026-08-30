@@ -246,7 +246,12 @@
 
 - (void)autoMesh:(id)sender {
     if (!self.documentModel.hasImage) { self.statusLabel.stringValue = @"Open an image first."; return; }
-    [self.documentModel useRectangularBoundaryWithMargin:6.0];
+    // 0 margin: boundary exactly matches the image's own edges (0,0)-(w,h),
+    // per explicit request -- was 6.0 (a small cosmetic inset with no
+    // functional reason: Image::sampleBilinear/sampleGradient clamp to
+    // valid pixel coordinates internally, so sampling exactly at the image
+    // edge is safe, not an out-of-bounds risk).
+    [self.documentModel useRectangularBoundaryWithMargin:0.0];
     NSInteger rows = MAX(3, self.rowsField.integerValue), cols = MAX(3, self.colsField.integerValue);
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
