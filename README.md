@@ -920,6 +920,58 @@ the Ceres stub and is untouched/unaffected by this change (the patience and rest
 logic both live in the hand-rolled `optimizeAtCurrentResolution`/`optimizeCoarseToFine`
 control flow, outside the Ceres-specific solve functions those call into).
 
+### Bug found and fixed: the macOS app's internal `Image` was vertically mirrored relative to everything else
+
+Reported by the user from the app's UI: the mesh grid visually looked inconsistent
+with the displayed photo -- like one of the two was flipped vertically relative to
+the other.
+
+Traced the Y-axis convention through the entire pipeline end to end: `Image::loadPNG`/
+`loadPPM` (`core/src/Image.cpp`, used by the CLI), `GradientMesh::buildInitial`'s
+boundary/vertex construction, `CanvasView`'s on-screen mesh-overlay drawing and
+mouse-click-to-image-coordinate mapping (`mac/CanvasView.mm`), and `SVGExporter` are
+all mutually consistent: row 0 / y=0 = top, y grows downward, uniformly.
+
+Found one place that disagreed: `DocumentModel.mm`'s `-loadImageAtURL:error:`, the
+macOS app's actual image-loading path (the CLI's `Image::load` is a separate,
+unaffected code path -- see `Image.h`'s own comment that the app never calls it).
+It builds `_target` (the internal `gmcore::Image` used for every color sample, and
+for the optimizer's data/gradient energy terms) by drawing the loaded `CGImage` into
+a `CGBitmapContextCreate` bitmap context via `CGContextDrawImage`, then copying that
+buffer row-by-row into `_target` assuming row 0 = top. That assumption doesn't hold
+here: a fresh `CGBitmapContextCreate` context has Quartz/PDF's default coordinate
+convention -- origin at the BOTTOM-left, y increasing upward -- and `CGContextDrawImage`
+draws respecting that current transform, so without an explicit flip the image ends
+up right-side-up in y-up space, which means it's stored upside-down in the buffer's
+top-down memory layout. (This is a well-known, frequently-hit Core Graphics gotcha,
+not specific to this codebase -- searching "CGContextDrawImage draws image upside
+down" turns up many independent reports of exactly this scenario and exactly this
+fix.) The displayed `NSImage` (`self.displayImage`) is a completely separate object
+loaded straight from the file and was never affected -- `NSImage`'s own `-drawInRect:`
+self-orients regardless of the destination context's flip state -- so the bug was
+invisible in the raw photo display and only showed up in anything that used `_target`
+geometrically: initial per-vertex mesh colors sampled from the wrong row
+(`GradientMesh::buildInitial`, `target.sampleBilinear(S.x, S.y)`), and, if the
+optimizer ran, geometry pulled toward color/edge features that were actually the
+vertical mirror of what's on screen.
+
+Fix: added the standard `CGContextTranslateCTM(ctx, 0, h); CGContextScaleCTM(ctx, 1.0,
+-1.0);` before the `CGContextDrawImage` call, so `buffer`'s row 0 ends up holding the
+image's true top row, matching every other stage's convention. Checked the app's one
+other `CGBitmapContextCreate` use (`-renderReconstructionPreview`, for the
+export/preview image): that path writes `gmcore::Image` pixel data directly into a
+buffer and wraps it with `CGBitmapContextCreateImage` -- it never calls
+`CGContextDrawImage`, so no CTM/transform is ever invoked and no flip is needed there;
+confirmed it was not a second instance of the same bug.
+
+**Not build-verified on macOS** -- this sandbox has no Cocoa/Core Graphics toolchain,
+so this fix is based on reading the exact code path plus the well-documented,
+widely-corroborated Quartz coordinate-flip behavior, not a rebuild-and-see-it-line-up
+test on the actual app. Should be confirmed by loading a photo in the rebuilt app and
+checking the mesh grid now visually tracks the image correctly (and, if there's an
+old project file/mesh saved from before this fix, that it may need re-optimizing,
+since its vertex colors and any prior optimization were fit against the mirrored data).
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

@@ -70,6 +70,26 @@ static NSError* gmError(NSString* msg) {
     CGColorSpaceRelease(cs);
     if (!ctx) { CGImageRelease(cgImage); if (error) *error = gmError(@"Could not create bitmap context."); return NO; }
     CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+    // CGBitmapContextCreate's default CTM is Quartz/PDF-style: origin at the
+    // BOTTOM-left, y increasing upward. Without this flip, CGContextDrawImage
+    // draws the source image right-side-up in that y-up space, which means
+    // row 0 of `buffer` below ends up holding the image's BOTTOM row, not
+    // its top -- the classic "CGContextDrawImage draws upside down" Quartz
+    // gotcha. Every other part of this codebase (Image::loadPNG/loadPPM in
+    // core/src/Image.cpp, GradientMesh's boundary/vertex construction,
+    // CanvasView's isFlipped=YES display+click mapping, SVGExporter) uses
+    // "row 0 / y=0 = top, y grows down" consistently -- this flip makes
+    // `_target` (below) match that same convention instead of being
+    // vertically mirrored relative to it. Found after a report that the
+    // mesh grid looked inconsistent with the displayed image: the displayed
+    // NSImage (self.displayImage, set from the same file below) was never
+    // affected -- NSImage's own -drawInRect: self-orients regardless of a
+    // flipped destination -- but `_target`, used internally for all color
+    // sampling and the optimizer's data/gradient terms, WAS mirrored,
+    // producing exactly that mismatch (initial vertex colors sampled from
+    // the wrong row, and the optimizer chasing mirrored image features).
+    CGContextTranslateCTM(ctx, 0, h);
+    CGContextScaleCTM(ctx, 1.0, -1.0);
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
 
     Image img((int)w, (int)h);
