@@ -989,6 +989,41 @@ If there's an old project file/mesh saved from before this fix, it may be worth
 re-optimizing it, since its vertex colors and any prior optimization were fit against
 the (then-mirrored) data.
 
+### Second, separate flip bug found: the DISPLAYED photo itself was upside-down in the app's canvas
+
+After the fix above, the user reported the mesh/reconstruction were now correct, but a
+follow-up, more specific report clarified something the first round of questions had
+missed: the loaded photo itself, as literally shown on screen in the canvas, displays
+upside-down -- a completely different code path than `_target`, and one this project's
+earlier CanvasView investigation (see the flip bug above) had assumed was fine.
+
+Root cause: `CanvasView.mm`'s `-drawRect:` shows the loaded photo via
+`[shown drawInRect:r fromRect:NSZeroRect operation:NSCompositingOperationCopy
+fraction:1.0]` -- `NSImage`'s "modern" (post-10.6) drawing API. The earlier
+investigation assumed this method auto-compensates for a flipped destination view
+(`CanvasView.isFlipped` returns `YES`, origin top-left, matching every other coordinate
+in this file). That assumption was wrong: `-drawInRect:fromRect:operation:fraction:`
+draws the image as-is in the current graphics-state coordinate system without any such
+compensation, so in this flipped view the photo comes out vertically mirrored. This is
+a real, if less commonly documented, AppKit gotcha -- unlike the Core Graphics flip
+fixed above, this one wasn't confirmed via extensive documentation archaeology (that
+approach had already proven unreliable once this session -- see the note above); it was
+identified directly from the user's live, on-device report and fixed on that basis.
+
+Fix: wrap just that one `drawInRect:` call in a save/concat/restore-scoped
+`NSAffineTransform` that reflects the image vertically within its own display rect
+(`translateXBy:0 yBy:(r.origin.y*2 + r.size.height)` then `scaleXBy:1.0 yBy:-1.0`,
+the standard idiom for this). Scoped narrowly so `drawBoundary`/`drawMesh`/
+`drawTangents`/`drawVectorLines` (drawn right after, via the same `viewPointFromImagePoint:`
+mapping already confirmed correct) are unaffected -- they already assumed a right-side-up
+image, so fixing the image draw to actually be right-side-up is what makes them agree
+with what's on screen, rather than requiring any change on their end.
+
+**Not yet confirmed on-device** -- unlike the `_target` fix above, this one hasn't had
+its own dedicated rebuild-and-look test yet at the time of writing; needs the same
+on-device confirmation loop (load a photo, check it now displays right-side-up, check
+the grid/boundary still track it correctly).
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

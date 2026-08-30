@@ -97,7 +97,26 @@
     NSRect r = [self imageDisplayRect];
 
     NSImage* shown = (self.showReconstructionPreview && _reconstructionPreview) ? _reconstructionPreview : dm.displayImage;
+    // -[NSImage drawInRect:fromRect:operation:fraction:] does NOT automatically
+    // compensate for -isFlipped==YES on the destination view -- despite that
+    // being the commonly assumed behavior for this "modern" (post-10.6)
+    // drawing API, it draws the image as-is in the CURRENT graphics-state
+    // coordinate system, so in this view (isFlipped=YES, origin top-left,
+    // matching every other coordinate in this file) the image comes out
+    // vertically mirrored. Found after an on-device report that the loaded
+    // photo displays upside-down. Fixed by reflecting just this one draw call
+    // vertically within its own rect (save/concat/restore scoped to only this
+    // call, so drawBoundary/drawMesh/drawTangents/drawVectorLines below --
+    // which already correctly assume a right-side-up image via
+    // viewPointFromImagePoint: -- are unaffected and stay correctly aligned
+    // now that the image itself displays correctly).
+    [NSGraphicsContext saveGraphicsState];
+    NSAffineTransform* flip = [NSAffineTransform transform];
+    [flip translateXBy:0 yBy:(r.origin.y * 2 + r.size.height)];
+    [flip scaleXBy:1.0 yBy:-1.0];
+    [flip concat];
     [shown drawInRect:r fromRect:NSZeroRect operation:NSCompositingOperationCopy fraction:1.0];
+    [NSGraphicsContext restoreGraphicsState];
 
     [self drawBoundary];
     if (self.showMeshOverlay && dm.hasMesh && !dm.isOptimizing) [self drawMesh];
