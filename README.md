@@ -964,13 +964,30 @@ buffer and wraps it with `CGBitmapContextCreateImage` -- it never calls
 `CGContextDrawImage`, so no CTM/transform is ever invoked and no flip is needed there;
 confirmed it was not a second instance of the same bug.
 
-**Not build-verified on macOS** -- this sandbox has no Cocoa/Core Graphics toolchain,
-so this fix is based on reading the exact code path plus the well-documented,
-widely-corroborated Quartz coordinate-flip behavior, not a rebuild-and-see-it-line-up
-test on the actual app. Should be confirmed by loading a photo in the rebuilt app and
-checking the mesh grid now visually tracks the image correctly (and, if there's an
-old project file/mesh saved from before this fix, that it may need re-optimizing,
-since its vertex colors and any prior optimization were fit against the mirrored data).
+**Confirmed on-device.** This sandbox has no Cocoa/Core Graphics toolchain, so the fix
+itself was written from reading the exact code path plus the (surprisingly hard to pin
+down with a single authoritative quote -- see below) Quartz coordinate-flip convention,
+not from a local rebuild-and-see-it-line-up test. The user rebuilt the app with this fix
+and tested against `gradient.png` (whose real corner colors, confirmed with `PIL`
+outside the app: top-left red, top-right green, bottom-right yellow, bottom-left blue,
+going clockwise -- matching the paper's own convention) and reported: before this fix
+`_target` was indeed mirrored (matching the diagnosis); after it, the mesh -- once
+optimized -- correctly snaps to the real (non-mirrored) image features, and
+`renderReconstructionPreview`'s output is correct. Direction of the fix confirmed
+correct, not just structurally reasoned about.
+
+Side note on process: trying to nail the *exact* mechanism down further by searching for
+an authoritative primary source (Apple's own docs on whether a fresh `CGBitmapContext`'s
+raw buffer row 0 is the image's top or bottom absent a flip) turned out to be
+surprisingly inconclusive -- multiple Apple reference pages and the Quartz 2D
+Programming Guide describe the *user-space* convention (bottom-left origin, y-up) but
+none of the fetched sources spelled out the raw-buffer-row question in so many words.
+The on-device empirical test above is what actually settled it, which is generally the
+more trustworthy signal for this class of bug anyway.
+
+If there's an old project file/mesh saved from before this fix, it may be worth
+re-optimizing it, since its vertex colors and any prior optimization were fit against
+the (then-mirrored) data.
 
 ## How this was tested
 
