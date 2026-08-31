@@ -1194,7 +1194,7 @@ e.g. a recent iPhone photo, which is where this would be most visible), optimize
 compare the live `CanvasView` reconstruction against a fresh PNG export side by side --
 they should now look the same, both fully saturated.
 
-### Measured, not just theorized: useCeresJoint's color still meaningfully worse than hand-rolled after the SPARSE_NORMAL_CHOLESKY fix -- found the actual gate bug
+### Fixed and verified: useCeresJoint's color-throttling gate bug (the SPARSE_NORMAL_CHOLESKY fix alone wasn't enough)
 
 The user exported the same mesh (6x6 patches on `gradient.png`) as SVG from both
 `--use-ceres-joint` and the hand-rolled path and sent both files. Rather than eyeball
@@ -1244,14 +1244,24 @@ point of `useCeresJoint` (e.g. for the paper's Fig. 4 pinch) -- but color's valu
 forward is now always the exact solve, never left wherever the shared alpha gate
 happened to strand it.
 
-**Not yet verified against a real Ceres build** -- syntax-checked
-(`g++ -fsyntax-only`) and link-checked (both object files compile, with
-`solveColorExact` correctly `T` (defined) in `MeshOptimizer.o` and `U` (undefined,
+Syntax-checked (`g++ -fsyntax-only`) and link-checked (both object files compile,
+with `solveColorExact` correctly `T` (defined) in `MeshOptimizer.o` and `U` (undefined,
 resolved at link time) in `MeshOptimizerCeres.o` -- confirming it isn't accidentally
-stuck in the anonymous namespace both files otherwise use for their private helpers),
-but not run against real Ceres. Please rebuild, export the same mesh/image as SVG from
-`--use-ceres-joint` again, and compare -- ideally the per-vertex numbers above should
-now land close to hand-rolled's, corners included.
+stuck in the anonymous namespace both files otherwise use for their private helpers)
+before being sent for a real rebuild.
+
+**Verified against a real Ceres build.** The user rebuilt, re-exported the exact same
+mesh from `--use-ceres-joint`, and sent the new SVG for the same per-vertex check.
+Result: per-vertex color RMSE dropped from 23.0/255 (0.0901) to 8.0/255 (0.0312) --
+right in line with hand-rolled's 7.5/255 (0.0295), closing essentially the whole gap.
+The 4 corners now fit almost exactly (0.0-0.8/255 error, matching hand-rolled's
+corner precision). What error remains is concentrated at the same couple of interior
+vertices where hand-rolled *also* has its own worst fit (a genuinely hard local
+feature in `gradient.png` -- a sharp transition around x~100-120 in the top rows, not
+a mesh-resolution or solver artifact) -- i.e. the remaining error is shared with
+hand-rolled's own hardest spot, not something specific to the joint path anymore. This
+confirms the diagnosis: the gate bug, not the residual math, was the actual reason
+`--use-ceres-joint` underperformed.
 
 ## How this was tested
 
