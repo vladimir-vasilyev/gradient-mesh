@@ -25,6 +25,58 @@ static NSError* gmError(NSString* msg) {
     return [NSError errorWithDomain:@"GradientMeshStudio" code:1 userInfo:@{NSLocalizedDescriptionKey: msg}];
 }
 
+// --- Debug-data export helpers (see -exportDebugDataToURL:error:) ---
+
+// Finds the git repo root by walking up from THIS SOURCE FILE'S OWN
+// compile-time path (__FILE__) looking for a .git directory/file (a git
+// worktree's .git is a file, not a directory, hence -fileExistsAtPath:
+// rather than checking isDirectory). This works because Xcode compiles
+// this .mm from its real location in the working copy and __FILE__
+// captures whatever absolute path was actually passed to the compiler --
+// it does NOT depend on the app's runtime bundle location (which, for a
+// built .app, has nothing to do with where the source/repo lives) or on
+// any build-time-generated version header. Returns nil (not a hard
+// failure) if no .git is found within a handful of parent directories --
+// e.g. if this binary was ever built from a source tree copied out from
+// under its .git, or moved after building. Callers must handle nil.
+static NSString* gmFindRepoRootFromSourceFile(void) {
+    NSString* dir = [[NSString stringWithUTF8String:__FILE__] stringByDeletingLastPathComponent];
+    NSFileManager* fm = [NSFileManager defaultManager];
+    for (int i = 0; i < 8 && dir.length > 1; ++i) {
+        if ([fm fileExistsAtPath:[dir stringByAppendingPathComponent:@".git"]]) return dir;
+        NSString* parent = [dir stringByDeletingLastPathComponent];
+        if ([parent isEqualToString:dir]) break;
+        dir = parent;
+    }
+    return nil;
+}
+
+// Runs `git -C repoRoot <args>` and returns trimmed stdout, or nil on any
+// failure (repoRoot nil, git not found, non-zero exit, ...) -- deliberately
+// forgiving since this only feeds an informational debug dump, never
+// something the app's own correctness depends on.
+static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
+    if (!repoRoot) return nil;
+    NSTask* task = [[NSTask alloc] init];
+    task.launchPath = @"/usr/bin/env";
+    NSMutableArray<NSString*>* full = [NSMutableArray arrayWithObjects:@"git", @"-C", repoRoot, nil];
+    [full addObjectsFromArray:args];
+    task.arguments = full;
+    NSPipe* outPipe = [NSPipe pipe];
+    task.standardOutput = outPipe;
+    task.standardError = [NSPipe pipe]; // discarded
+    @try {
+        [task launch];
+    } @catch (NSException* __unused exc) {
+        return nil;
+    }
+    NSData* data = [outPipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) return nil;
+    NSString* out = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return [out stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
 @interface DocumentModel () {
     gmcore::Image _target;
     BOOL _hasImage;
@@ -35,6 +87,17 @@ static NSError* gmError(NSString* msg) {
     std::vector<VectorLine> _vectorLines;
     BOOL _isOptimizing;
     double _lastRMSE;
+    // State captured for -exportDebugDataToURL:error: (see DocumentModel.h)
+    // -- the exact OptimizerOptions the most recent
+    // -optimizeWithPyramidLevels:progress:completion: call used, its full
+    // per-outer-iteration progress history, whether any run has happened
+    // yet, and how long it took wall-clock. Snapshotted/reset at the START
+    // of each optimize call (see that method), so a debug export mid-run
+    // or right after reflects the run actually in flight/just finished.
+    OptimizerOptions _lastOptsUsed;
+    std::vector<OptimizerProgress> _lastRunHistory;
+    BOOL _hasRunOptimize;
+    double _lastRunWallClockSeconds;
 }
 @property (nonatomic, strong, nullable) NSImage* displayImage;
 @end
@@ -361,18 +424,34 @@ static NSError* gmError(NSString* msg) {
     // 0/unset -> 1: see DocumentModel.h's comment on this property.
     opts.pyramidRestarts = (int)std::max((NSInteger)1, self.pyramidRestarts);
 
+    // Snapshot the exact opts this run uses and reset the per-run progress
+    // log/timer, for -exportDebugDataToURL:error: -- must happen here, on
+    // the main thread, before the background dispatch below, not inside it,
+    // so a debug export triggered mid-run (or right after) always reflects
+    // THIS run's actual settings, not a stale opts struct left over from an
+    // earlier call with different solver toggles.
+    _lastOptsUsed = opts;
+    _lastRunHistory.clear();
+    _hasRunOptimize = YES;
+    NSDate* runStart = [NSDate date];
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts,
-            [progress](const OptimizerProgress& p) {
-                if (!progress) return;
+            [progress, self](const OptimizerProgress& p) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    progress(p.rmse, p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.totalOuterIterations);
+                    // Recorded unconditionally, even if the caller passed a
+                    // nil UI progress block -- this is the history
+                    // -exportDebugDataToURL:error: dumps, independent of
+                    // whether anything was listening for live UI updates.
+                    self->_lastRunHistory.push_back(p);
+                    if (progress) progress(p.rmse, p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.totalOuterIterations);
                 });
             });
         double finalRmse = meshPtr->reconstructionRMSE(targetCopy, 6);
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_isOptimizing = NO;
             self->_lastRMSE = finalRmse;
+            self->_lastRunWallClockSeconds = -[runStart timeIntervalSinceNow];
             if (completion) completion();
         });
     });
@@ -445,6 +524,149 @@ static NSError* gmError(NSString* msg) {
     NSError* writeErr = nil;
     BOOL ok = [str writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
     if (!ok && error) *error = writeErr ?: gmError(@"Could not write SVG file.");
+    return ok;
+}
+
+- (BOOL)exportDebugDataToURL:(NSURL*)url error:(NSError**)error {
+    if (!_mesh) { if (error) *error = gmError(@"No mesh to export debug data for yet."); return NO; }
+
+    NSMutableDictionary* root = [NSMutableDictionary dictionary];
+
+    if (@available(macOS 10.12, *)) {
+        NSISO8601DateFormatter* iso = [[NSISO8601DateFormatter alloc] init];
+        root[@"exportedAt"] = [iso stringFromDate:[NSDate date]];
+    }
+
+    NSString* repoRoot = gmFindRepoRootFromSourceFile();
+    NSString* commit = gmRunGit(repoRoot, @[@"rev-parse", @"HEAD"]) ?: @"unknown";
+    NSString* describe = gmRunGit(repoRoot, @[@"describe", @"--always", @"--dirty", @"--long"]) ?: @"unknown";
+    NSString* porcelain = gmRunGit(repoRoot, @[@"status", @"--porcelain"]);
+    root[@"git"] = @{
+        @"repoRootFound": @(repoRoot != nil),
+        @"commit": commit,
+        @"describe": describe,
+        @"dirty": @(porcelain != nil && porcelain.length > 0),
+    };
+
+    // Which solver was REQUESTED (the UI toggle) vs. which one actually ran
+    // -- these can differ silently: useCeresGeometry/useCeresJoint are
+    // no-ops (with only a one-time stderr warning, easy to miss) in a
+    // build without Ceres found. This is exactly the ambiguity that made
+    // an earlier SVG-only analysis unreliable -- see gmcore::builtWithCeres().
+    BOOL builtWithCeres = gmcore::builtWithCeres();
+    NSString* requestedSolver = self.useCeresJoint ? @"ceresJoint"
+                               : self.useCeresGeometry ? @"ceresGeometry" : @"handRolled";
+    NSString* effectiveSolver = builtWithCeres ? requestedSolver : @"handRolled";
+    root[@"solver"] = @{
+        @"builtWithCeres": @(builtWithCeres),
+        @"requested": requestedSolver,
+        @"effective": effectiveSolver,
+    };
+
+    root[@"image"] = @{ @"width": @(_target.width), @"height": @(_target.height) };
+    // Same metric, same sample density (6) the UI's status label and the
+    // filename-embedded RMSE convention already use -- see
+    // -optimizeWithPyramidLevels:progress:completion:'s finalRmse.
+    root[@"lastRMSE"] = @(_lastRMSE);
+    root[@"pyramidRestarts"] = @(self.pyramidRestarts);
+    root[@"hasRunOptimize"] = @(_hasRunOptimize);
+    root[@"lastRunWallClockSeconds"] = @(_lastRunWallClockSeconds);
+
+    NSMutableArray<NSDictionary*>* history = [NSMutableArray arrayWithCapacity:_lastRunHistory.size()];
+    for (const auto& p : _lastRunHistory) {
+        [history addObject:@{
+            @"pyramidLevel": @(p.pyramidLevel),
+            @"totalPyramidLevels": @(p.totalPyramidLevels),
+            @"outerIteration": @(p.outerIteration),
+            @"totalOuterIterations": @(p.totalOuterIterations),
+            @"rmse": @(p.rmse),
+        }];
+    }
+    root[@"lastRunHistory"] = history;
+
+    const OptimizerOptions& o = _lastOptsUsed;
+    root[@"optimizerOptions"] = @{
+        @"samplesPerPatchEdge": @(o.samplesPerPatchEdge),
+        @"smoothWeightGeom": @(o.smoothWeightGeom),
+        @"smoothGeomEdgeGain": @(o.smoothGeomEdgeGain),
+        @"smoothGeomMinFactor": @(o.smoothGeomMinFactor),
+        @"smoothWeightColor": @(o.smoothWeightColor),
+        @"colorDerivRidge": @(o.colorDerivRidge),
+        @"boundaryWeight": @(o.boundaryWeight),
+        @"vectorLineWeight": @(o.vectorLineWeight),
+        @"vectorLineInfluenceRadius": @(o.vectorLineInfluenceRadius),
+        @"geomTangentPriorWeight": @(o.geomTangentPriorWeight),
+        @"outerIterationsPerLevel": @(o.outerIterationsPerLevel),
+        @"outerConvergenceRelTol": @(o.outerConvergenceRelTol),
+        @"outerConvergencePatience": @(o.outerConvergencePatience),
+        @"pyramidRestarts": @(o.pyramidRestarts),
+        @"geomGaussNewtonItersPerOuter": @(o.geomGaussNewtonItersPerOuter),
+        @"cgMaxIterations": @(o.cgMaxIterations),
+        @"cgRelTolerance": @(o.cgRelTolerance),
+        @"geomDampingInitial": @(o.geomDampingInitial),
+        @"useCeresGeometry": @(o.useCeresGeometry),
+        @"useCeresJoint": @(o.useCeresJoint),
+    };
+
+    // Full mesh state -- the actual point of this export. Unlike the SVG
+    // exporter (4 corner colors per patch, no Cu/Cv/Cuv, no explicit
+    // geometry tangents) this carries every field GradientMesh::evalPos/
+    // evalColor actually read, so an offline analysis can reproduce
+    // reconstructionRMSE (and the render) exactly rather than approximate
+    // it from Bezier control points.
+    NSMutableArray<NSDictionary*>* vertsJSON = [NSMutableArray arrayWithCapacity:_mesh->vertices.size()];
+    for (int r = 0; r < _mesh->rows; ++r) {
+        for (int c = 0; c < _mesh->cols; ++c) {
+            const gmcore::MeshVertex& mv = _mesh->at(r, c);
+            [vertsJSON addObject:@{
+                @"row": @(r), @"col": @(c),
+                @"P": @[@(mv.P.x), @(mv.P.y)],
+                @"Pu": @[@(mv.Pu.x), @(mv.Pu.y)],
+                @"Pv": @[@(mv.Pv.x), @(mv.Pv.y)],
+                @"Puv": @[@(mv.Puv.x), @(mv.Puv.y)], // always {0,0} -- see GradientMesh.h
+                @"C": @[@(mv.C.r), @(mv.C.g), @(mv.C.b)],
+                @"Cu": @[@(mv.Cu.r), @(mv.Cu.g), @(mv.Cu.b)],
+                @"Cv": @[@(mv.Cv.r), @(mv.Cv.g), @(mv.Cv.b)],
+                @"Cuv": @[@(mv.Cuv.r), @(mv.Cuv.g), @(mv.Cuv.b)],
+                @"isBoundary": @(mv.isBoundary),
+                @"boundarySide": @(mv.boundarySide),
+                @"boundaryT": @(mv.boundaryT),
+            }];
+        }
+    }
+    root[@"mesh"] = @{
+        @"rows": @(_mesh->rows),
+        @"cols": @(_mesh->cols),
+        @"vertices": vertsJSON,
+    };
+
+    NSMutableArray<NSArray*>* boundaryJSON = [NSMutableArray arrayWithCapacity:4];
+    if (_hasBoundary) {
+        for (int i = 0; i < 4; ++i) {
+            const CubicBezier& b = _boundary[i];
+            [boundaryJSON addObject:@[
+                @[@(b.p0.x), @(b.p0.y)], @[@(b.p1.x), @(b.p1.y)],
+                @[@(b.p2.x), @(b.p2.y)], @[@(b.p3.x), @(b.p3.y)],
+            ]];
+        }
+    }
+    root[@"boundary"] = boundaryJSON; // [top,right,bottom,left], each [p0,p1,p2,p3]
+
+    NSMutableArray<NSArray*>* linesJSON = [NSMutableArray arrayWithCapacity:_vectorLines.size()];
+    for (const auto& line : _vectorLines) {
+        NSMutableArray<NSArray*>* pts = [NSMutableArray arrayWithCapacity:line.points.size()];
+        for (const auto& p : line.points) [pts addObject:@[@(p.x), @(p.y)]];
+        [linesJSON addObject:pts];
+    }
+    root[@"vectorLines"] = linesJSON;
+
+    NSError* jsonErr = nil;
+    NSData* data = [NSJSONSerialization dataWithJSONObject:root
+                                                     options:(NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys)
+                                                       error:&jsonErr];
+    if (!data) { if (error) *error = jsonErr ?: gmError(@"Could not serialize debug data."); return NO; }
+    BOOL ok = [data writeToURL:url options:NSDataWritingAtomic error:&jsonErr];
+    if (!ok && error) *error = jsonErr ?: gmError(@"Could not write debug data file.");
     return ok;
 }
 

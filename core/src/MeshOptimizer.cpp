@@ -295,6 +295,17 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
 
 } // namespace
 
+// See MeshOptimizer.h's comment on this declaration for why it's a real
+// function rather than leaving every caller to test GMCORE_WITH_CERES
+// itself.
+bool builtWithCeres() {
+#ifdef GMCORE_WITH_CERES
+    return true;
+#else
+    return false;
+#endif
+}
+
 void solveColorExact(GradientMesh& mesh, const Image& target, const OptimizerOptions& opts) {
     int numV = (int)mesh.vertices.size();
     int n = std::max(2, opts.samplesPerPatchEdge);

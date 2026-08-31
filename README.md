@@ -91,6 +91,69 @@ the algorithm itself.
    color panel and repaint it.
 9. **Export PNG…** rasterizes the current mesh; **Export SVG…** writes a real SVG2
    `<meshgradient>` document (see below).
+10. **Export Debug Data…** writes a JSON dump of everything needed to analyze a solver
+    run offline (see "Export Debug Data (offline solver analysis)" below) -- the actual
+    reason this exists: the Ceres-backed solvers can only be built and run on a real
+    Mac with Ceres installed, so this is how solver internals get out of a run for
+    review elsewhere.
+
+## Export Debug Data (offline solver analysis)
+
+Added specifically because the Ceres-backed solvers (`useCeresGeometry`/`useCeresJoint`)
+can only be built and exercised on-device (Xcode + a real Ceres install) -- they cannot
+be built or run in the environment used to develop and review this code. Earlier
+debugging relied on comparing *SVG* exports between hand-rolled and Ceres runs (see the
+"Fixed and verified: useCeresJoint's color-throttling gate bug" section above), which
+turned out to be a real but limited channel: SVG2 `<meshgradient>` only carries 4 corner
+colors per patch -- no `Cu`/`Cv`/`Cuv` color derivatives, no explicit geometry tangents
+(`Pu`/`Pv`) beyond what can be *inferred* from each boundary segment's Bezier control
+points. That's enough to check seam consistency and corner-level color error, but not
+enough to see what happens *inside* a patch, where `GradientMesh::evalColor`'s full
+bicubic Hermite surface (using the real `Cu`/`Cv`/`Cuv`, not just corner colors) can
+overshoot between the sample points a corner-only check happens to land on -- exactly
+the gap that made a 9x9-mesh `useCeresJoint` run look fine at the vertex level while
+its app-reported `reconstructionRMSE` (which densely samples patch interiors, see
+`GradientMesh::reconstructionRMSE`) was ~9x worse than hand-rolled's.
+
+**Export Debug Data…** closes that gap: it writes a single pretty-printed JSON file
+containing everything `GradientMesh::evalPos`/`evalColor`/`reconstructionRMSE` actually
+read, so an offline analysis can reproduce those functions exactly instead of
+approximating them from a lossy SVG. Specifically, the file has:
+
+- `git`: `commit` (full SHA) and `describe` (`git describe --always --dirty --long`) of
+  the exact working copy this binary was built from, found at export time by walking up
+  from `DocumentModel.mm`'s own compile-time `__FILE__` path looking for `.git` --
+  independent of the app bundle's runtime location, so it works from a normal Xcode
+  Debug build. `dirty: true` means uncommitted changes were present at export time.
+- `solver.builtWithCeres`: whether this binary was actually compiled with
+  `GMCORE_WITH_CERES` (via the new `gmcore::builtWithCeres()`, defined in
+  `MeshOptimizer.cpp` so it reflects the library's real build setting rather than
+  whatever `DocumentModel.mm`'s own translation unit happens to see). `solver.requested`
+  is what the UI's solver picker was set to; `solver.effective` is what actually ran --
+  they can silently differ, since `useCeresGeometry`/`useCeresJoint` no-op back to
+  hand-rolled (with only a one-time stderr warning) in a build without Ceres found. This
+  directly answers "did Ceres actually run?" without having to trust the UI picker.
+- `mesh`: full `rows`/`cols` plus every vertex's `P`, `Pu`, `Pv`, `Puv` (position and
+  geometry tangents -- `Puv` is always `[0,0]`, see `GradientMesh.h`) and `C`, `Cu`,
+  `Cv`, `Cuv` (color and color derivatives), plus `isBoundary`/`boundarySide`/
+  `boundaryT`.
+- `boundary`: the 4 fitted boundary `CubicBezier` splines (top/right/bottom/left), each
+  as `[p0,p1,p2,p3]`; `vectorLines`: any user-drawn guide lines.
+- `optimizerOptions`: every `OptimizerOptions` field actually used by the most recent
+  optimize run (not just the two solver-choice flags) -- smoothness/boundary/vector-line
+  weights, iteration/damping/CG settings, etc.
+- `lastRunHistory`: the per-outer-iteration `(pyramidLevel, outerIteration, rmse)`
+  sequence from that run, recorded unconditionally (independent of whether the UI's
+  progress callback was listening), plus `lastRunWallClockSeconds`.
+- `lastRMSE`: `reconstructionRMSE(target, 6)` -- the exact same metric/sample density
+  the status bar and the project's own filename convention (e.g.
+  `..._ceres_joint_9x9_rmse0234...`) already use.
+
+Available any time `hasMesh` is true (doesn't require having optimized yet -- an
+unoptimized initial mesh dumps fine too, just with empty history and default
+`optimizerOptions`). The default filename (`gm_debug_<solver>_<rows>x<cols>.json`)
+follows the same "reconstruction type in the filename" convention already used for SVG
+exports shared for review.
 
 ## How the algorithm maps to the paper
 

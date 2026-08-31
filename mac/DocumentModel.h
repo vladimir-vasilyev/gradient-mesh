@@ -116,6 +116,32 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 - (BOOL)exportPNGToURL:(NSURL*)url error:(NSError**)error;
 - (BOOL)exportSVGToURL:(NSURL*)url error:(NSError**)error;
 
+// Dumps everything needed to analyze a solver run OFFLINE, without a local
+// Ceres build -- the actual motivation for this method: this project's
+// Ceres-backed solvers can only be built/run on-device (Xcode + a real
+// Ceres install), never in the sandbox used to develop and review this
+// code, so this is the channel for getting real solver internals out of a
+// run: the exact git commit this binary was built from, which solver was
+// requested vs. which one ACTUALLY ran (see gmcore::builtWithCeres() --
+// useCeresGeometry/useCeresJoint silently no-op back to hand-rolled, with
+// only a one-time stderr warning, in a build without Ceres found), the full
+// OptimizerOptions used, the mesh dimensions, the last reported RMSE, the
+// per-outer-iteration RMSE history of the run that produced the current
+// mesh, and -- most importantly -- the COMPLETE mesh state: every vertex's
+// position P, free geometry tangents Pu/Pv, inert Puv, and full color
+// Hermite data C/Cu/Cv/Cuv, plus the 4 boundary splines and any vector
+// guide lines. This is strictly more than either the SVG or PNG export:
+// SVG only carries 4 corner colors per patch (no Cu/Cv/Cuv, no geometry
+// tangents beyond what's implied by the Bezier control points), and PNG
+// carries no structured data at all -- neither lets an offline analysis
+// exactly reproduce what GradientMesh::evalPos/evalColor/reconstructionRMSE
+// actually compute. This does, by construction (same fields, same units).
+// Written as pretty-printed, sorted-key JSON. Requires hasMesh; does NOT
+// require having run -optimizeWithPyramidLevels:progress:completion: yet
+// (an unoptimized initial mesh can still be dumped, just with an empty
+// history and default-constructed optimizerOptions).
+- (BOOL)exportDebugDataToURL:(NSURL*)url error:(NSError**)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

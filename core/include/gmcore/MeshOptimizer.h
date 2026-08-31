@@ -21,6 +21,20 @@
 
 namespace gmcore {
 
+// True iff this binary was compiled with Ceres available (GMCORE_WITH_CERES
+// defined) -- i.e. whether OptimizerOptions::useCeresGeometry/useCeresJoint
+// can actually take effect, or silently no-op back to the hand-rolled path
+// (see MeshOptimizer.cpp's jointSolvedByCeres/geometrySolvedByCeres comments
+// and the one-time stderr warning). Exposed as a real function (defined in
+// MeshOptimizer.cpp, which is unconditionally compiled with whatever the
+// project's actual GMCORE_WITH_CERES setting is) rather than left for each
+// caller to test the macro itself, because a caller's own translation unit
+// (e.g. mac/DocumentModel.mm) isn't guaranteed to see the same preprocessor
+// definition the core library was built with -- this is exactly the kind of
+// "solver silently fell back and nobody noticed" gap the debug-data export
+// (DocumentModel -exportDebugDataToURL:error:) exists to catch.
+bool builtWithCeres();
+
 struct OptimizerOptions {
     int samplesPerPatchEdge = 6;      // data-term sampling density per patch, per axis
     double smoothWeightGeom = 0.02;   // 2nd-difference regularization on control-point positions.

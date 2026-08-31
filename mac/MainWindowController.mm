@@ -17,6 +17,7 @@
 @property (nonatomic, strong) NSButton* optimizeButton;
 @property (nonatomic, strong) NSButton* exportPNGButton;
 @property (nonatomic, strong) NSButton* exportSVGButton;
+@property (nonatomic, strong) NSButton* exportDebugButton;
 // Solver picker: Hand-rolled (default) / Ceres (geometry) / Ceres (joint) --
 // mirrors gmcore::OptimizerOptions::useCeresGeometry/useCeresJoint via
 // DocumentModel's properties of the same name. See -solverChanged:.
@@ -91,6 +92,7 @@
     self.tangentsCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.exportPNGButton = [self buttonTitled:@"Export PNG…" action:@selector(exportPNG:)];
     self.exportSVGButton = [self buttonTitled:@"Export SVG…" action:@selector(exportSVG:)];
+    self.exportDebugButton = [self buttonTitled:@"Export Debug Data…" action:@selector(exportDebugData:)];
     self.progressSpinner = [[NSProgressIndicator alloc] init];
     self.progressSpinner.translatesAutoresizingMaskIntoConstraints = NO;
     self.progressSpinner.style = NSProgressIndicatorStyleSpinning;
@@ -101,7 +103,7 @@
 
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
                          self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.tangentsCheckbox,
-                         self.exportPNGButton, self.exportSVGButton])
+                         self.exportPNGButton, self.exportSVGButton, self.exportDebugButton])
         [controlsRow2 addSubview:v];
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
@@ -343,6 +345,32 @@
         NSError* error = nil;
         if (![weakSelf.documentModel exportSVGToURL:panel.URL error:&error]) [weakSelf presentError:error];
         else weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Exported SVG (mesh gradient) to %@", panel.URL.path];
+    }];
+}
+
+- (void)exportDebugData:(id)sender {
+    if (!self.documentModel.hasMesh) { self.statusLabel.stringValue = @"Build a mesh first."; return; }
+    // Default filename embeds solver + mesh size, matching the convention
+    // already used when sharing exports for offline analysis (e.g.
+    // "..._ceres_joint_9x9_rmse0234...") -- see -exportDebugDataToURL:
+    // error:'s own comment on DocumentModel for what this file contains
+    // and why: it's the channel for getting real solver internals (git
+    // commit, which solver actually ran, full OptimizerOptions, per-
+    // iteration RMSE history, and the complete mesh -- position, tangents,
+    // and color Hermite data) out of a run for analysis without a local
+    // Ceres build.
+    NSString* solverTag = self.documentModel.useCeresJoint ? @"ceres_joint"
+                         : self.documentModel.useCeresGeometry ? @"ceres_geom" : @"hand_rolled";
+    NSString* name = [NSString stringWithFormat:@"gm_debug_%@_%ldx%ld.json", solverTag,
+                       (long)self.documentModel.meshRows, (long)self.documentModel.meshCols];
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.nameFieldStringValue = name;
+    __weak typeof(self) weakSelf = self;
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK) return;
+        NSError* error = nil;
+        if (![weakSelf.documentModel exportDebugDataToURL:panel.URL error:&error]) [weakSelf presentError:error];
+        else weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Exported debug data to %@", panel.URL.path];
     }];
 }
 
