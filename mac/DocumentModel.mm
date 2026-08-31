@@ -98,8 +98,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     std::vector<OptimizerProgress> _lastRunHistory;
     BOOL _hasRunOptimize;
     double _lastRunWallClockSeconds;
+    // URL of the currently loaded image (set in -loadImageAtURL:error:) --
+    // used only to locate the "DebugOut" folder for -autoExportDebugData
+    // (see DocumentModel.h), sibling to wherever the image actually lives.
+    NSURL* _imageURL;
 }
 @property (nonatomic, strong, nullable) NSImage* displayImage;
+@property (nonatomic, strong, nullable) NSString* lastDebugExportPath;
 @end
 
 @implementation DocumentModel
@@ -211,6 +216,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
               bl.r * 255, bl.g * 255, bl.b * 255, br.r * 255, br.g * 255, br.b * 255);
     }
 
+    _imageURL = url; // see -autoExportDebugDataIfEnabled's use of this
     _hasImage = YES;
     _hasBoundary = NO;
     _mesh.reset();
@@ -452,9 +458,72 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
             self->_isOptimizing = NO;
             self->_lastRMSE = finalRmse;
             self->_lastRunWallClockSeconds = -[runStart timeIntervalSinceNow];
+            // Must run AFTER the state above is updated (it dumps
+            // _lastRMSE/_lastRunHistory/_lastRunWallClockSeconds) but
+            // BEFORE completion(), so a completion handler that checks
+            // -lastDebugExportPath (see MainWindowController's -optimize:)
+            // sees this run's result, not a stale one from before it.
+            [self autoExportDebugDataIfEnabled];
             if (completion) completion();
         });
     });
+}
+
+#pragma mark - Debug data auto-export
+
+// Sibling "DebugOut" folder next to the currently loaded image, creating it
+// if needed. Returns nil if there's no loaded image to be a sibling of, or
+// if the folder couldn't be created (e.g. the image's folder is read-only).
+- (nullable NSURL*)debugOutDirectoryURL {
+    if (!_imageURL) return nil;
+    NSURL* dir = [[_imageURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"DebugOut" isDirectory:YES];
+    NSError* mkdirErr = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtURL:dir withIntermediateDirectories:YES
+                                                     attributes:nil error:&mkdirErr]) {
+        NSLog(@"[GMCORE] autoExportDebugData: could not create DebugOut folder at %@: %@", dir, mkdirErr);
+        return nil;
+    }
+    return dir;
+}
+
+// "gm_debug_<solver>_<rows>x<cols>_<timestamp>.json" -- same
+// <solver>_<rows>x<cols> convention as the old manual export's default
+// filename, plus a millisecond-resolution local timestamp (fixed
+// yyyyMMdd-HHmmss-SSS format, en_US_POSIX locale so it can't come out
+// looking different on a machine set to another locale/calendar) so
+// repeated runs pile up in DebugOut side by side instead of each one
+// silently overwriting the last -- the whole point of turning this into an
+// always-on checkbox is comparing a SEQUENCE of runs after the fact.
+- (NSString*)debugExportFilename {
+    NSString* solverTag = self.useCeresJoint ? @"ceres_joint" : self.useCeresGeometry ? @"ceres_geom" : @"hand_rolled";
+    static NSDateFormatter* fmt;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyyMMdd-HHmmss-SSS";
+    });
+    NSString* stamp = [fmt stringFromDate:[NSDate date]];
+    return [NSString stringWithFormat:@"gm_debug_%@_%ldx%ld_%@.json", solverTag,
+            (long)self.meshRows, (long)self.meshCols, stamp];
+}
+
+// See DocumentModel.h's comment on autoExportDebugData. Called at the end
+// of every -optimizeWithPyramidLevels:progress:completion: run (regardless
+// of outcome -- there's always a mesh by that point, since the method
+// bails out early if there wasn't one to begin with).
+- (void)autoExportDebugDataIfEnabled {
+    if (!self.autoExportDebugData || !_mesh) return;
+    NSURL* dir = [self debugOutDirectoryURL];
+    if (!dir) { self.lastDebugExportPath = nil; return; }
+    NSURL* fileURL = [dir URLByAppendingPathComponent:[self debugExportFilename]];
+    NSError* error = nil;
+    if ([self exportDebugDataToURL:fileURL error:&error]) {
+        self.lastDebugExportPath = fileURL.path;
+    } else {
+        NSLog(@"[GMCORE] autoExportDebugData: export failed: %@", error);
+        self.lastDebugExportPath = nil;
+    }
 }
 
 #pragma mark - Output

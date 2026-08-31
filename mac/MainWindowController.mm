@@ -17,11 +17,12 @@
 @property (nonatomic, strong) NSButton* optimizeButton;
 @property (nonatomic, strong) NSButton* exportPNGButton;
 @property (nonatomic, strong) NSButton* exportSVGButton;
-@property (nonatomic, strong) NSButton* exportDebugButton;
 // Solver picker: Hand-rolled (default) / Ceres (geometry) / Ceres (joint) --
 // mirrors gmcore::OptimizerOptions::useCeresGeometry/useCeresJoint via
 // DocumentModel's properties of the same name. See -solverChanged:.
 @property (nonatomic, strong) NSPopUpButton* solverPopup;
+// Mirrors DocumentModel.autoExportDebugData -- see -toggleAutoDebug:.
+@property (nonatomic, strong) NSButton* autoDebugCheckbox;
 @end
 
 @implementation MainWindowController
@@ -92,7 +93,6 @@
     self.tangentsCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.exportPNGButton = [self buttonTitled:@"Export PNG…" action:@selector(exportPNG:)];
     self.exportSVGButton = [self buttonTitled:@"Export SVG…" action:@selector(exportSVG:)];
-    self.exportDebugButton = [self buttonTitled:@"Export Debug Data…" action:@selector(exportDebugData:)];
     self.progressSpinner = [[NSProgressIndicator alloc] init];
     self.progressSpinner.translatesAutoresizingMaskIntoConstraints = NO;
     self.progressSpinner.style = NSProgressIndicatorStyleSpinning;
@@ -103,7 +103,7 @@
 
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
                          self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.tangentsCheckbox,
-                         self.exportPNGButton, self.exportSVGButton, self.exportDebugButton])
+                         self.exportPNGButton, self.exportSVGButton])
         [controlsRow2 addSubview:v];
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
@@ -118,7 +118,15 @@
     solverHint.textColor = [NSColor secondaryLabelColor];
     solverHint.font = [NSFont systemFontOfSize:11];
 
-    for (NSView* v in @[solverLabel, self.solverPopup, solverHint]) [controlsRow3 addSubview:v];
+    // Mirrors DocumentModel.autoExportDebugData -- see -toggleAutoDebug:
+    // and that property's own comment for what gets written (a timestamped
+    // JSON per run, in a "DebugOut" folder next to the loaded image) and
+    // why (offline analysis of a solver run without a local Ceres build).
+    self.autoDebugCheckbox = [NSButton checkboxWithTitle:@"Auto-export debug data"
+                                                     target:self action:@selector(toggleAutoDebug:)];
+    self.autoDebugCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+
+    for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox]) [controlsRow3 addSubview:v];
 
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -289,7 +297,14 @@
             [weakSelf.progressSpinner stopAnimation:nil];
             weakSelf.optimizeButton.enabled = YES;
             weakSelf.buildMeshButton.enabled = YES;
-            weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Done. Final RMSE=%.4f.", weakSelf.documentModel.currentRMSE];
+            NSString* msg = [NSString stringWithFormat:@"Done. Final RMSE=%.4f.", weakSelf.documentModel.currentRMSE];
+            // -lastDebugExportPath is only non-nil right after a run that
+            // both had autoExportDebugData ON and wrote successfully -- see
+            // DocumentModel -autoExportDebugDataIfEnabled.
+            if (weakSelf.documentModel.lastDebugExportPath) {
+                msg = [msg stringByAppendingFormat:@" Debug log: %@", weakSelf.documentModel.lastDebugExportPath];
+            }
+            weakSelf.statusLabel.stringValue = msg;
             [weakSelf.canvasView refreshReconstructionPreview];
             [weakSelf.canvasView setNeedsDisplay:YES];
         }];
@@ -348,30 +363,17 @@
     }];
 }
 
-- (void)exportDebugData:(id)sender {
-    if (!self.documentModel.hasMesh) { self.statusLabel.stringValue = @"Build a mesh first."; return; }
-    // Default filename embeds solver + mesh size, matching the convention
-    // already used when sharing exports for offline analysis (e.g.
-    // "..._ceres_joint_9x9_rmse0234...") -- see -exportDebugDataToURL:
-    // error:'s own comment on DocumentModel for what this file contains
-    // and why: it's the channel for getting real solver internals (git
-    // commit, which solver actually ran, full OptimizerOptions, per-
-    // iteration RMSE history, and the complete mesh -- position, tangents,
-    // and color Hermite data) out of a run for analysis without a local
-    // Ceres build.
-    NSString* solverTag = self.documentModel.useCeresJoint ? @"ceres_joint"
-                         : self.documentModel.useCeresGeometry ? @"ceres_geom" : @"hand_rolled";
-    NSString* name = [NSString stringWithFormat:@"gm_debug_%@_%ldx%ld.json", solverTag,
-                       (long)self.documentModel.meshRows, (long)self.documentModel.meshCols];
-    NSSavePanel* panel = [NSSavePanel savePanel];
-    panel.nameFieldStringValue = name;
-    __weak typeof(self) weakSelf = self;
-    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
-        if (result != NSModalResponseOK) return;
-        NSError* error = nil;
-        if (![weakSelf.documentModel exportDebugDataToURL:panel.URL error:&error]) [weakSelf presentError:error];
-        else weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Exported debug data to %@", panel.URL.path];
-    }];
+- (void)toggleAutoDebug:(id)sender {
+    // See DocumentModel.h's autoExportDebugData comment: when ON, every
+    // completed "Optimize" run writes a timestamped debug JSON to a
+    // "DebugOut" folder next to the loaded image, with no save dialog --
+    // replaces the old one-shot "Export Debug Data…" button, which needed
+    // a manual click (and manual filename bookkeeping to avoid overwriting
+    // a previous run) after every single run you wanted to keep.
+    self.documentModel.autoExportDebugData = (self.autoDebugCheckbox.state == NSControlStateValueOn);
+    self.statusLabel.stringValue = self.documentModel.autoExportDebugData
+        ? @"Auto-export debug data: ON. Each “Optimize” run will write a timestamped JSON to DebugOut/ next to the image."
+        : @"Auto-export debug data: OFF.";
 }
 
 - (void)presentError:(NSError*)error {

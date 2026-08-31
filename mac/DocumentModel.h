@@ -50,6 +50,30 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // behavior, unchanged) -- see -optimizeWithPyramidLevels:progress:completion:.
 @property (nonatomic, assign) NSInteger pyramidRestarts;
 
+// When YES, every completed -optimizeWithPyramidLevels:progress:completion:
+// run automatically writes a full debug-data JSON (same content
+// -exportDebugDataToURL:error: below produces) to a "DebugOut" folder next
+// to the currently loaded image -- created if it doesn't exist yet -- under
+// a timestamped filename, e.g.
+// "gm_debug_ceres_joint_9x9_20260901-143022-118.json". Timestamped rather
+// than a fixed name specifically so repeated runs (trying different solver
+// settings, or re-running after a code change) accumulate side by side
+// instead of the newest one silently overwriting the last -- the whole
+// point is comparing runs after the fact. Default NO (opt-in, since it
+// writes files without an explicit per-run save dialog). Silently does
+// nothing if there's no mesh yet or no image was ever loaded (no image
+// means nowhere to put "next to the image"); check -lastDebugExportPath
+// after a run to see whether/where it actually wrote, or watch the status
+// bar in MainWindowController.
+@property (nonatomic, assign) BOOL autoExportDebugData;
+
+// Full path of the most recent successful auto-export (see
+// autoExportDebugData above), or nil if none has happened yet in this
+// session (auto-export disabled, no run completed since it was enabled, or
+// the last attempt failed -- these aren't distinguished here; check the
+// console log for a failure reason).
+@property (nonatomic, readonly, nullable) NSString* lastDebugExportPath;
+
 // --- Image ---
 - (BOOL)loadImageAtURL:(NSURL*)url error:(NSError**)error;
 

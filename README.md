@@ -91,11 +91,11 @@ the algorithm itself.
    color panel and repaint it.
 9. **Export PNG…** rasterizes the current mesh; **Export SVG…** writes a real SVG2
    `<meshgradient>` document (see below).
-10. **Export Debug Data…** writes a JSON dump of everything needed to analyze a solver
-    run offline (see "Export Debug Data (offline solver analysis)" below) -- the actual
-    reason this exists: the Ceres-backed solvers can only be built and run on a real
-    Mac with Ceres installed, so this is how solver internals get out of a run for
-    review elsewhere.
+10. **Auto-export debug data** checkbox: when ON, every completed **Optimize** run
+    automatically writes a JSON dump of everything needed to analyze that run offline
+    (see "Export Debug Data (offline solver analysis)" below) -- the actual reason this
+    exists: the Ceres-backed solvers can only be built and run on a real Mac with Ceres
+    installed, so this is how solver internals get out of a run for review elsewhere.
 
 ## Export Debug Data (offline solver analysis)
 
@@ -115,10 +115,19 @@ the gap that made a 9x9-mesh `useCeresJoint` run look fine at the vertex level w
 its app-reported `reconstructionRMSE` (which densely samples patch interiors, see
 `GradientMesh::reconstructionRMSE`) was ~9x worse than hand-rolled's.
 
-**Export Debug Data…** closes that gap: it writes a single pretty-printed JSON file
-containing everything `GradientMesh::evalPos`/`evalColor`/`reconstructionRMSE` actually
-read, so an offline analysis can reproduce those functions exactly instead of
-approximating them from a lossy SVG. Specifically, the file has:
+The **Auto-export debug data** checkbox closes that gap. When ON,
+`DocumentModel -optimizeWithPyramidLevels:progress:completion:` writes a single
+pretty-printed JSON file at the end of every run, into a `DebugOut` folder created (if
+needed) right next to the currently loaded image, named
+`gm_debug_<solver>_<rows>x<cols>_<yyyyMMdd-HHmmss-SSS>.json` -- millisecond-timestamped
+specifically so repeated runs (different solver settings, or re-running after a code
+change) accumulate side by side in `DebugOut/` instead of each one silently overwriting
+the last; the whole point is comparing a *sequence* of runs after the fact, not just the
+most recent one. No save dialog, no per-run manual step -- check the box once, then just
+run **Optimize** as many times as you want to compare (the status bar echoes the path of
+whatever it just wrote). It contains everything `GradientMesh::evalPos`/`evalColor`/
+`reconstructionRMSE` actually read, so an offline analysis can reproduce those functions
+exactly instead of approximating them from a lossy SVG. Specifically, the file has:
 
 - `git`: `commit` (full SHA) and `describe` (`git describe --always --dirty --long`) of
   the exact working copy this binary was built from, found at export time by walking up
@@ -149,11 +158,14 @@ approximating them from a lossy SVG. Specifically, the file has:
   the status bar and the project's own filename convention (e.g.
   `..._ceres_joint_9x9_rmse0234...`) already use.
 
-Available any time `hasMesh` is true (doesn't require having optimized yet -- an
-unoptimized initial mesh dumps fine too, just with empty history and default
-`optimizerOptions`). The default filename (`gm_debug_<solver>_<rows>x<cols>.json`)
-follows the same "reconstruction type in the filename" convention already used for SVG
-exports shared for review.
+Off by default (opt-in, since it writes files without an explicit per-run save
+dialog); toggled via `DocumentModel.autoExportDebugData`, mirrored 1:1 by the checkbox.
+`DocumentModel -exportDebugDataToURL:error:` (the method that actually builds the JSON)
+is still there and still works standalone -- the auto-export path is just a thin wrapper
+around it that picks the `DebugOut/<timestamped name>.json` destination automatically
+instead of asking. If there's no loaded image (so nowhere to put a sibling `DebugOut`
+folder) or the folder can't be created, the run still completes normally; it just skips
+the write silently (logged to the console) and `-lastDebugExportPath` stays nil.
 
 ## How the algorithm maps to the paper
 
