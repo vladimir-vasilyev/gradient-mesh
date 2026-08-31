@@ -782,6 +782,78 @@ iterations allowed per call, though real convergence should stop well short of t
 ceiling most of the time) -- a wall-clock timing comparison for this mode still
 hasn't been done (see "Optional: Ceres-based geometry solver" above).
 
+### Found the actual root cause: CGNR+JACOBI was too weak a linear solver, not just too few iterations
+
+Reported by the user after rebuilding with the `cgMaxIterations` fix above:
+`--use-ceres` (geometry only) still approximates worse than the hand-rolled path, and
+`--use-ceres-joint` is worse still -- i.e. the iteration-budget fix directly above did
+**not** resolve the problem. Went back through the whole file line by line at the
+user's explicit request ("Ceres geom аппроксимирует хуже Hand-rolled. Ceres-joint -
+еще хуже. Перепроверь код."):
+
+- Re-verified every `sqrt(weight)` residual-scaling call site (Ceres minimizes
+  sum-of-squared-residuals; the hand-rolled path's energy is `weight * r^2`) -- all
+  consistent.
+- Read `computeTrueGeometryEnergy`/`computeTrueJointEnergy` side by side against
+  `MeshOptimizer.cpp`'s `computeGeometryEnergy` term by term (data, vector-line,
+  smoothness, tangent-prior, boundary) -- identical formulas and weights.
+- Read every `ceres::CostFunction` in the file in full --
+  `PatchDataCostFunction`, `JointPatchDataCostFunction`, `ColorSmoothTripleCostFunction`,
+  `ColorRidgeCostFunction`, `SmoothTripleCostFunction`, `TangentPriorCostFunction`,
+  `BoundaryCostFunction`, `VectorLineCostFunction` -- comparing each residual and
+  Jacobian sign/index against its hand-rolled counterpart (`addSmoothnessTerms`,
+  `addTangentPriorTerms`, the boundary and vector-line blocks inside
+  `optimizeAtCurrentResolution`'s GN loop, and `PatchWeights`' `w`/`wu`/`wv` array
+  layout). No sign error, wrong array offset, or mismatched weight found anywhere --
+  every term still matches its hand-rolled equivalent exactly.
+
+With the residual/Jacobian math cleared (again), the remaining suspect was the linear
+solver itself. Both `ceresSolveOnce` and `jointSolveOnce` had `Solver::Options` set to
+`linear_solver_type = ceres::CGNR` with `preconditioner_type = ceres::JACOBI`. CGNR is
+itself an iterative conjugate-gradient solve of the normal equations (not an exact
+one), and Ceres's `JACOBI` preconditioner for CGNR is only a per-*scalar* diagonal of
+`J^T J`. Compare that to the hand-rolled path's own linear solve
+(`SparseBlockSolver.h`'s `solveSPD_PCG`): also CG, but block-Jacobi preconditioned --
+it inverts each vertex's full 6x6 diagonal block, capturing the strong coupling
+between `P`, `Pu`, and `Pv` at the same vertex. A bare scalar diagonal preconditioner
+is materially weaker than that block preconditioner, especially with the vector-line
+and boundary terms mixed in (very unevenly-weighted residuals sharing the same
+6-double block). Under a weak preconditioner, a low iteration cap (the original,
+un-fixed 6 for `useCeresGeometry`) starves the CG solve before it gets close to the
+true GN/LM step -- and raising the cap alone (the `cgMaxIterations` fix above, already
+applied to `useCeresJoint`) just means grinding more slowly toward the same
+under-converged answer; it doesn't fix the underlying solve quality, which is
+consistent with the user's report that the budget fix alone didn't help.
+
+Fix: switched `linear_solver_type` to `ceres::SPARSE_NORMAL_CHOLESKY` in both
+`ceresSolveOnce` and `jointSolveOnce` (dropping `preconditioner_type`, which only
+applies to iterative solvers). This solves the normal equations *exactly* every LM
+iteration instead of approximately -- Ceres requires Eigen as a hard dependency
+regardless of solver choice, so `EIGEN_SPARSE` is always available as the sparse
+backend even without SuiteSparse; a Homebrew `ceres-solver` install additionally links
+SuiteSparse, which Ceres prefers automatically when present, for an even faster exact
+solve. The mesh grids here are small (tens to low hundreds of vertices), so an exact
+sparse Cholesky factorization per iteration is computationally trivial. Also raised
+`optimizeGeometryCeres`'s `itersPerSubStep` from the original hardcoded 6 to
+`std::max(6, opts.cgMaxIterations)`, matching `useCeresJoint`'s budget -- with an
+exact solver, Ceres's own convergence tolerances (`function_tolerance`,
+`gradient_tolerance`, `parameter_tolerance`) stop it well short of a generous cap once
+it actually converges, so there's no real cost to keeping the two paths symmetric
+instead of leaving geometry-only arbitrarily starved relative to joint.
+
+**Not yet verified against a real Ceres build** -- same caveat as every Ceres change
+in this project: this sandbox has no Ceres installed, only a hand-written stub
+(`/tmp/ceres_stub`) used to syntax-check `MeshOptimizerCeres.cpp` compiles
+(`g++ -fsyntax-only -DGMCORE_WITH_CERES`), which caught no errors. This is a
+well-reasoned fix backed by a real, identifiable difference between the two solvers'
+preconditioning strength, not a proven one. Please rebuild on macOS with the real
+Homebrew Ceres and report reconstruction RMSE for hand-rolled vs. `--use-ceres` vs.
+`--use-ceres-joint` on the same test image so this can be confirmed -- if
+`SPARSE_NORMAL_CHOLESKY` isn't available in your Ceres build for some reason (it
+requires *some* sparse linear algebra backend at Ceres's own build time, which nearly
+every distribution -- including Homebrew's -- provides), Ceres will report that
+clearly via `Solver::Summary::message` / stderr rather than silently misbehaving.
+
 ### Fixed: hand-rolled optimizer's default iteration budget was too low to converge
 
 Reported by the user: running the hand-rolled optimizer a SECOND time on its own

@@ -883,9 +883,39 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
 
     fixCornerPositions(problem, mesh, params);
 
+    // Linear solver: SPARSE_NORMAL_CHOLESKY (an exact, direct sparse solve
+    // of the normal equations each LM iteration), NOT CGNR+JACOBI as this
+    // used previously. That earlier choice is the actual reason
+    // useCeresGeometry/useCeresJoint underperformed the hand-rolled path
+    // (see report: geom worse than hand-rolled, joint worse still) --
+    // CGNR is itself a conjugate-gradient solve of the normal equations,
+    // and Ceres's JACOBI preconditioner for CGNR is only a per-SCALAR
+    // diagonal of J^T J. The hand-rolled path's own linear solve
+    // (SparseBlockSolver.h's solveSPD_PCG) is also CG, but with a
+    // per-VERTEX 6x6 block-Jacobi preconditioner that captures the strong
+    // P/Pu/Pv coupling within a vertex -- a materially stronger
+    // preconditioner than a bare scalar diagonal, especially once the
+    // vector-line and boundary terms are in the mix (very uneven residual
+    // weights across the same block). Under Ceres's weaker scalar
+    // preconditioner, capping iterations low (the original 6) starves the
+    // CG solve before it gets close to the true GN step; raising the cap
+    // (as was tried for the joint path, see optimizeJointCeres) still left
+    // it slower to converge and only papers over the issue instead of
+    // fixing it. SPARSE_NORMAL_CHOLESKY sidesteps the whole question by
+    // solving the (small, sparse) normal equations exactly every
+    // iteration -- Ceres requires Eigen regardless (a mandatory dependency
+    // of Ceres itself), so EIGEN_SPARSE is always available as the sparse
+    // backend even without SuiteSparse; a Homebrew `ceres-solver` install
+    // additionally links SuiteSparse, which Ceres will prefer
+    // automatically if present. preconditioner_type does not apply to a
+    // direct solver, so it's left unset (Ceres ignores it for
+    // non-iterative linear_solver_type values, but omitting it is
+    // clearer). NOT yet verified against a real Ceres build (this sandbox
+    // has none) -- well-reasoned, not proven; please rebuild and report
+    // hand-rolled vs. Ceres-geom vs. Ceres-joint RMSE on the same image so
+    // this can be confirmed or further revised.
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::CGNR;
-    options.preconditioner_type = ceres::JACOBI;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
     options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
@@ -1033,9 +1063,21 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
 
     fixCornerPositions(problem, mesh, paramsGeom);
 
+    // Same switch to SPARSE_NORMAL_CHOLESKY as ceresSolveOnce, and for the
+    // same reason -- see that function's comment. It matters even more
+    // here: the joint problem is 18 doubles/vertex (6 geometry + 12
+    // color) instead of 6, packed into one combined normal system with
+    // several very differently-scaled terms (pixel-scale geometry data/
+    // smoothness/boundary/vector-line residuals alongside 0..1-scale
+    // color residuals), which is exactly the kind of system a weak scalar
+    // (JACOBI) CG preconditioner struggles with. This is very likely why
+    // raising itersPerSubStep to opts.cgMaxIterations below (an earlier
+    // fix, see this function's other comment) did not resolve reports
+    // that useCeresJoint was the worst of the three solver modes -- more
+    // CG iterations against a weak preconditioner still converges slowly.
+    // An exact per-iteration solve removes that variable entirely.
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::CGNR;
-    options.preconditioner_type = ceres::JACOBI;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
     options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
@@ -1086,12 +1128,20 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
     // 0.4, 0.16, 0.064) until computeTrueGeometryEnergy() stops
     // objecting, before falling back to a full revert.
     //
-    // 6 Ceres iterations per sub-step is a deliberately modest budget:
-    // enough for Ceres's trust region to meaningfully outdo a single
-    // hand-rolled GN+backtracking step, not so many that the frozen
-    // weights it's using stop reflecting the mesh it's actually solving
-    // for by the time this sub-step's result gets checked.
-    const int itersPerSubStep = 6;
+    // Was hardcoded to 6 ("a deliberately modest budget... not so many
+    // that the frozen weights go stale") -- that reasoning mattered much
+    // more back when the linear solve itself (CGNR+JACOBI) was only a
+    // loose CG approximation of the true LM step, where extra iterations
+    // mostly meant "grinding further against increasingly stale weights."
+    // Now that ceresSolveOnce uses SPARSE_NORMAL_CHOLESKY (see that
+    // function's comment), each accepted LM iteration is an exact solve
+    // of the current linearization, so Ceres's own convergence checks
+    // (function/gradient/parameter tolerance) will stop it well short of
+    // this cap once it actually converges -- there's no real downside to
+    // giving it the same generous budget the joint path already uses, and
+    // it keeps the two paths symmetric instead of geometry-only being
+    // arbitrarily starved relative to joint.
+    const int itersPerSubStep = std::max(6, opts.cgMaxIterations);
     for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
         std::vector<MeshVertex> before = mesh.vertices;
         double energyBefore = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
@@ -1132,38 +1182,46 @@ void optimizeGeometryCeres(GradientMesh& mesh, const Image& target,
 // cost function, not the true energy.
 void optimizeJointCeres(GradientMesh& mesh, const Image& target,
                          const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
-    // NOT the same modest budget as optimizeGeometryCeres -- and using the
-    // same value (6) was likely the actual bug behind a report that
-    // useCeresJoint produced visibly the worst reconstruction of the three
-    // solver modes (worse than both the hand-rolled path and
-    // useCeresGeometry). Extensive review of every joint residual/Jacobian
+    // History: this used to be hardcoded to 6 while optimizeGeometryCeres
+    // also used 6, and a report that useCeresJoint produced visibly the
+    // worst reconstruction of the three solver modes (worse than both the
+    // hand-rolled path and useCeresGeometry) was first suspected to be
+    // this iteration budget alone -- raised to opts.cgMaxIterations (200)
+    // as an initial fix. That fix alone was NOT sufficient (a later report
+    // confirmed useCeresGeometry still underperformed hand-rolled, and
+    // useCeresJoint remained worse still, even with the larger budget in
+    // place) -- see ceresSolveOnce's comment for the actual root cause
+    // found on closer investigation: CGNR+JACOBI is only a loose,
+    // scalar-preconditioned CG approximation of each LM step, and no
+    // amount of extra CG iterations against a weak preconditioner
+    // substitutes for solving the normal equations exactly, which
+    // SPARSE_NORMAL_CHOLESKY (now used here too, same as ceresSolveOnce)
+    // does. Extensive review of every joint residual/Jacobian
     // (JointPatchDataCostFunction, ColorSmoothTripleCostFunction,
     // ColorRidgeCostFunction, and the geometry-side terms shared with
     // ceresSolveOnce) found no sign or formula error -- every one matches
     // its corresponding hand-rolled term exactly (see this file's header
-    // comment and each CostFunction's own comment). What's different about
-    // joint, structurally: its parameter space is 18 doubles/vertex (6
-    // geometry + 12 color), while the hand-rolled and useCeresGeometry
-    // paths solve color EXACTLY via its own dedicated closed-form linear
-    // system -- up to opts.cgMaxIterations (200) conjugate-gradient
-    // iterations against opts.cgRelTolerance, every single outer iteration
-    // (see optimizeAtCurrentResolution's color step). useCeresJoint has no
+    // comment and each CostFunction's own comment). What's still
+    // different about joint, structurally: its parameter space is 18
+    // doubles/vertex (6 geometry + 12 color), while the hand-rolled and
+    // useCeresGeometry paths solve color EXACTLY via its own dedicated
+    // closed-form linear system -- up to opts.cgMaxIterations (200)
+    // conjugate-gradient iterations against opts.cgRelTolerance, every
+    // single outer iteration (see optimizeAtCurrentResolution's color
+    // step). useCeresJoint has no
     // such dedicated solve: color and geometry are minimized together in
     // ONE ceres::Problem, and `maxIters` here caps Ceres's own outer
-    // trust-region (Levenberg-Marquardt) iteration count for that combined
-    // problem -- 6 such iterations is a reasonable budget for the
-    // geometry-only problem (6 doubles/vertex, verified working well
-    // against real Ceres per the README), but is very likely far too few
-    // for a problem 3x the size that also has to arrive at a good color
-    // fit with no dedicated linear solve to fall back on -- each outer LM
-    // iteration only gets one shot at an (internally CG-approximated)
-    // linearized step before this function's own gate re-checks the true
-    // energy and, on rejection, throws the whole sub-step away. Reusing
-    // opts.cgMaxIterations (default 200) here gives Ceres's own LM loop
-    // room to actually converge instead of being cut off after 6 steps --
-    // NOT yet verified against a real Ceres build (this sandbox has no
-    // Ceres to run), so treat this as a well-reasoned fix pending that
-    // confirmation, not a proven one.
+    // trust-region (Levenberg-Marquardt) iteration count for that combined,
+    // 3x-larger problem, which also has to arrive at a good color fit with
+    // no dedicated linear solve to fall back on. Kept at the same
+    // std::max(6, opts.cgMaxIterations) budget as optimizeGeometryCeres
+    // now uses (see that function's comment) -- with SPARSE_NORMAL_CHOLESKY
+    // giving each LM iteration an exact solve, Ceres's own convergence
+    // tolerances stop it well short of this cap once it actually
+    // converges, so there is no real cost to a generous shared budget.
+    // NOT yet verified against a real Ceres build (this sandbox has none)
+    // -- well-reasoned, not proven; please rebuild and report hand-rolled
+    // vs. Ceres-geom vs. Ceres-joint RMSE on the same image.
     const int itersPerSubStep = std::max(6, opts.cgMaxIterations);
     for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
         std::vector<MeshVertex> before = mesh.vertices;
