@@ -295,6 +295,106 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
 
 } // namespace
 
+void solveColorExact(GradientMesh& mesh, const Image& target, const OptimizerOptions& opts) {
+    int numV = (int)mesh.vertices.size();
+    int n = std::max(2, opts.samplesPerPatchEdge);
+    double duv = 1.0 / (n * n);
+
+    SparseBlockMatrix H;
+    H.init(4, numV);
+    std::vector<double> gR(numV * 4, 0.0), gG(numV * 4, 0.0), gB(numV * 4, 0.0);
+    std::vector<double> x0R(numV * 4), x0G(numV * 4), x0B(numV * 4);
+    for (int i = 0; i < numV; ++i) {
+        const MeshVertex& mv = mesh.vertices[i];
+        Color c[4] = {mv.C, mv.Cu, mv.Cv, mv.Cuv};
+        for (int k = 0; k < 4; ++k) {
+            x0R[i * 4 + k] = c[k].r; x0G[i * 4 + k] = c[k].g; x0B[i * 4 + k] = c[k].b;
+        }
+    }
+
+    for (int pr = 0; pr < mesh.rows - 1; ++pr) {
+        for (int pc = 0; pc < mesh.cols - 1; ++pc) {
+            for (int i = 0; i <= n; ++i) {
+                double v = double(i) / n;
+                for (int j = 0; j <= n; ++j) {
+                    double u = double(j) / n;
+                    Vec2 pos = mesh.evalPos(pr, pc, u, v);
+                    Color cmesh = mesh.evalColor(pr, pc, u, v);
+                    Color ctarget = target.sampleBilinear(pos.x, pos.y);
+                    double w = areaWeightAt(mesh, pr, pc, u, v, duv);
+                    PatchWeights pw = PatchWeights::at(u, v);
+
+                    std::vector<RowEntry> row;
+                    row.reserve(16);
+                    for (int a = 0; a < 2; ++a) {
+                        for (int b = 0; b < 2; ++b) {
+                            int base = (a * 2 + b) * 4;
+                            int vert = mesh.idx(pr + b, pc + a);
+                            for (int k = 0; k < 4; ++k)
+                                row.push_back({vert, k, pw.w[base + k]});
+                        }
+                    }
+                    double r0R = cmesh.r - ctarget.r;
+                    double r0G = cmesh.g - ctarget.g;
+                    double r0B = cmesh.b - ctarget.b;
+                    accumulateGNRow(H, gR, row, r0R, w);
+                    accumulateGNRow(H, gG, row, r0G, w);
+                    accumulateGNRow(H, gB, row, r0B, w);
+                }
+            }
+        }
+    }
+
+    // Smoothness on base color (kind 0) + ridge on Cu,Cv,Cuv (kinds 1..3).
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 1; c < mesh.cols - 1; ++c) {
+            int i0 = mesh.idx(r, c - 1), i1 = mesh.idx(r, c), i2 = mesh.idx(r, c + 1);
+            std::vector<RowEntry> row = {{i0, 0, 1}, {i1, 0, -2}, {i2, 0, 1}};
+            double r0r = mesh.vertices[i0].C.r - 2 * mesh.vertices[i1].C.r + mesh.vertices[i2].C.r;
+            double r0g = mesh.vertices[i0].C.g - 2 * mesh.vertices[i1].C.g + mesh.vertices[i2].C.g;
+            double r0b = mesh.vertices[i0].C.b - 2 * mesh.vertices[i1].C.b + mesh.vertices[i2].C.b;
+            accumulateGNRow(H, gR, row, r0r, opts.smoothWeightColor);
+            accumulateGNRow(H, gG, row, r0g, opts.smoothWeightColor);
+            accumulateGNRow(H, gB, row, r0b, opts.smoothWeightColor);
+        }
+    }
+    for (int c = 0; c < mesh.cols; ++c) {
+        for (int r = 1; r < mesh.rows - 1; ++r) {
+            int i0 = mesh.idx(r - 1, c), i1 = mesh.idx(r, c), i2 = mesh.idx(r + 1, c);
+            std::vector<RowEntry> row = {{i0, 0, 1}, {i1, 0, -2}, {i2, 0, 1}};
+            double r0r = mesh.vertices[i0].C.r - 2 * mesh.vertices[i1].C.r + mesh.vertices[i2].C.r;
+            double r0g = mesh.vertices[i0].C.g - 2 * mesh.vertices[i1].C.g + mesh.vertices[i2].C.g;
+            double r0b = mesh.vertices[i0].C.b - 2 * mesh.vertices[i1].C.b + mesh.vertices[i2].C.b;
+            accumulateGNRow(H, gR, row, r0r, opts.smoothWeightColor);
+            accumulateGNRow(H, gG, row, r0g, opts.smoothWeightColor);
+            accumulateGNRow(H, gB, row, r0b, opts.smoothWeightColor);
+        }
+    }
+    for (int i = 0; i < numV; ++i) {
+        for (int k = 1; k < 4; ++k) {
+            std::vector<RowEntry> row = {{i, k, 1}};
+            Color c[4] = {mesh.vertices[i].C, mesh.vertices[i].Cu, mesh.vertices[i].Cv, mesh.vertices[i].Cuv};
+            accumulateGNRow(H, gR, row, c[k].r, opts.colorDerivRidge);
+            accumulateGNRow(H, gG, row, c[k].g, opts.colorDerivRidge);
+            accumulateGNRow(H, gB, row, c[k].b, opts.colorDerivRidge);
+        }
+    }
+
+    auto deltaR = solveSPD_PCG(H, gR, std::vector<double>(numV * 4, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+    auto deltaG = solveSPD_PCG(H, gG, std::vector<double>(numV * 4, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+    auto deltaB = solveSPD_PCG(H, gB, std::vector<double>(numV * 4, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
+
+    for (int i = 0; i < numV; ++i) {
+        MeshVertex& mv = mesh.vertices[i];
+        Color* slots[4] = {&mv.C, &mv.Cu, &mv.Cv, &mv.Cuv};
+        for (int k = 0; k < 4; ++k) {
+            slots[k]->r = x0R[i * 4 + k] + deltaR[i * 4 + k];
+            slots[k]->g = x0G[i * 4 + k] + deltaG[i * 4 + k];
+            slots[k]->b = x0B[i * 4 + k] + deltaB[i * 4 + k];
+        }
+    }
+}
+
 void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image& target,
                                                  const std::vector<VectorLine>& vectorLines,
                                                  const OptimizerOptions& opts,
@@ -358,99 +458,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
 
         // 2) Solve for colors exactly (data term is linear in color unknowns).
         if (!jointSolvedByCeres) {
-            SparseBlockMatrix H;
-            H.init(4, numV);
-            std::vector<double> gR(numV * 4, 0.0), gG(numV * 4, 0.0), gB(numV * 4, 0.0);
-            std::vector<double> x0R(numV * 4), x0G(numV * 4), x0B(numV * 4);
-            for (int i = 0; i < numV; ++i) {
-                const MeshVertex& mv = mesh.vertices[i];
-                Color c[4] = {mv.C, mv.Cu, mv.Cv, mv.Cuv};
-                for (int k = 0; k < 4; ++k) {
-                    x0R[i * 4 + k] = c[k].r; x0G[i * 4 + k] = c[k].g; x0B[i * 4 + k] = c[k].b;
-                }
-            }
-
-            for (int pr = 0; pr < mesh.rows - 1; ++pr) {
-                for (int pc = 0; pc < mesh.cols - 1; ++pc) {
-                    for (int i = 0; i <= n; ++i) {
-                        double v = double(i) / n;
-                        for (int j = 0; j <= n; ++j) {
-                            double u = double(j) / n;
-                            Vec2 pos = mesh.evalPos(pr, pc, u, v);
-                            Color cmesh = mesh.evalColor(pr, pc, u, v);
-                            Color ctarget = target.sampleBilinear(pos.x, pos.y);
-                            double w = areaWeightAt(mesh, pr, pc, u, v, duv);
-                            PatchWeights pw = PatchWeights::at(u, v);
-
-                            std::vector<RowEntry> row;
-                            row.reserve(16);
-                            for (int a = 0; a < 2; ++a) {
-                                for (int b = 0; b < 2; ++b) {
-                                    int base = (a * 2 + b) * 4;
-                                    int vert = mesh.idx(pr + b, pc + a);
-                                    for (int k = 0; k < 4; ++k)
-                                        row.push_back({vert, k, pw.w[base + k]});
-                                }
-                            }
-                            double r0R = cmesh.r - ctarget.r;
-                            double r0G = cmesh.g - ctarget.g;
-                            double r0B = cmesh.b - ctarget.b;
-                            accumulateGNRow(H, gR, row, r0R, w);
-                            accumulateGNRow(H, gG, row, r0G, w);
-                            accumulateGNRow(H, gB, row, r0B, w);
-                        }
-                    }
-                }
-            }
-
-            // Smoothness on base color (kind 0) + ridge on Cu,Cv,Cuv (kinds 1..3).
-            for (int r = 0; r < mesh.rows; ++r) {
-                for (int c = 1; c < mesh.cols - 1; ++c) {
-                    int i0 = mesh.idx(r, c - 1), i1 = mesh.idx(r, c), i2 = mesh.idx(r, c + 1);
-                    std::vector<RowEntry> row = {{i0, 0, 1}, {i1, 0, -2}, {i2, 0, 1}};
-                    double r0r = mesh.vertices[i0].C.r - 2 * mesh.vertices[i1].C.r + mesh.vertices[i2].C.r;
-                    double r0g = mesh.vertices[i0].C.g - 2 * mesh.vertices[i1].C.g + mesh.vertices[i2].C.g;
-                    double r0b = mesh.vertices[i0].C.b - 2 * mesh.vertices[i1].C.b + mesh.vertices[i2].C.b;
-                    accumulateGNRow(H, gR, row, r0r, opts.smoothWeightColor);
-                    accumulateGNRow(H, gG, row, r0g, opts.smoothWeightColor);
-                    accumulateGNRow(H, gB, row, r0b, opts.smoothWeightColor);
-                }
-            }
-            for (int c = 0; c < mesh.cols; ++c) {
-                for (int r = 1; r < mesh.rows - 1; ++r) {
-                    int i0 = mesh.idx(r - 1, c), i1 = mesh.idx(r, c), i2 = mesh.idx(r + 1, c);
-                    std::vector<RowEntry> row = {{i0, 0, 1}, {i1, 0, -2}, {i2, 0, 1}};
-                    double r0r = mesh.vertices[i0].C.r - 2 * mesh.vertices[i1].C.r + mesh.vertices[i2].C.r;
-                    double r0g = mesh.vertices[i0].C.g - 2 * mesh.vertices[i1].C.g + mesh.vertices[i2].C.g;
-                    double r0b = mesh.vertices[i0].C.b - 2 * mesh.vertices[i1].C.b + mesh.vertices[i2].C.b;
-                    accumulateGNRow(H, gR, row, r0r, opts.smoothWeightColor);
-                    accumulateGNRow(H, gG, row, r0g, opts.smoothWeightColor);
-                    accumulateGNRow(H, gB, row, r0b, opts.smoothWeightColor);
-                }
-            }
-            for (int i = 0; i < numV; ++i) {
-                for (int k = 1; k < 4; ++k) {
-                    std::vector<RowEntry> row = {{i, k, 1}};
-                    Color c[4] = {mesh.vertices[i].C, mesh.vertices[i].Cu, mesh.vertices[i].Cv, mesh.vertices[i].Cuv};
-                    accumulateGNRow(H, gR, row, c[k].r, opts.colorDerivRidge);
-                    accumulateGNRow(H, gG, row, c[k].g, opts.colorDerivRidge);
-                    accumulateGNRow(H, gB, row, c[k].b, opts.colorDerivRidge);
-                }
-            }
-
-            auto deltaR = solveSPD_PCG(H, gR, std::vector<double>(numV * 4, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
-            auto deltaG = solveSPD_PCG(H, gG, std::vector<double>(numV * 4, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
-            auto deltaB = solveSPD_PCG(H, gB, std::vector<double>(numV * 4, 0.0), opts.cgMaxIterations, opts.cgRelTolerance);
-
-            for (int i = 0; i < numV; ++i) {
-                MeshVertex& mv = mesh.vertices[i];
-                Color* slots[4] = {&mv.C, &mv.Cu, &mv.Cv, &mv.Cuv};
-                for (int k = 0; k < 4; ++k) {
-                    slots[k]->r = x0R[i * 4 + k] + deltaR[i * 4 + k];
-                    slots[k]->g = x0G[i * 4 + k] + deltaG[i * 4 + k];
-                    slots[k]->b = x0B[i * 4 + k] + deltaB[i * 4 + k];
-                }
-            }
+            solveColorExact(mesh, target, opts);
         }
 
         // 3) Refine geometry -- position P AND the free tangents Pu, Pv.

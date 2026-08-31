@@ -1194,6 +1194,65 @@ e.g. a recent iPhone photo, which is where this would be most visible), optimize
 compare the live `CanvasView` reconstruction against a fresh PNG export side by side --
 they should now look the same, both fully saturated.
 
+### Measured, not just theorized: useCeresJoint's color still meaningfully worse than hand-rolled after the SPARSE_NORMAL_CHOLESKY fix -- found the actual gate bug
+
+The user exported the same mesh (6x6 patches on `gradient.png`) as SVG from both
+`--use-ceres-joint` and the hand-rolled path and sent both files. Rather than eyeball
+them, every mesh vertex's color was cross-checked against the true `gradient.png` pixel
+at that vertex's position (parsing the exported `<meshgradient>` stops, which also
+served as a free, exhaustive check that adjacent patches still agree exactly at every
+shared vertex -- position and color disagreement across all 49 shared vertices: zero,
+in both files, confirming the SVG exporter itself is not in question here).
+
+Results: hand-rolled's per-vertex color RMSE was 7.5/255 (0.0295 normalized), with all
+4 mesh corners essentially exact (~0.6/255 error). `--use-ceres-joint`'s was 23.0/255
+(0.0901 normalized) -- about 3x worse -- and, tellingly, the 4 corners were NOT close:
+27-43/255 error each, worse than plenty of interior vertices. That "worse even at the
+corners" detail is the key clue: corner POSITION is hard-fixed (`SubsetManifold`, see
+`fixCornerPositions`) in both paths, so a corner's local fitting problem is about as
+easy as this gets -- there's no plausible reason a correctly-converging solver should
+do noticeably worse there than in the interior. So the SPARSE_NORMAL_CHOLESKY fix
+above, while itself correct and necessary, did not fix the actual reason
+`--use-ceres-joint` underperforms; something else was still throttling color broadly,
+everywhere, corners included.
+
+Found it by comparing `optimizeJointCeres`'s structure against the hand-rolled
+block-coordinate-descent loop it's meant to replace. Hand-rolled re-solves color to its
+*exact* conditional optimum (given the current geometry -- the data term is linear in
+color, so this isn't a linearized approximation, it's the literal minimizer) every
+single outer iteration, completely independent of how well that same outer iteration's
+geometry step goes. `optimizeJointCeres`, by contrast, computes ONE scalar `alpha` from
+the TOTAL combined (geometry + color) energy each of its `geomGaussNewtonItersPerOuter`
+sub-steps, then applies that SAME alpha to interpolate every vertex's geometry AND
+color between `before` and `after`. A geometry difficulty localized to one part of the
+mesh (the harder nonlinear vector-line/boundary terms are the likely candidate) can
+shrink or reject the whole step -- throttling color's progress everywhere, including at
+vertices (like the corners) whose own proposed color update was already fine on its
+own. This is a real structural gap between the two paths, not a residual/Jacobian bug
+-- consistent with the exhaustive term-by-term audit done for the previous fix turning
+up nothing.
+
+Fix: factored the hand-rolled exact color solve out of
+`optimizeAtCurrentResolution`'s block-coordinate-descent color step into a new
+standalone `gmcore::solveColorExact(mesh, target, opts)` (declared in
+`MeshOptimizer.h`, defined in `MeshOptimizer.cpp`, used unchanged by the hand-rolled
+path -- purely a refactor there, same code, same behavior). `optimizeJointCeres` now
+calls it unconditionally once, after its own gated geometry+color sub-steps settle
+(accepted at some alpha, or fully reverted). Ceres's joint LM step is still what
+*chooses where to move* -- preserving the position/color coupling that's the whole
+point of `useCeresJoint` (e.g. for the paper's Fig. 4 pinch) -- but color's value going
+forward is now always the exact solve, never left wherever the shared alpha gate
+happened to strand it.
+
+**Not yet verified against a real Ceres build** -- syntax-checked
+(`g++ -fsyntax-only`) and link-checked (both object files compile, with
+`solveColorExact` correctly `T` (defined) in `MeshOptimizer.o` and `U` (undefined,
+resolved at link time) in `MeshOptimizerCeres.o` -- confirming it isn't accidentally
+stuck in the anonymous namespace both files otherwise use for their private helpers),
+but not run against real Ceres. Please rebuild, export the same mesh/image as SVG from
+`--use-ceres-joint` again, and compare -- ideally the per-vertex numbers above should
+now land close to hand-rolled's, corners included.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

@@ -1251,6 +1251,37 @@ void optimizeJointCeres(GradientMesh& mesh, const Image& target,
             mesh.vertices = before;
         }
     }
+
+    // Guaranteed exact color pass, unconditionally, after the joint
+    // geometry+color sub-steps above have settled (accepted at some alpha,
+    // or fully reverted). Added after an on-device, per-vertex comparison
+    // (hand-rolled vs. useCeresJoint SVG exports of the same gradient.png
+    // mesh, cross-checked against the actual source pixels) showed
+    // useCeresJoint's color still meaningfully worse than hand-rolled EVEN
+    // AT THE 4 HARD-POSITION-FIXED CORNERS (color error ~30-40/255, vs.
+    // hand-rolled's ~0.6/255 -- i.e. nearly exact) -- switching to
+    // SPARSE_NORMAL_CHOLESKY alone (see ceresSolveOnce's comment) did not
+    // close this gap. Since corner geometry is pinned and therefore
+    // trivially easy, a large color error specifically there points at the
+    // gate above, not at the residual math: `alpha` is ONE scalar computed
+    // from the TOTAL combined joint energy and then applied uniformly to
+    // EVERY vertex's color (and geometry) update. A geometry difficulty
+    // localized to one region of the mesh (e.g. the harder nonlinear
+    // vector-line/boundary terms fighting each other somewhere) can shrink
+    // or reject the whole step, throttling color's progress EVERYWHERE --
+    // including at vertices, like the corners, whose own local update was
+    // already fine. Hand-rolled never has this problem: it re-solves color
+    // to its exact conditional optimum (given the current geometry) every
+    // single outer iteration, completely decoupled from how well or badly
+    // that same outer iteration's geometry step goes. This call restores
+    // that same guarantee for the joint path too -- Ceres's own joint LM
+    // step is still what chooses WHERE to move next (preserving the
+    // position/color coupling that's the whole point of useCeresJoint,
+    // e.g. for the paper's Fig. 4 pinch), but color's value going forward
+    // is always the exact solve, never left however the shared alpha gate
+    // happened to leave it. Only touches mesh.vertices[*].C/Cu/Cv/Cuv (see
+    // solveColorExact's own comment); geometry from above is unaffected.
+    solveColorExact(mesh, target, opts);
 }
 
 } // namespace gmcore

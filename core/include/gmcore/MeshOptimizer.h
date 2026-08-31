@@ -298,6 +298,20 @@ struct OptimizerOptions {
     bool useCeresJoint = false;
 };
 
+// Exact closed-form solve for the 4 free color unknowns (C,Cu,Cv,Cuv) at
+// every vertex, given FIXED geometry -- the data term is linear in color
+// (unlike position, which enters nonlinearly through the target image
+// lookup), so this isn't a linearized approximation the way the geometry
+// Gauss-Newton step is: it's the literal, exact minimizer of (data +
+// color-smoothness + color-ridge) energy for the mesh's current shape.
+// Factored out of optimizeAtCurrentResolution's block-coordinate-descent
+// color step (declared here, not file-local, specifically so
+// MeshOptimizerCeres.cpp's optimizeJointCeres can call it too -- see that
+// function's comment for why a guaranteed-exact color pass matters even
+// for the joint solve). Mutates mesh.vertices[*].C/Cu/Cv/Cuv in place;
+// does not touch geometry (P/Pu/Pv) at all.
+void solveColorExact(GradientMesh& mesh, const Image& target, const OptimizerOptions& opts);
+
 struct OptimizerProgress {
     int pyramidLevel = 0;
     int totalPyramidLevels = 1;
