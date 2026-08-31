@@ -1152,6 +1152,48 @@ from before this fix -- that would still carry stale, pre-fix-era vertex colors)
 the mesh, and check that it now visually tracks the image correctly both before and
 after optimizing.
 
+### Fixed: reconstruction preview looked washed out on screen, but the exported PNG was correctly saturated
+
+Reported by the user: the optimized reconstruction, as drawn live in `CanvasView`,
+looked visibly lightened/less saturated than expected -- but saving it via File > Export
+PNG and reopening that file showed the colors fully saturated, matching expectations.
+
+Both the on-screen preview and the exported file are built from the exact same call
+(`-[DocumentModel renderReconstructionPreview]`, which rasterizes the mesh into a raw
+RGBA buffer and wraps it in an `NSImage`) -- `-exportPNGToURL:` calls it again and
+writes the resulting `CGImage` straight to a PNG, so the two paths start from
+numerically identical pixel bytes. That ruled out a data/optimizer bug (nothing about
+the mesh, the color solve, or the render math differs between the two) and pointed
+at how the same bytes get *interpreted* differently by two different consumers.
+
+The cause: `renderReconstructionPreview`'s bitmap context was created with
+`CGColorSpaceCreateDeviceRGB()`. Despite the name, this does not mean "use the actual
+display's color response" -- it's legacy CoreGraphics terminology for an
+untagged/ambiguous "generic device" RGB space. When AppKit composites an image tagged
+this way into a modern window's (wide-gamut, typically Display P3) backing store, the
+color-management pipeline has to pick *some* concrete interpretation for that
+ambiguous tag, and can fall back to an old "Generic RGB" ColorSync profile with a
+visibly flatter, less saturated response than sRGB. A PNG file, by contrast, is opened
+by other apps (Preview, QuickLook, etc.) under the modern convention that an
+untagged/generic image means sRGB -- so the identical numeric bytes render with full,
+correct sRGB saturation once reopened from disk. Two different implicit assumptions
+about the same ambiguous tag, in two different code paths, produced two different
+looking results from one set of numbers.
+
+Fix: `CGColorSpaceCreateDeviceRGB()` replaced with the explicit, unambiguous
+`CGColorSpaceCreateWithName(kCGColorSpaceSRGB)` in both
+`renderReconstructionPreview` and `loadImageAtURL:` (the latter builds `_target`'s
+numeric buffer from the source file -- fixed too, for consistency, so the color space
+that actually gets optimized against, rendered, and displayed is the same well-defined
+sRGB space throughout the pipeline, not an ambiguous one at the very first step). No
+change to any optimizer math or file formats -- purely a color-space tag on two
+`CGBitmapContextCreate` calls.
+
+**Confirm after rebuilding**: re-open a photo (ideally one known to be wide-gamut,
+e.g. a recent iPhone photo, which is where this would be most visible), optimize, and
+compare the live `CanvasView` reconstruction against a fresh PNG export side by side --
+they should now look the same, both fully saturated.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

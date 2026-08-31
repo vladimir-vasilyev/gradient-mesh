@@ -64,7 +64,20 @@ static NSError* gmError(NSString* msg) {
     if (w == 0 || h == 0) { CGImageRelease(cgImage); if (error) *error = gmError(@"Image has zero size."); return NO; }
 
     std::vector<uint8_t> buffer(w * h * 4, 0);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    // Explicit sRGB, NOT CGColorSpaceCreateDeviceRGB() -- see
+    // -renderReconstructionPreview's comment for the full story (a
+    // reported "reconstruction looks washed out on screen, but the
+    // exported PNG looks correctly saturated" bug traced to exactly this
+    // call using the ambiguous/legacy "device RGB" space instead of a
+    // named, unambiguous one). Used here too for the same reason and for
+    // consistency: this is the conversion that turns the source file's
+    // bytes (whatever color space THEY were tagged in, e.g. a wide-gamut
+    // Display P3 photo) into _target's raw numeric buffer, and every
+    // consumer of that buffer (the optimizer's data term, and
+    // -renderReconstructionPreview's render of the fitted mesh) should be
+    // working in the same well-defined color space as what actually gets
+    // displayed and exported, not an ambiguous one.
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef ctx = CGBitmapContextCreate(buffer.data(), w, h, 8, w * 4, cs,
                                               kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(cs);
@@ -382,7 +395,25 @@ static NSError* gmError(NSString* msg) {
             px[3] = 255;
         }
     }
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    // Explicit sRGB, NOT CGColorSpaceCreateDeviceRGB() -- fixes a reported
+    // bug: the reconstruction preview looked visibly "washed out"/less
+    // saturated on screen in CanvasView, while exporting it to a PNG via
+    // -exportPNGToURL: (which rasterizes this SAME NSImage/CGImage) and
+    // reopening that file showed the correct, fully-saturated colors. Both
+    // paths draw the exact same numeric RGB bytes -- CGColorSpaceCreateDeviceRGB()
+    // produces an untagged/"generic device" color space, which is legacy
+    // CoreGraphics terminology, not a request to bypass color management.
+    // On-screen, AppKit/ColorSync has to pick SOME interpretation for that
+    // ambiguous tag when compositing into the window's (wide-gamut,
+    // typically Display P3) backing store, and can fall back to an old
+    // "Generic RGB" profile with a flatter, less saturated response than
+    // sRGB; a PNG viewer opening the exported file, on the other hand,
+    // treats an untagged/generic image as sRGB by convention (the modern
+    // default assumption), which is why the file looked correct while the
+    // live view did not. Explicitly naming the space as sRGB removes the
+    // ambiguity at the source instead of relying on inconsistent fallback
+    // behavior in two different code paths.
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef ctx = CGBitmapContextCreate(buffer.data(), w, h, 8, w * 4, cs,
                                               kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(cs);
