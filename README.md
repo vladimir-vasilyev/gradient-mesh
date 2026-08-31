@@ -1338,6 +1338,72 @@ hand-rolled's own hardest spot, not something specific to the joint path anymore
 confirms the diagnosis: the gate bug, not the residual math, was the actual reason
 `--use-ceres-joint` underperformed.
 
+### Corrected, debug-data-verified 9x9 comparison -- and a real, smaller gap found and (unverified) addressed
+
+A later report ("как то не очень", a 9x9 mesh) turned out to rest on a misread filename
+(`rmse0234` was 0.0234, read as 0.234 -- a spurious 10x). The Auto-export debug data
+checkbox (see above) made it possible to check properly: exporting full debug JSON for
+hand-rolled, `useCeresGeometry`, and `useCeresJoint` on the SAME 9x9 mesh/image and
+re-implementing `evalPos`/`evalColor`/`reconstructionRMSE` independently in Python from
+the exported `P`/`Pu`/`Pv`/`C`/`Cu`/`Cv`/`Cuv` data matched the app's own `lastRMSE` to
+full double precision on all three files -- confirming both the export and the
+independent re-implementation are correct, and enabling a trustworthy comparison:
+
+| solver | RMSE | wall-clock |
+|---|---|---|
+| hand-rolled | 0.0156 | 47.8s |
+| `useCeresGeometry` | 0.0166 (+6.6%) | 57.1s |
+| `useCeresJoint` | 0.0234 (+50%) | 101.1s |
+
+All three had `solver.builtWithCeres: true` and `solver.effective == solver.requested`,
+so Ceres genuinely ran in all cases -- not a silent fallback. `useCeresGeometry` (Ceres
+for position/tangents only, color still solved exactly via `solveColorExact`, same
+alternating scheme as hand-rolled) stays close to hand-rolled. `useCeresJoint` is a real
+~50% RMSE gap and ~2x slower -- a much smaller gap than the earlier (misread) numbers
+suggested, but a genuine, still-unresolved one. Comparing vertex data directly in the
+image's hardest region (the same sharp white->green/blue transition around x~100-130
+noted above): `useCeresJoint`'s vertex positions diverge from hand-rolled's/
+`useCeresGeometry`'s by up to ~15px, and `Pu`/`Pv` tangent magnitudes run ~30-40%
+smaller, concentrated exactly where its per-patch RMSE was worst -- not a degenerate/
+collapsed mesh, just a different, worse local optimum.
+
+Diagnosis: `useCeresJoint`'s combined 18-unknowns-per-vertex (position+color) linearized
+step can improve the dense data-term residual (49 quadrature samples per patch, see
+`GradientMesh::reconstructionRMSE`) just as effectively by moving WHERE a sample lands
+on the target image as by improving the color comparison there -- something neither
+hand-rolled's alternating scheme nor `useCeresGeometry`'s frozen-color residual can do,
+since neither ever has position and "the thing being matched against" both free in the
+SAME linearized step. Nothing in the residual math is wrong; it's an emergent property
+of solving position and color jointly against a small, discrete sample set.
+
+Addressed (not yet verified against a real build) by adding
+`OptimizerOptions::jointGeomStepDampingWeight` (`MeshOptimizerCeres.cpp`'s new
+`JointGeomStepDampingCostFunction`): a soft per-vertex penalty, inside `jointSolveOnce`'s
+own `ceres::Problem`, on how far `P`/`Pu`/`Pv` move within a single joint solve relative
+to the mesh state that solve started from -- makes moving geometry "cost" something in
+the joint objective (same idea as `geomTangentPriorWeight`/`colorDerivRidge` already
+keeping other unknowns grounded), so Ceres's own LM iterations are discouraged from
+proposing such a step in the first place, rather than only catching it after the fact via
+`optimizeJointCeres`'s existing alpha-backtracking gate (which still runs unchanged, and
+now also folds this same penalty into `computeTrueJointEnergy` via a new
+`geomStepReference` parameter, so the accept/reject energy stays consistent with what
+the Ceres problem actually minimized -- same line-search-consistency reason every other
+term in that function already follows). Explicitly kept as an addition, not a
+replacement of true joint solving (position and color still solved together in one
+`ceres::Problem`) -- decoupling them into an alternating scheme instead was considered
+and rejected: it would leave `useCeresJoint` functionally almost identical to
+`useCeresGeometry` (differing only in how often color gets re-solved within an outer
+iteration), which defeats the point of offering it as a separate mode.
+
+The starting weight (`0.3`) is a reasoned guess, NOT a measured optimum -- there is no
+Ceres build in the sandbox this was developed in to tune it against. **If you rebuild
+and re-run `useCeresJoint` on the same mesh/image, please compare its new
+Auto-export-debug-data RMSE and per-vertex position spread against the 0.0234/~15px
+baseline above.** If the gap closes without meaningfully hurting `useCeresJoint`'s
+wall-clock or convergence, leave it; if it overshoots (RMSE now worse, or `useCeresJoint`
+starts looking suspiciously identical to `useCeresGeometry`), try lowering the weight; if
+the gap barely moves, try raising it.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

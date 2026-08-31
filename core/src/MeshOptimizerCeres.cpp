@@ -235,8 +235,21 @@ double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
 // reason computeTrueGeometryEnergy exists: Ceres's own trust region only
 // ever checks its frozen-weight cost function, so a step that looks good
 // there can still be bad against the true, freshly-evaluated energy.
+//
+// `geomStepReference`, when non-null, must be the mesh vertex state
+// jointSolveOnce's Ceres problem was linearized against for the call
+// being checked (i.e. optimizeJointCeres's own `before`) -- when given,
+// this ALSO folds in JointGeomStepDampingCostFunction's penalty term, so
+// the accept/reject energy here matches EXACTLY what that call's Ceres
+// problem actually minimized (same line-search-consistency reason every
+// other term in this function already follows -- an energy that omits a
+// term the solver was actually minimizing against can reject a step that
+// genuinely reduced the real objective, or accept one that didn't).
+// Passing nullptr skips that term entirely (e.g. if ever called somewhere
+// with no meaningful "step start" to reference).
 double computeTrueJointEnergy(const GradientMesh& mesh, const Image& target,
-                               const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
+                               const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts,
+                               const std::vector<MeshVertex>* geomStepReference) {
     double energy = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
 
     for (int r = 0; r < mesh.rows; ++r) {
@@ -259,6 +272,21 @@ double computeTrueJointEnergy(const GradientMesh& mesh, const Image& target,
     }
     for (const auto& mv : mesh.vertices) {
         energy += opts.colorDerivRidge * (mv.Cu.lengthSq() + mv.Cv.lengthSq() + mv.Cuv.lengthSq());
+    }
+
+    // Step-damping term (see this function's own comment on
+    // `geomStepReference` and JointGeomStepDampingCostFunction) -- must
+    // mirror that CostFunction's residuals exactly (same weight, same
+    // per-vertex P/Pu/Pv deviation) for line-search consistency.
+    if (geomStepReference) {
+        const std::vector<MeshVertex>& ref = *geomStepReference;
+        for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+            const MeshVertex& mv = mesh.vertices[i];
+            const MeshVertex& r0 = ref[i];
+            Vec2 dP = mv.P - r0.P, dPu = mv.Pu - r0.Pu, dPv = mv.Pv - r0.Pv;
+            energy += opts.jointGeomStepDampingWeight *
+                (dP.x * dP.x + dP.y * dP.y + dPu.x * dPu.x + dPu.y * dPu.y + dPv.x * dPv.x + dPv.y * dPv.y);
+        }
     }
 
     return energy;
@@ -589,6 +617,46 @@ public:
     }
 private:
     double sw_; Vec2 tu_, tv_;
+};
+
+// ---- Joint-only step damping: one residual block per vertex, penalizing
+// how far P/Pu/Pv have moved from a fixed reference point (the mesh state
+// jointSolveOnce's CALLER snapshotted right before invoking it -- see
+// optimizeJointCeres's `before`, passed through unchanged since
+// jointSolveOnce takes its own `snapshot` at the very start, before any
+// mutation, so the two are identical). See OptimizerOptions::
+// jointGeomStepDampingWeight's own comment (MeshOptimizer.h) for the full
+// diagnosis this exists to address -- short version: useCeresJoint's
+// combined position+color linearized step can improve the data-term
+// residual just as effectively by moving WHERE a quadrature sample lands
+// on the target image as by improving the color comparison there, which
+// let it trade geometric plausibility for a locally-better color fit.
+// Only used when opts.jointGeomStepDampingWeight > 0 (see jointSolveOnce).
+// NOT used by ceresSolveOnce/optimizeGeometryCeres -- that path's residual
+// never has color free in the same step to trade against, so this
+// failure mode doesn't apply there. ----
+class JointGeomStepDampingCostFunction : public ceres::CostFunction {
+public:
+    JointGeomStepDampingCostFunction(double weight, Vec2 P0, Vec2 Pu0, Vec2 Pv0)
+        : sw_(std::sqrt(std::max(weight, 0.0))), P0_(P0), Pu0_(Pu0), Pv0_(Pv0) {
+        set_num_residuals(6);
+        mutable_parameter_block_sizes()->push_back(6);
+    }
+    bool Evaluate(double const* const* p, double* residuals, double** jacobians) const override {
+        residuals[0] = sw_ * (p[0][0] - P0_.x);
+        residuals[1] = sw_ * (p[0][1] - P0_.y);
+        residuals[2] = sw_ * (p[0][2] - Pu0_.x);
+        residuals[3] = sw_ * (p[0][3] - Pu0_.y);
+        residuals[4] = sw_ * (p[0][4] - Pv0_.x);
+        residuals[5] = sw_ * (p[0][5] - Pv0_.y);
+        if (!jacobians || !jacobians[0]) return true;
+        double* J = jacobians[0];
+        std::fill(J, J + 6 * 6, 0.0);
+        for (int k = 0; k < 6; ++k) J[k * 6 + k] = sw_;
+        return true;
+    }
+private:
+    double sw_; Vec2 P0_, Pu0_, Pv0_;
 };
 
 // ---- Boundary: one residual block per boundary vertex. Normal-only (see
@@ -1061,6 +1129,21 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
         problem.AddResidualBlock(cost, nullptr, paramsColor[i].data());
     }
 
+    // Joint-only step damping (see JointGeomStepDampingCostFunction's and
+    // OptimizerOptions::jointGeomStepDampingWeight's comments) -- one
+    // residual block per vertex, referenced against `snapshot` (this
+    // call's own frozen linearization point, same one the data term
+    // above uses). Skipped entirely when the weight is 0, matching the
+    // geomTangentPriorWeight/vectorLines guards elsewhere in this
+    // function.
+    if (opts.jointGeomStepDampingWeight > 0.0) {
+        for (int i = 0; i < numV; ++i) {
+            const MeshVertex& mv0 = snapshot.vertices[i];
+            auto* cost = new JointGeomStepDampingCostFunction(opts.jointGeomStepDampingWeight, mv0.P, mv0.Pu, mv0.Pv);
+            problem.AddResidualBlock(cost, nullptr, paramsGeom[i].data());
+        }
+    }
+
     fixCornerPositions(problem, mesh, paramsGeom);
 
     // Same switch to SPARSE_NORMAL_CHOLESKY as ceresSolveOnce, and for the
@@ -1225,7 +1308,14 @@ void optimizeJointCeres(GradientMesh& mesh, const Image& target,
     const int itersPerSubStep = std::max(6, opts.cgMaxIterations);
     for (int gi = 0; gi < opts.geomGaussNewtonItersPerOuter; ++gi) {
         std::vector<MeshVertex> before = mesh.vertices;
-        double energyBefore = computeTrueJointEnergy(mesh, target, vectorLines, opts);
+        // `before` doubles as the step-damping reference point -- it's
+        // exactly the mesh state jointSolveOnce is about to snapshot as
+        // its own `snapshot` at the very start of that call (no mutation
+        // happens between capturing `before` here and that call), so
+        // passing it here keeps this energy check consistent with what
+        // that call's Ceres problem actually minimizes. See
+        // computeTrueJointEnergy's own comment on this parameter.
+        double energyBefore = computeTrueJointEnergy(mesh, target, vectorLines, opts, &before);
 
         jointSolveOnce(mesh, target, vectorLines, opts, itersPerSubStep);
         std::vector<MeshVertex> after = mesh.vertices;
@@ -1243,7 +1333,7 @@ void optimizeJointCeres(GradientMesh& mesh, const Image& target,
                 mesh.vertices[i].Cv  = before[i].Cv  + (after[i].Cv  - before[i].Cv)  * alpha;
                 mesh.vertices[i].Cuv = before[i].Cuv + (after[i].Cuv - before[i].Cuv) * alpha;
             }
-            double newEnergy = computeTrueJointEnergy(mesh, target, vectorLines, opts);
+            double newEnergy = computeTrueJointEnergy(mesh, target, vectorLines, opts, &before);
             if (newEnergy <= energyBefore) { improved = true; break; }
             alpha *= 0.4;
         }

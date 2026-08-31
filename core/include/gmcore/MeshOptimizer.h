@@ -310,6 +310,43 @@ struct OptimizerOptions {
     // Same graceful-fallback contract as useCeresGeometry: ignored with a
     // one-time stderr warning when GMCORE_WITH_CERES wasn't defined.
     bool useCeresJoint = false;
+
+    // useCeresJoint-only: soft penalty (see MeshOptimizerCeres.cpp's
+    // JointGeomStepDampingCostFunction) on how far P/Pu/Pv move, per
+    // vertex, within a SINGLE jointSolveOnce call, relative to the mesh
+    // state that call started from. Exists to curb a real, measured
+    // failure mode: useCeresJoint's combined 18-unknowns-per-vertex
+    // (position+color) linearized step can trade geometric plausibility
+    // for a better LOCAL color fit at the dense data-term quadrature
+    // samples, because moving a vertex changes where those samples land on
+    // the target image just as surely as changing color changes what gets
+    // compared there -- something neither the hand-rolled alternating
+    // scheme nor useCeresGeometry's frozen-color residual can do, since
+    // neither ever has position and "the thing being matched against" both
+    // free in the same linearized step. Confirmed via three real,
+    // debug-data-exported 9x9-mesh runs on the same image (see README):
+    // hand-rolled RMSE 0.0156, useCeresGeometry 0.0166 (+6.6%), useCeresJoint
+    // 0.0234 (+50%, and ~2x slower) -- with useCeresJoint's vertex positions
+    // in the image's hardest region diverging from the other two by up to
+    // ~15px and Pu/Pv tangent magnitudes shrinking ~30-40%, right where its
+    // per-patch RMSE was worst. This weight makes moving P/Pu/Pv "cost"
+    // something in the joint least-squares objective (same idea as
+    // geomTangentPriorWeight/colorDerivRidge already keeping OTHER unknowns
+    // grounded), so Ceres's own internal LM iterations are discouraged from
+    // PROPOSING such a step in the first place -- it does NOT replace the
+    // alpha-backtracking gate in optimizeJointCeres (still catches a bad
+    // full step after the fact via computeTrueJointEnergy, which this
+    // weight's contribution is also folded into for accept/reject
+    // consistency -- see that function's geomStepReference parameter).
+    // 0 disables it entirely (residual blocks skipped). NOT YET TUNED
+    // against a real Ceres build -- this starting value is a reasoned
+    // guess, not a measured optimum; please re-run useCeresJoint on the
+    // same mesh/image with Export Debug Data (or the auto-export
+    // checkbox) and compare its RMSE/vertex-position spread against this
+    // baseline, then adjust up (more damping, closer to useCeresGeometry's
+    // behavior/quality but less "true joint" benefit) or down (less
+    // damping, closer to the original unconstrained joint) from there.
+    double jointGeomStepDampingWeight = 0.3;
 };
 
 // Exact closed-form solve for the 4 free color unknowns (C,Cu,Cv,Cuv) at
