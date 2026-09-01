@@ -675,6 +675,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"geomDampingInitial": @(o.geomDampingInitial),
         @"useCeresGeometry": @(o.useCeresGeometry),
         @"useCeresJoint": @(o.useCeresJoint),
+        // Added late -- omitted from the first round of exported debug
+        // JSONs (they predate this OptimizerOptions field), so its
+        // absence there means "this build's default (0.3), not recorded",
+        // not "damping was off".
+        @"jointGeomStepDampingWeight": @(o.jointGeomStepDampingWeight),
     };
 
     // Full mesh state -- the actual point of this export. Unlike the SVG

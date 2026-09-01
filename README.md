@@ -1404,6 +1404,50 @@ wall-clock or convergence, leave it; if it overshoots (RMSE now worse, or `useCe
 starts looking suspiciously identical to `useCeresGeometry`), try lowering the weight; if
 the gap barely moves, try raising it.
 
+### Verified: `useCeresGeometry` then `useCeresJoint` -- staged, run once each -- beats every single-solver option
+
+Real on-device runs (git `81784c3-dirty`, the step-damping commit above) with the
+Auto-export debug data checkbox on, same 9x9 mesh/image throughout:
+
+| sequence | final RMSE | joint stage wall-clock |
+|---|---|---|
+| hand-rolled (single Optimize) | 0.01559 | -- |
+| `useCeresGeometry` x1 (fresh mesh) | 0.01662 | -- |
+| `useCeresGeometry` x2 (Optimize clicked twice) | 0.01557 | -- |
+| ...then switch to `useCeresJoint`, Optimize once | **0.01494** | 21.5-21.8s |
+| ...then `useCeresJoint` again (same mesh) | 0.01692 | 23.7s |
+| ...then `useCeresJoint` a third time | 0.01732 | 23.7s |
+
+Two independent repeats of the full "fresh mesh -> geometry -> geometry -> joint once"
+sequence produced the identical final RMSE (`0.014935881251664193`, matching past the
+last bit of double precision both times) -- the solver is fully deterministic, and this
+specific staged sequence reproducibly beats every single-solver run tried so far,
+including hand-rolled alone. It also makes the `useCeresJoint` stage itself much
+cheaper (~22s vs. the ~101s a from-scratch `useCeresJoint` run took, see above): most of
+the position/tangent work is already done by the geometry passes, so joint only needs a
+short, cheap final pass to pull color and position into agreement, which the
+step-damping fix's smaller allowed movement suits well.
+
+**But joint gets WORSE if you keep running it.** Clicking Optimize a second and third
+time with `useCeresJoint` already selected, on the already-joint-refined mesh, moved
+RMSE 0.01494 -> 0.01692 -> 0.01732 -- monotonically away from the good point it had just
+reached, not further toward it. So `jointGeomStepDampingWeight`'s per-substep damping
+(new above) reins in any ONE proposed step, but doesn't fully stop joint's combined
+position+color coupling from slowly drifting toward a worse configuration over MANY
+outer iterations even starting from an already-good mesh -- consistent with the same
+underlying mechanism (trading position accuracy for local color fit at the dense
+quadrature samples), just needing more outer iterations to accumulate when there's less
+room to move per step. **Practical recipe until this is understood/fixed further: run
+`useCeresGeometry` (ideally twice), then `useCeresJoint` exactly ONCE, then stop --
+don't keep re-optimizing with joint selected.**
+
+Also fixed in this round: `-exportDebugDataToURL:error:`'s JSON was missing
+`jointGeomStepDampingWeight` from its `optimizerOptions` dump (the field was added to
+`OptimizerOptions` but the export dictionary literal in `DocumentModel.mm` wasn't
+updated to match) -- present in exports from now on; the runs in the table above predate
+the fix, so their own JSON files don't show the weight actually in effect (0.3, this
+build's default -- there's no UI to change it yet).
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)
