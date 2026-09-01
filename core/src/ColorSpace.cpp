@@ -71,10 +71,16 @@ Color srgbToCIELUV(const Color& srgb) {
 
     double u = 13.0 * L * (uPrime - kUn);
     double v = 13.0 * L * (vPrime - kVn);
-    return Color(L, u, v);
+    // /kCIELUVWorkingScale: see that constant's comment in ColorSpace.h --
+    // this is NOT the textbook CIELUV value, it's this project's working
+    // representation sized to match OptimizerOptions' fixed-scale weights.
+    return Color(L, u, v) / kCIELUVWorkingScale;
 }
 
-Color cieluvToSRGB(const Color& luv) {
+Color cieluvToSRGB(const Color& luvScaled) {
+    // Undo the /kCIELUVWorkingScale first to recover real L*,u*,v*, then run
+    // the textbook inverse formulas unchanged below.
+    Color luv = luvScaled * kCIELUVWorkingScale;
     double L = luv.r, u = luv.g, v = luv.b;
 
     // Inverse of the L* piecewise formula above.

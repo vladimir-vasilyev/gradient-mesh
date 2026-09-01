@@ -55,16 +55,56 @@
 
 namespace gmcore {
 
-// A single colour, sRGB (gamma-encoded, nominally 0..1) -> CIELUV
-// (L* nominally 0..100, u*/v* roughly -100..100 for in-gamut sRGB colours,
-// D65 reference white, standard CIE 1976 formulas). See the file header for
-// why out-of-[0,1]/out-of-gamut inputs are handled (signed extension)
-// instead of asserting or clamping.
+// kCIELUVWorkingScale -- WHY IT'S HERE (found from real on-device runs, not
+// anticipated up front): OptimizerOptions' weights (smoothWeightGeom,
+// boundaryWeight, geomTangentPriorWeight, vectorLineWeight, smoothWeightColor,
+// colorDerivRidge -- see MeshOptimizer.h) are all fixed absolute constants,
+// empirically tuned assuming colour differences are roughly O(0.01-1), i.e.
+// sRGB's own natural [0,1]-per-channel scale. Standard CIELUV's L* alone
+// spans the full [0,100] range for the same luminance span sRGB covers in
+// [0,1] -- a ~100x larger numeric scale -- and u*/v* are comparable or
+// larger still for saturated colours. A first real on-device CIELUV run
+// confirmed the predicted failure mode exactly: RMSE ~2 orders of magnitude
+// larger (expected, just a unit change) but ALSO visibly disordered/
+// "shuffled" patch placement and artifacts right at the image border, with
+// (as a side effect of the same cause) noticeably sharper colour
+// transitions. The mechanism: geometry's data-term residual and Jacobian
+// both carry a factor of the colour scale, so in a Gauss-Newton normal-
+// equations solve its influence relative to the FIXED, colour-scale-
+// unaware position/tangent/boundary regularizers grows roughly with the
+// SQUARE of that scale (~100x colour scale -> ~10000x more data-term pull
+// relative to smoothWeightGeom/boundaryWeight/geomTangentPriorWeight) --
+// enough to overpower boundaryWeight=200 and produce exactly the reported
+// border artifacts and incoherent neighboring positions. Separately,
+// smoothWeightColor/colorDerivRidge (regularizers ON the colour channel
+// itself) become proportionally far weaker at ~100x colour scale, which is
+// the more likely real explanation for the "sharper" transitions users
+// noticed -- not CIELUV's perceptual uniformity per se, but its
+// regularization being comparatively under-strength. Dividing by 100 here
+// (sRGB [0,1] <-> L* [0,100] is where 100 comes from -- not a fitted
+// constant) brings the working representation's magnitude back to roughly
+// what every one of those weights was actually tuned against, restoring
+// their intended balance against the data term. This is a coarse, only
+// approximately-right fix (u*/v* aren't strictly bounded by 100 the way L*
+// is), expected to also measurably REDUCE the sharpening effect (same root
+// cause as the artifacts it fixes) -- if a user still wants deliberately
+// sharper transitions after this, that calls for a dedicated, decoupled
+// style control instead of leaning on this scale mismatch (see README).
+constexpr double kCIELUVWorkingScale = 100.0;
+
+// A single colour, sRGB (gamma-encoded, nominally 0..1) -> this project's
+// CIELUV *working* representation: standard CIE 1976 L*u*v* (D65 white)
+// divided by kCIELUVWorkingScale, i.e. roughly L* in [0,1], u*/v* order
+// +-1..1.5 for in-gamut sRGB colours -- NOT the raw textbook L*[0,100]
+// values (see kCIELUVWorkingScale's comment for why the extra /100 is
+// there). See the file header for why out-of-[0,1]/out-of-gamut inputs are
+// handled (signed extension) instead of asserting or clamping.
 Color srgbToCIELUV(const Color& srgb);
 
-// Inverse of srgbToCIELUV. Round-trips srgbToCIELUV to within floating-point
-// precision for any input (including the signed-extended out-of-gamut
-// regime described above).
+// Inverse of srgbToCIELUV (undoes both the CIE formulas and the /
+// kCIELUVWorkingScale division). Round-trips srgbToCIELUV to within
+// floating-point precision for any input (including the signed-extended
+// out-of-gamut regime described above).
 Color cieluvToSRGB(const Color& luv);
 
 // Per-pixel srgbToCIELUV/cieluvToSRGB applied to an entire Image (same
