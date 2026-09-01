@@ -1,4 +1,5 @@
 #include "gmcore/SVGExporter.h"
+#include "gmcore/ColorSpace.h"
 #include <sstream>
 #include <algorithm>
 #include <cstdio>
@@ -38,7 +39,8 @@ std::string sidePathData(const Side& s) {
 
 } // namespace
 
-std::string exportGradientMeshSVG(const GradientMesh& mesh, int canvasWidth, int canvasHeight) {
+std::string exportGradientMeshSVG(const GradientMesh& mesh, int canvasWidth, int canvasHeight,
+                                   bool sourceIsCIELUV) {
     std::ostringstream svg;
     svg << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
     svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << canvasWidth << "\" height=\""
@@ -68,6 +70,12 @@ std::string exportGradientMeshSVG(const GradientMesh& mesh, int canvasWidth, int
             HermiteCorner<Vec2> g11 = mesh.geomCorner(r + 1, c + 1);
             Color col00 = mesh.at(r, c).C, col10 = mesh.at(r, c + 1).C;
             Color col11 = mesh.at(r + 1, c + 1).C, col01 = mesh.at(r + 1, c).C;
+            // SVG stop-color is always sRGB; only the point VALUE at each
+            // corner is converted (never a derivative -- see ColorSpace.h).
+            if (sourceIsCIELUV) {
+                col00 = cieluvToSRGB(col00); col10 = cieluvToSRGB(col10);
+                col11 = cieluvToSRGB(col11); col01 = cieluvToSRGB(col01);
+            }
 
             Side top{g00.P, g10.P, g00.Pu, g10.Pu};
             Side right{g10.P, g11.P, g10.Pv, g11.Pv};

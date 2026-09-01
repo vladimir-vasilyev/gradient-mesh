@@ -5,6 +5,7 @@
 #include "gmcore/GradientMesh.h"
 #include "gmcore/MeshOptimizer.h"
 #include "gmcore/SVGExporter.h"
+#include "gmcore/ColorSpace.h"
 #include <vector>
 #include <array>
 #include <memory>
@@ -79,6 +80,12 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 @interface DocumentModel () {
     gmcore::Image _target;
+    // CIELUV conversion of _target, recomputed alongside it in
+    // -loadImageAtURL:error: (see -workingTargetImage and
+    // useCIELUVColorSpace's doc comment in DocumentModel.h). Computed
+    // eagerly (a one-time, one-per-image-load cost) rather than lazily so
+    // there's no first-use stall/branch to reason about.
+    gmcore::Image _targetLUV;
     BOOL _hasImage;
     std::vector<Vec2> _boundaryPolygon;
     std::array<CubicBezier, 4> _boundary;
@@ -87,6 +94,16 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     std::vector<VectorLine> _vectorLines;
     BOOL _isOptimizing;
     double _lastRMSE;
+    // Which colour space _mesh's C/Cu/Cv/Cuv are actually stored in --
+    // snapshotted from self.useCIELUVColorSpace at -buildInitialMeshRows:
+    // cols: time (see that method) and used everywhere _mesh's colours are
+    // read/written from then on, INSTEAD OF re-reading the live
+    // useCIELUVColorSpace property. This is deliberate: it's what makes
+    // toggling the property after a mesh already exists harmless (a no-op
+    // until the next rebuild) rather than a silent colour-space mismatch
+    // between the mesh and whatever -optimizeWithPyramidLevels:... would
+    // otherwise feed it.
+    BOOL _meshColorSpaceIsCIELUV;
     // State captured for -exportDebugDataToURL:error: (see DocumentModel.h)
     // -- the exact OptimizerOptions the most recent
     // -optimizeWithPyramidLevels:progress:completion: call used, its full
@@ -105,6 +122,12 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 }
 @property (nonatomic, strong, nullable) NSImage* displayImage;
 @property (nonatomic, strong, nullable) NSString* lastDebugExportPath;
+// The Image that -buildInitialMeshRows:cols:/-optimizeWithPyramidLevels:...
+// should actually fit against: _target (sRGB) or _targetLUV (CIELUV),
+// chosen by the LIVE useCIELUVColorSpace property. Only ever consulted at
+// -buildInitialMeshRows:cols: time -- see that method and
+// _meshColorSpaceIsCIELUV's comment above for why.
+- (const gmcore::Image&)workingTargetImage;
 @end
 
 @implementation DocumentModel
@@ -118,6 +141,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (NSInteger)meshRows { return _mesh ? _mesh->rows : 0; }
 - (NSInteger)meshCols { return _mesh ? _mesh->cols : 0; }
 - (double)currentRMSE { return _lastRMSE; }
+- (BOOL)meshColorSpaceIsCIELUV { return _mesh ? _meshColorSpaceIsCIELUV : NO; }
 
 #pragma mark - Image loading
 
@@ -189,6 +213,12 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     CGImageRelease(cgImage);
 
     _target = std::move(img);
+    // See useCIELUVColorSpace's doc comment in DocumentModel.h: computed
+    // eagerly here, once per image load, regardless of whether CIELUV mode
+    // is currently on -- so flipping the checkbox and clicking "Build
+    // Initial Mesh" never has to wait on (or forget to trigger) a
+    // conversion pass.
+    _targetLUV = gmcore::imageSRGBToCIELUV(_target);
 
     // Diagnostic: log _target's 4 corner colors so orientation can be
     // checked directly against a known test image (e.g. a corner-colored
@@ -277,10 +307,22 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 #pragma mark - Mesh
 
+- (const gmcore::Image&)workingTargetImage {
+    return self.useCIELUVColorSpace ? _targetLUV : _target;
+}
+
 - (void)buildInitialMeshRows:(NSInteger)rows cols:(NSInteger)cols {
     if (!_hasImage || !_hasBoundary) return;
-    _mesh = std::make_unique<GradientMesh>(GradientMesh::buildInitial((int)rows, (int)cols, _boundary, _target));
-    _lastRMSE = _mesh->reconstructionRMSE(_target, 6);
+    // Snapshot NOW, at build time -- everything downstream (this run's
+    // -optimizeWithPyramidLevels:..., -renderReconstructionPreview,
+    // -exportSVGToURL:, -exportDebugDataToURL:, the vertex color
+    // swatch/picker) reads THIS, not the live property, so a later toggle
+    // of useCIELUVColorSpace can never mismatch against what's actually
+    // stored in _mesh until the next rebuild. See its declaration's comment.
+    _meshColorSpaceIsCIELUV = self.useCIELUVColorSpace;
+    const gmcore::Image& target = [self workingTargetImage];
+    _mesh = std::make_unique<GradientMesh>(GradientMesh::buildInitial((int)rows, (int)cols, _boundary, target));
+    _lastRMSE = _mesh->reconstructionRMSE(target, 6);
 }
 
 - (NSPoint)meshVertexPositionAtRow:(NSInteger)row col:(NSInteger)col {
@@ -291,7 +333,14 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 - (NSColor*)meshVertexColorAtRow:(NSInteger)row col:(NSInteger)col {
     if (!_mesh) return [NSColor blackColor];
-    Color c = _mesh->at((int)row, (int)col).C.clamped01();
+    Color c = _mesh->at((int)row, (int)col).C;
+    // _mesh->C is only actually sRGB when _meshColorSpaceIsCIELUV is NO --
+    // see that ivar's comment and ColorSpace.h. clamped01() must run AFTER
+    // this conversion: it assumes an sRGB-range [0,1] triple, and would
+    // silently mangle a raw CIELUV (L* up to 100, u*/v* often negative)
+    // value if applied first.
+    if (_meshColorSpaceIsCIELUV) c = gmcore::cieluvToSRGB(c);
+    c = c.clamped01();
     return [NSColor colorWithCalibratedRed:c.r green:c.g blue:c.b alpha:1.0];
 }
 
@@ -303,7 +352,12 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (void)setMeshVertexColor:(NSColor*)color atRow:(NSInteger)row col:(NSInteger)col {
     if (!_mesh) return;
     NSColor* rgb = [color colorUsingColorSpace:[NSColorSpace deviceRGBColorSpace]];
-    _mesh->at((int)row, (int)col).C = Color(rgb.redComponent, rgb.greenComponent, rgb.blueComponent);
+    Color c(rgb.redComponent, rgb.greenComponent, rgb.blueComponent);
+    // The color picker always hands back sRGB; convert INTO whichever space
+    // _mesh actually stores (see _meshColorSpaceIsCIELUV's comment) so a
+    // manual edit stays consistent with every other vertex's C field.
+    if (_meshColorSpaceIsCIELUV) c = gmcore::srgbToCIELUV(c);
+    _mesh->at((int)row, (int)col).C = c;
 }
 
 - (BOOL)findNearestVertexToPoint:(NSPoint)p maxDistance:(double)maxDist row:(NSInteger*)outRow col:(NSInteger*)outCol {
@@ -419,7 +473,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // pointer stable and avoid touching it from the main thread while this
     // runs (CanvasView checks isOptimizing before reading mesh geometry).
     GradientMesh* meshPtr = _mesh.get();
-    Image targetCopy = _target; // Image is a small value type wrapping a vector; a private copy for thread safety.
+    // Must match the color space _mesh's C/Cu/Cv/Cuv were actually BUILT in
+    // (_meshColorSpaceIsCIELUV, snapshotted at -buildInitialMeshRows:cols:
+    // time), NOT the live useCIELUVColorSpace property -- see that ivar's
+    // comment. Using the wrong one here would feed the optimizer's data
+    // term a target in a different space than the mesh colors it's
+    // comparing against, silently corrupting every run.
+    Image targetCopy = _meshColorSpaceIsCIELUV ? _targetLUV : _target; // Image is a small value type wrapping a vector; a private copy for thread safety.
     std::vector<VectorLine> linesCopy = _vectorLines;
     OptimizerOptions opts;
     // See DocumentModel.h's comment on these two properties: "joint wins" if
@@ -486,16 +546,24 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     return dir;
 }
 
-// "gm_debug_<solver>_<rows>x<cols>_<timestamp>.json" -- same
+// "gm_debug_<solver>[_cieluv]_<rows>x<cols>_<timestamp>.json" -- same
 // <solver>_<rows>x<cols> convention as the old manual export's default
 // filename, plus a millisecond-resolution local timestamp (fixed
 // yyyyMMdd-HHmmss-SSS format, en_US_POSIX locale so it can't come out
 // looking different on a machine set to another locale/calendar) so
 // repeated runs pile up in DebugOut side by side instead of each one
 // silently overwriting the last -- the whole point of turning this into an
-// always-on checkbox is comparing a SEQUENCE of runs after the fact.
+// always-on checkbox is comparing a SEQUENCE of runs after the fact. The
+// "_cieluv" tag (see the JSON body's own "colorSpace" field, the actual
+// source of truth) is deliberately visible in the filename too: a CIELUV
+// run's lastRMSE is in different units than an sRGB run's (see
+// useCIELUVColorSpace's doc comment) and this project has already once
+// mixed up two RMSE numbers that looked comparable but weren't (see
+// README) -- worth avoiding a repeat by making the units visible at a
+// glance, not just inside the file.
 - (NSString*)debugExportFilename {
     NSString* solverTag = self.useCeresJoint ? @"ceres_joint" : self.useCeresGeometry ? @"ceres_geom" : @"hand_rolled";
+    NSString* colorSpaceTag = _meshColorSpaceIsCIELUV ? @"_cieluv" : @"";
     static NSDateFormatter* fmt;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -504,7 +572,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         fmt.dateFormat = @"yyyyMMdd-HHmmss-SSS";
     });
     NSString* stamp = [fmt stringFromDate:[NSDate date]];
-    return [NSString stringWithFormat:@"gm_debug_%@_%ldx%ld_%@.json", solverTag,
+    return [NSString stringWithFormat:@"gm_debug_%@%@_%ldx%ld_%@.json", solverTag, colorSpaceTag,
             (long)self.meshRows, (long)self.meshCols, stamp];
 }
 
@@ -531,6 +599,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (NSImage*)renderReconstructionPreview {
     if (!_mesh || !_hasImage) return nil;
     Image rendered = _mesh->render((int)_target.width, (int)_target.height, 8);
+    // _mesh->render() fully patch-interpolates (Sec 3's Ferguson patches),
+    // producing per-pixel POINT VALUES throughout -- so, unlike Cu/Cv/Cuv,
+    // the raster it returns is safe/correct to convert wholesale. Must run
+    // before the clamped01() loop below (see that call's own note on why).
+    if (_meshColorSpaceIsCIELUV) rendered = gmcore::imageCIELUVToSRGB(rendered);
     int w = rendered.width, h = rendered.height;
     std::vector<uint8_t> buffer(size_t(w) * h * 4, 255);
     for (int y = 0; y < h; ++y) {
@@ -588,7 +661,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 - (BOOL)exportSVGToURL:(NSURL*)url error:(NSError**)error {
     if (!_mesh) { if (error) *error = gmError(@"No mesh to export yet."); return NO; }
-    std::string svg = gmcore::exportGradientMeshSVG(*_mesh, _target.width, _target.height);
+    std::string svg = gmcore::exportGradientMeshSVG(*_mesh, _target.width, _target.height, _meshColorSpaceIsCIELUV);
     NSString* str = [NSString stringWithUTF8String:svg.c_str()];
     NSError* writeErr = nil;
     BOOL ok = [str writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
@@ -631,6 +704,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"requested": requestedSolver,
         @"effective": effectiveSolver,
     };
+
+    // Which colour space _mesh's C/Cu/Cv/Cuv (below) and lastRMSE are
+    // actually in -- see useCIELUVColorSpace's doc comment in
+    // DocumentModel.h and ColorSpace.h. Not present in JSONs exported
+    // before this field existed; treat its absence there as "sRGB" (the
+    // only space that existed at the time). lastRMSE from a "CIELUV" export
+    // is measured in CIELUV units (L* roughly 0..100) and is NOT directly
+    // comparable by raw number to an "sRGB" export's lastRMSE.
+    root[@"colorSpace"] = _meshColorSpaceIsCIELUV ? @"CIELUV" : @"sRGB";
 
     root[@"image"] = @{ @"width": @(_target.width), @"height": @(_target.height) };
     // Same metric, same sample density (6) the UI's status label and the

@@ -23,6 +23,8 @@
 @property (nonatomic, strong) NSPopUpButton* solverPopup;
 // Mirrors DocumentModel.autoExportDebugData -- see -toggleAutoDebug:.
 @property (nonatomic, strong) NSButton* autoDebugCheckbox;
+// Mirrors DocumentModel.useCIELUVColorSpace -- see -toggleCIELUV:.
+@property (nonatomic, strong) NSButton* cieluvCheckbox;
 @end
 
 @implementation MainWindowController
@@ -126,7 +128,17 @@
                                                      target:self action:@selector(toggleAutoDebug:)];
     self.autoDebugCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
 
-    for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox]) [controlsRow3 addSubview:v];
+    // Mirrors DocumentModel.useCIELUVColorSpace -- see -toggleCIELUV: and
+    // that property's own doc comment (Hogervorst 2017's finding that
+    // CIELUV is the best colour space for gradient-mesh colour
+    // interpolation). Takes effect on the NEXT "Build Initial Mesh", not
+    // retroactively -- see that comment for why.
+    self.cieluvCheckbox = [NSButton checkboxWithTitle:@"CIELUV color space"
+                                                  target:self action:@selector(toggleCIELUV:)];
+    self.cieluvCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+
+    for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox, self.cieluvCheckbox])
+        [controlsRow3 addSubview:v];
 
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -206,7 +218,8 @@
         [weakSelf.canvasView setNeedsDisplay:YES];
     };
     self.canvasView.onMeshEdited = ^{
-        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"RMSE (unrefit): %.4f", weakSelf.documentModel.currentRMSE];
+        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"RMSE (unrefit): %.4f%@", weakSelf.documentModel.currentRMSE,
+                                             weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
     };
 }
 
@@ -266,8 +279,9 @@
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
     [self.toolSegmented setSelected:YES forSegment:3];
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"Auto rectangular boundary + %ldx%ld grid built. RMSE=%.4f. Click Optimize.",
-                                     (long)rows, (long)cols, self.documentModel.currentRMSE];
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Auto rectangular boundary + %ldx%ld grid built. RMSE=%.4f%@. Click Optimize.",
+                                     (long)rows, (long)cols, self.documentModel.currentRMSE,
+                                     self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
     [self.canvasView setNeedsDisplay:YES];
 }
 
@@ -277,8 +291,9 @@
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
     [self.toolSegmented setSelected:YES forSegment:3];
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"Initial %ldx%ld mesh built. RMSE=%.4f. Optionally draw vector lines, then click Optimize.",
-                                     (long)rows, (long)cols, self.documentModel.currentRMSE];
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Initial %ldx%ld mesh built. RMSE=%.4f%@. Optionally draw vector lines, then click Optimize.",
+                                     (long)rows, (long)cols, self.documentModel.currentRMSE,
+                                     self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
     [self.canvasView setNeedsDisplay:YES];
 }
 
@@ -290,14 +305,20 @@
     __weak typeof(self) weakSelf = self;
     [self.documentModel optimizeWithPyramidLevels:4
         progress:^(double rmse, NSInteger level, NSInteger totalLevels, NSInteger iter, NSInteger totalIters) {
-            weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Optimizing… pyramid level %ld/%ld, iteration %ld/%ld, RMSE=%.4f",
-                                                 (long)level, (long)(totalLevels - 1), (long)iter, (long)(totalIters - 1), rmse];
+            // See DocumentModel.h's useCIELUVColorSpace comment: a CIELUV
+            // run's RMSE is in different units (L* roughly 0..100) than an
+            // sRGB run's -- flagged here so it's never mistaken for a huge
+            // regression/improvement at a glance.
+            NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @"";
+            weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Optimizing… pyramid level %ld/%ld, iteration %ld/%ld, RMSE=%.4f%@",
+                                                 (long)level, (long)(totalLevels - 1), (long)iter, (long)(totalIters - 1), rmse, unitTag];
         }
         completion:^{
             [weakSelf.progressSpinner stopAnimation:nil];
             weakSelf.optimizeButton.enabled = YES;
             weakSelf.buildMeshButton.enabled = YES;
-            NSString* msg = [NSString stringWithFormat:@"Done. Final RMSE=%.4f.", weakSelf.documentModel.currentRMSE];
+            NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units -- not comparable to sRGB-mode RMSE)" : @"";
+            NSString* msg = [NSString stringWithFormat:@"Done. Final RMSE=%.4f%@.", weakSelf.documentModel.currentRMSE, unitTag];
             // -lastDebugExportPath is only non-nil right after a run that
             // both had autoExportDebugData ON and wrote successfully -- see
             // DocumentModel -autoExportDebugDataIfEnabled.
@@ -374,6 +395,18 @@
     self.statusLabel.stringValue = self.documentModel.autoExportDebugData
         ? @"Auto-export debug data: ON. Each “Optimize” run will write a timestamped JSON to DebugOut/ next to the image."
         : @"Auto-export debug data: OFF.";
+}
+
+- (void)toggleCIELUV:(id)sender {
+    // See DocumentModel.h's useCIELUVColorSpace comment: only takes effect
+    // at the next "Build Initial Mesh" -- an already-built mesh keeps
+    // whichever space it was built in regardless of this toggle, so the
+    // status message says so explicitly rather than implying an immediate
+    // effect the way -solverChanged:'s message does for the next Optimize.
+    self.documentModel.useCIELUVColorSpace = (self.cieluvCheckbox.state == NSControlStateValueOn);
+    self.statusLabel.stringValue = self.documentModel.useCIELUVColorSpace
+        ? @"CIELUV color space: ON. Click “Build Initial Mesh” (or “Auto”) again to rebuild in CIELUV -- an existing mesh is unaffected until then."
+        : @"CIELUV color space: OFF (sRGB). Click “Build Initial Mesh” (or “Auto”) again to rebuild in sRGB -- an existing mesh is unaffected until then.";
 }
 
 - (void)presentError:(NSError*)error {

@@ -1448,6 +1448,90 @@ updated to match) -- present in exports from now on; the runs in the table above
 the fix, so their own JSON files don't show the weight actually in effect (0.3, this
 build's default -- there's no UI to change it yet).
 
+## Optional CIELUV colour space (colour interpolation, not geometry)
+
+Added after reading Hogervorst (2017), *"Colour Interpolation in Gradient Meshes"*
+(Bachelor's thesis, University of Groningen) -- a from-scratch extension of an earlier
+gradient-mesh tool that specifically compared colour spaces and interpolation functions
+for gradient-mesh colour fitting. Its headline finding (own user study included):
+CIELUV is the best colour space for this -- it's perceptually uniform (raw/linear sRGB
+isn't), and unlike CIELAB it doesn't show an unnatural blue->purple->green artifact on
+some transitions. Its own baseline tool already worked in a perceptually uniform space
+(CIELAB); the paper's real interpolation-*function* finding (cubic beats linear/"flat"
+variants, since flat/"half-flat" settings intentionally produce blocky, non-gradient-like
+patches) is exactly the bicubic Hermite patch this project already uses, so nothing
+needed to change there. Explicitly NOT adopted: assigning colours directly to
+derivatives as a manual creative control -- the paper's own conclusion is that it "does
+not yield the effect users expect" and isn't a meaningful feature.
+
+New: `DocumentModel.useCIELUVColorSpace` (UI: "CIELUV color space" checkbox next to the
+solver picker). When on, the NEXT "Build Initial Mesh"/"Auto" builds the mesh against a
+CIELUV conversion of the loaded image instead of raw sRGB, and every subsequent Optimize
+run fits that same converted target -- so the mesh's `C`/`Cu`/`Cv`/`Cuv` fields end up
+holding `(L*,u*,v*)` rather than `(r,g,b)`.
+
+This needed surprisingly little to change in `gmcore` itself: `GradientMesh`/
+`MeshOptimizer`/`MeshOptimizerCeres` never interpret `Color.r/g/b` as literally
+red/green/blue -- every use is generic linear algebra (sums, differences, dot products;
+see `FergusonPatch.h`'s `evalHermitePatch<T>`, templated on the color/position type). So
+converting the *target image* once at the boundary and running the existing,
+byte-for-byte-unmodified optimizer against it is enough -- new
+`core/include/gmcore/ColorSpace.h` + `core/src/ColorSpace.cpp` hold the actual
+`srgbToCIELUV`/`cieluvToSRGB` conversions (standard CIE 1976 L*u*v* formulas, D65 white,
+verified round-tripping every primary/secondary sRGB colour to <2e-6 error, including
+deliberately out-of-[0,1]/out-of-gamut inputs -- both the sRGB gamma curve and the L*
+cube-root are sign-extended via `std::cbrt` rather than clamped, since `Color` values go
+unclamped and can overshoot mid-optimization by design, see `Color.h`), plus
+`imageSRGBToCIELUV`/`imageCIELUVToSRGB` for whole-`Image` conversion. `DocumentModel.mm`
+converts back to sRGB only at the few places that need an actually-displayable colour:
+the on-screen/PNG raster (`-renderReconstructionPreview`), the SVG exporter's per-corner
+stop colours (`exportGradientMeshSVG` gained a `sourceIsCIELUV` parameter), and the mesh
+vertex colour swatch/picker. Only ever the POINT VALUE gets converted this way, never a
+derivative (`Cu`/`Cv`/`Cuv`) -- a "colour derivative" only means something within the
+space it was computed in; naively running it through the same nonlinear per-component
+formula as a point value would be mathematically wrong (the real derivative transform
+needs the map's Jacobian, not a substitution). `GradientMesh::render()`'s rasterizer
+naturally produces only point values (it's already done all its patch interpolation by
+the time a pixel comes out), so converting its whole output `Image` at the end is exact.
+
+Correctness hazard this had to be designed around: the *mesh's* colour space and
+whatever target `-optimizeWithPyramidLevels:...` fits it against must always match, or
+the data term silently compares apples to oranges. Since the checkbox is a live,
+independently-togglable property, `DocumentModel` snapshots it into a private
+`_meshColorSpaceIsCIELUV` ivar at `-buildInitialMeshRows:cols:` time and reads *that*
+(never the live property) everywhere the mesh's colours are touched afterwards --
+optimize, render, SVG export, debug export, the vertex colour picker. So toggling the
+checkbox after a mesh already exists is inert until the next rebuild, by construction,
+rather than a trap.
+
+Also: a CIELUV run's `currentRMSE`/exported `lastRMSE` is measured in CIELUV units (L*
+roughly 0..100) and is **not** directly comparable by raw number to an sRGB run's --
+exactly the kind of misread this project already made once with a solver-RMSE digit (see
+above). Flagged three ways so it can't quietly slip past: the exported debug JSON gets a
+new top-level `"colorSpace": "CIELUV"|"sRGB"` field (absent in JSONs from before this
+existed, which are all implicitly `"sRGB"`), the auto-export filename gets a `_cieluv`
+tag (`gm_debug_ceres_joint_cieluv_9x9_...json`), and every RMSE status string in the UI
+appends `(CIELUV units)` when applicable.
+
+Verified algorithmically (no local Ceres/Xcode build in this sandbox, same limitation as
+everywhere else in this project -- see below): a small standalone harness built the
+existing `gmcore` library, ran `buildInitial`+`optimizeCoarseToFine` (hand-rolled solver)
+against both a raw-sRGB target and its CIELUV conversion of the same 64x64 synthetic
+test image, unmodified. Both runs reduced RMSE normally in their own native units (sRGB
+0.0349 -> 0.0285; CIELUV 6.53 -> 3.05 -- confirming by inspection that these are simply
+different units, not a regression), no NaNs/crashes, and `srgbToCIELUV`/`cieluvToSRGB`
+round-tripped every sRGB primary/secondary colour AND deliberately out-of-range inputs
+(e.g. `(-0.1, 0.3, 1.2)`) to double-precision-scale error. Rendering the CIELUV-fitted
+mesh and converting the raster back to sRGB produced a sane, comparable-order-of-magnitude
+image (not visually broken/inverted) when checked against the original sRGB target
+directly. **Not yet verified**: real photos, on-device, through the actual Ceres solvers
+and the real AppKit image-loading path -- needs an on-device rebuild (this is a new
+source file, `core/src/ColorSpace.cpp`; the CMake source list is a glob, so a plain
+`cmake --build` picks it up automatically, but a stale already-generated Xcode project
+may need `rm -rf build_xcode && cmake -G Xcode -B build_xcode .` first, same as any new
+file added to `core/src/`) and a real side-by-side look at whether CIELUV actually gives
+visibly sharper/cleaner colour transitions on real images, which is the actual point.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)

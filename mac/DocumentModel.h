@@ -50,6 +50,39 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // behavior, unchanged) -- see -optimizeWithPyramidLevels:progress:completion:.
 @property (nonatomic, assign) NSInteger pyramidRestarts;
 
+// When YES, the NEXT -buildInitialMeshRows:cols: call builds the mesh (and
+// every subsequent -optimizeWithPyramidLevels:progress:completion: call
+// fits it) entirely in CIELUV colour space instead of raw sRGB: the loaded
+// image is converted once (see -workingTargetImage/_targetLUV), and the
+// mesh's C/Cu/Cv/Cuv fields end up holding (L*,u*,v*) rather than (r,g,b).
+// Everything downstream that needs an actual displayable colour (the
+// on-screen/PNG raster, the SVG exporter's stop colors, the vertex color
+// swatch/picker) converts back to sRGB automatically -- see ColorSpace.h and
+// DocumentModel.mm for the full rationale (this follows a finding in
+// Hogervorst 2017, "Colour Interpolation in Gradient Meshes": CIELUV is
+// perceptually uniform, unlike sRGB, and -- unlike CIELAB -- doesn't show an
+// unnatural colour artifact on some transitions).
+//
+// Default NO (sRGB, the original behavior). IMPORTANT: this property is
+// only consulted at -buildInitialMeshRows:cols: time -- toggling it after a
+// mesh already exists does NOT retroactively convert that mesh's stored
+// colours; the mesh stays in whichever space it was built in (tracked
+// internally) until rebuilt, precisely so a stray toggle between "build"
+// and "optimize" can never silently feed the optimizer a colour-space
+// mismatch (mesh colours in one space, target image in another).
+// -currentRMSE after a CIELUV-mode run is measured in CIELUV units (L* is
+// roughly 0..100), NOT directly comparable by raw number to an sRGB-mode
+// RMSE -- see -exportDebugDataToURL:error:'s new "colorSpace" field, which
+// records which space produced a given number.
+@property (nonatomic, assign) BOOL useCIELUVColorSpace;
+
+// The colour space the CURRENT mesh (hasMesh) was actually built in --
+// snapshotted from useCIELUVColorSpace at the last -buildInitialMeshRows:
+// cols: call, so this reflects reality even if useCIELUVColorSpace has been
+// toggled since without rebuilding (see that property's doc comment). NO
+// (sRGB) if there is no mesh yet.
+@property (nonatomic, readonly) BOOL meshColorSpaceIsCIELUV;
+
 // When YES, every completed -optimizeWithPyramidLevels:progress:completion:
 // run automatically writes a full debug-data JSON (same content
 // -exportDebugDataToURL:error: below produces) to a "DebugOut" folder next

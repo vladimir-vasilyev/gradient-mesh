@@ -15,6 +15,14 @@
 
 namespace gmcore {
 
-std::string exportGradientMeshSVG(const GradientMesh& mesh, int canvasWidth, int canvasHeight);
+// sourceIsCIELUV: pass true when `mesh`'s vertex colors (MeshVertex::C) are
+// CIELUV (L*,u*,v*) values rather than sRGB -- i.e. when the mesh was built/
+// optimized with DocumentModel.useCIELUVColorSpace on (see ColorSpace.h).
+// SVG stop-color is always sRGB hex, so each patch corner's color is
+// converted back to sRGB before being hex-formatted; nothing else about the
+// exported geometry changes. Defaults to false (sRGB, the original
+// behavior) so every existing call site keeps compiling/behaving unchanged.
+std::string exportGradientMeshSVG(const GradientMesh& mesh, int canvasWidth, int canvasHeight,
+                                   bool sourceIsCIELUV = false);
 
 } // namespace gmcore
