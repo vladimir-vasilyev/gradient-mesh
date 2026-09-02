@@ -50,6 +50,35 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // behavior, unchanged) -- see -optimizeWithPyramidLevels:progress:completion:.
 @property (nonatomic, assign) NSInteger pyramidRestarts;
 
+// --- Geometry/colour energy weights ---
+// Mirror the corresponding gmcore::OptimizerOptions fields 1:1 (see
+// MeshOptimizer.h for each one's full derivation/tuning history) -- read
+// fresh into a new OptimizerOptions at the START of every
+// -optimizeWithPyramidLevels:progress:completion: call, so a value typed
+// into the UI takes effect on the NEXT "Optimize" click, same as the
+// rows/cols fields already work. -init seeds these from a
+// default-constructed gmcore::OptimizerOptions (i.e. this project's normal,
+// sRGB-tuned defaults), not a second hardcoded copy of those numbers --
+// see DocumentModel.mm. Exposed specifically because CIELUV mode
+// (useCIELUVColorSpace) needs these RE-tuned for its own colour-magnitude
+// scale (see ColorSpace.h's kCIELUVWorkingScale comment for why) and
+// recompiling for every trial value isn't practical; MainWindowController's
+// "Reset weights to defaults" button restores all six at once via the same
+// default-constructed OptimizerOptions.
+@property (nonatomic, assign) double smoothWeightGeom;      // OptimizerOptions::smoothWeightGeom
+@property (nonatomic, assign) double smoothWeightColor;     // OptimizerOptions::smoothWeightColor
+@property (nonatomic, assign) double colorDerivRidge;       // OptimizerOptions::colorDerivRidge
+@property (nonatomic, assign) double boundaryWeight;        // OptimizerOptions::boundaryWeight
+@property (nonatomic, assign) double geomTangentPriorWeight; // OptimizerOptions::geomTangentPriorWeight
+@property (nonatomic, assign) double vectorLineWeight;      // OptimizerOptions::vectorLineWeight
+
+// Resets all six weight properties above to gmcore::OptimizerOptions' own
+// compiled-in defaults (the same ones -init seeds them with) -- does NOT
+// touch anything else (solver picker, pyramidRestarts, useCIELUVColorSpace,
+// the mesh itself). Wired to MainWindowController's "Reset weights to
+// defaults" button.
+- (void)resetWeightsToDefaults;
+
 // When YES, the NEXT -buildInitialMeshRows:cols: call builds the mesh (and
 // every subsequent -optimizeWithPyramidLevels:progress:completion: call
 // fits it) entirely in CIELUV colour space instead of raw sRGB: the loaded

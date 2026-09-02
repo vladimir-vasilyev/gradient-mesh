@@ -132,6 +132,28 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 @implementation DocumentModel
 
+- (instancetype)init {
+    if ((self = [super init])) {
+        [self resetWeightsToDefaults];
+    }
+    return self;
+}
+
+// Single source of truth for these six starting values is
+// gmcore::OptimizerOptions' own member-initializers (MeshOptimizer.h) --
+// default-constructing one here and copying out of it, rather than typing
+// the same six numbers again, means they can never silently drift out of
+// sync with the struct's real compiled-in defaults.
+- (void)resetWeightsToDefaults {
+    OptimizerOptions defaults;
+    self.smoothWeightGeom = defaults.smoothWeightGeom;
+    self.smoothWeightColor = defaults.smoothWeightColor;
+    self.colorDerivRidge = defaults.colorDerivRidge;
+    self.boundaryWeight = defaults.boundaryWeight;
+    self.geomTangentPriorWeight = defaults.geomTangentPriorWeight;
+    self.vectorLineWeight = defaults.vectorLineWeight;
+}
+
 - (BOOL)hasImage { return _hasImage; }
 - (NSInteger)imageWidth { return _hasImage ? _target.width : 0; }
 - (NSInteger)imageHeight { return _hasImage ? _target.height : 0; }
@@ -489,6 +511,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     opts.useCeresJoint = self.useCeresJoint;
     // 0/unset -> 1: see DocumentModel.h's comment on this property.
     opts.pyramidRestarts = (int)std::max((NSInteger)1, self.pyramidRestarts);
+    // Geometry/colour energy weights -- see DocumentModel.h's comment on
+    // these six properties. Read fresh here (not cached), so a value edited
+    // in the UI since the last run takes effect on THIS "Optimize" click.
+    opts.smoothWeightGeom = self.smoothWeightGeom;
+    opts.smoothWeightColor = self.smoothWeightColor;
+    opts.colorDerivRidge = self.colorDerivRidge;
+    opts.boundaryWeight = self.boundaryWeight;
+    opts.geomTangentPriorWeight = self.geomTangentPriorWeight;
+    opts.vectorLineWeight = self.vectorLineWeight;
 
     // Snapshot the exact opts this run uses and reset the per-run progress
     // log/timer, for -exportDebugDataToURL:error: -- must happen here, on

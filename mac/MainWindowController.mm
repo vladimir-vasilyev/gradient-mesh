@@ -25,6 +25,16 @@
 @property (nonatomic, strong) NSButton* autoDebugCheckbox;
 // Mirrors DocumentModel.useCIELUVColorSpace -- see -toggleCIELUV:.
 @property (nonatomic, strong) NSButton* cieluvCheckbox;
+// Geometry/colour energy-weight fields -- mirror DocumentModel's six
+// properties of the same name 1:1 (see that header's comment). Read
+// straight into the model at the start of -optimize:, same pattern as
+// rowsField/colsField already use for -buildMesh:/-autoMesh:.
+@property (nonatomic, strong) NSTextField* smoothWeightGeomField;
+@property (nonatomic, strong) NSTextField* boundaryWeightField;
+@property (nonatomic, strong) NSTextField* geomTangentPriorWeightField;
+@property (nonatomic, strong) NSTextField* vectorLineWeightField;
+@property (nonatomic, strong) NSTextField* smoothWeightColorField;
+@property (nonatomic, strong) NSTextField* colorDerivRidgeField;
 @end
 
 @implementation MainWindowController
@@ -62,6 +72,8 @@
     NSView* controlsRow1 = [self makeRow];
     NSView* controlsRow2 = [self makeRow];
     NSView* controlsRow3 = [self makeRow];
+    NSView* controlsRow4 = [self makeRow];
+    NSView* controlsRow5 = [self makeRow];
 
     // --- Row 1: file + tool selection ---
     NSButton* openBtn = [self buttonTitled:@"Open Image…" action:@selector(openImage:)];
@@ -140,6 +152,47 @@
     for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox, self.cieluvCheckbox])
         [controlsRow3 addSubview:v];
 
+    // --- Row 4: geometry energy weights -- see DocumentModel.h's comment
+    // on these properties (mirrors gmcore::OptimizerOptions, MeshOptimizer.h
+    // has each one's full derivation/tuning history). Read into the model
+    // at the start of -optimize:, so a typed value takes effect on the next
+    // "Optimize" click, same as Rows/Cols already work for "Build Initial
+    // Mesh". Initial field text comes from documentModel's own -init
+    // (which seeds them from OptimizerOptions' real compiled-in defaults),
+    // not a second hardcoded copy of those numbers.
+    NSTextField* geomWeightsLabel = [self makeLabel:@"Geometry weights —"];
+    NSTextField* smoothGeomLabel = [self makeLabel:@"Smooth:"];
+    self.smoothWeightGeomField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom]];
+    NSTextField* boundaryLabel = [self makeLabel:@"Boundary:"];
+    self.boundaryWeightField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight]];
+    NSTextField* tangentPriorLabel = [self makeLabel:@"Tangent prior:"];
+    self.geomTangentPriorWeightField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.geomTangentPriorWeight]];
+    NSTextField* vectorLineLabel = [self makeLabel:@"Vector line:"];
+    self.vectorLineWeightField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight]];
+
+    for (NSView* v in @[geomWeightsLabel, smoothGeomLabel, self.smoothWeightGeomField, boundaryLabel,
+                         self.boundaryWeightField, tangentPriorLabel, self.geomTangentPriorWeightField,
+                         vectorLineLabel, self.vectorLineWeightField])
+        [controlsRow4 addSubview:v];
+
+    // --- Row 5: colour energy weights, + a shared reset for all six ---
+    NSTextField* colorWeightsLabel = [self makeLabel:@"Color weights —"];
+    NSTextField* smoothColorLabel = [self makeLabel:@"Smooth:"];
+    self.smoothWeightColorField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightColor]];
+    NSTextField* colorRidgeLabel = [self makeLabel:@"Ridge:"];
+    self.colorDerivRidgeField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.colorDerivRidge]];
+    NSButton* resetWeightsBtn = [self buttonTitled:@"Reset weights to defaults" action:@selector(resetWeights:)];
+
+    for (NSView* v in @[colorWeightsLabel, smoothColorLabel, self.smoothWeightColorField, colorRidgeLabel,
+                         self.colorDerivRidgeField, resetWeightsBtn])
+        [controlsRow5 addSubview:v];
+
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
     self.canvasView.documentModel = self.documentModel;
@@ -148,22 +201,30 @@
     [content addSubview:controlsRow1];
     [content addSubview:controlsRow2];
     [content addSubview:controlsRow3];
+    [content addSubview:controlsRow4];
+    [content addSubview:controlsRow5];
     [content addSubview:self.canvasView];
     [content addSubview:self.statusLabel];
 
-    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow2, controlsRow3, _canvasView, _statusLabel);
+    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow2, controlsRow3, controlsRow4,
+                                                           controlsRow5, _canvasView, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow3]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow4]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow5]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
-        @"V:|-8-[controlsRow1(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[_canvasView]-4-[_statusLabel(18)]-6-|"
+        @"V:|-8-[controlsRow1(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
+        "-6-[_canvasView]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
     [self layoutRowChildren:controlsRow2];
     [self layoutRowChildren:controlsRow3];
+    [self layoutRowChildren:controlsRow4];
+    [self layoutRowChildren:controlsRow5];
 }
 
 - (NSView*)makeRow {
@@ -182,6 +243,19 @@
     NSTextField* f = [NSTextField textFieldWithString:value];
     f.translatesAutoresizingMaskIntoConstraints = NO;
     [f.widthAnchor constraintEqualToConstant:44].active = YES;
+    return f;
+}
+
+// Slightly wider than makeNumberFieldWithValue: (44pt, used for integer
+// Rows/Cols) -- these show decimal weight values like "0.001" or "200",
+// which need a touch more room. Kept as a separate helper rather than
+// widening makeNumberFieldWithValue: itself so Rows/Cols' layout doesn't
+// shift.
+- (NSTextField*)makeWeightFieldWithValue:(NSString*)value {
+    NSTextField* f = [NSTextField textFieldWithString:value];
+    f.translatesAutoresizingMaskIntoConstraints = NO;
+    f.font = [NSFont systemFontOfSize:11];
+    [f.widthAnchor constraintEqualToConstant:54].active = YES;
     return f;
 }
 
@@ -299,6 +373,15 @@
 
 - (void)optimize:(id)sender {
     if (!self.documentModel.hasMesh) { self.statusLabel.stringValue = @"Build a mesh first."; return; }
+    // Geometry/colour energy weights -- read straight from the fields into
+    // the model, same pattern rowsField/colsField already use for -buildMesh:/
+    // -autoMesh:, so whatever's currently typed takes effect on THIS run.
+    self.documentModel.smoothWeightGeom = self.smoothWeightGeomField.doubleValue;
+    self.documentModel.boundaryWeight = self.boundaryWeightField.doubleValue;
+    self.documentModel.geomTangentPriorWeight = self.geomTangentPriorWeightField.doubleValue;
+    self.documentModel.vectorLineWeight = self.vectorLineWeightField.doubleValue;
+    self.documentModel.smoothWeightColor = self.smoothWeightColorField.doubleValue;
+    self.documentModel.colorDerivRidge = self.colorDerivRidgeField.doubleValue;
     self.optimizeButton.enabled = NO;
     self.buildMeshButton.enabled = NO;
     [self.progressSpinner startAnimation:nil];
@@ -407,6 +490,17 @@
     self.statusLabel.stringValue = self.documentModel.useCIELUVColorSpace
         ? @"CIELUV color space: ON. Click “Build Initial Mesh” (or “Auto”) again to rebuild in CIELUV -- an existing mesh is unaffected until then."
         : @"CIELUV color space: OFF (sRGB). Click “Build Initial Mesh” (or “Auto”) again to rebuild in sRGB -- an existing mesh is unaffected until then.";
+}
+
+- (void)resetWeights:(id)sender {
+    [self.documentModel resetWeightsToDefaults];
+    self.smoothWeightGeomField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom];
+    self.boundaryWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight];
+    self.geomTangentPriorWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomTangentPriorWeight];
+    self.vectorLineWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight];
+    self.smoothWeightColorField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightColor];
+    self.colorDerivRidgeField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.colorDerivRidge];
+    self.statusLabel.stringValue = @"Geometry/color weights reset to defaults. Takes effect on the next “Optimize” click.";
 }
 
 - (void)presentError:(NSError*)error {
