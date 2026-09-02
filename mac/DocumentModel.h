@@ -199,6 +199,15 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // --- Output ---
 - (nullable NSImage*)renderReconstructionPreview;
 - (double)currentRMSE;
+// Mean Absolute Error, same sampling/units convention as currentRMSE (see
+// gmcore::GradientMesh::reconstructionMAE) -- computed and updated at
+// exactly the same points currentRMSE is (-buildInitialMeshRows:cols: and
+// after each -optimizeWithPyramidLevels:progress:completion: run), and
+// carries the same CIELUV-units caveat when meshColorSpaceIsCIELUV is YES.
+// Reported alongside RMSE because RMSE's squaring makes it disproportionately
+// sensitive to a few large-error samples, while MAE weighs every sample
+// equally -- comparing the two says something neither alone can.
+- (double)currentMAE;
 - (BOOL)exportPNGToURL:(NSURL*)url error:(NSError**)error;
 - (BOOL)exportSVGToURL:(NSURL*)url error:(NSError**)error;
 

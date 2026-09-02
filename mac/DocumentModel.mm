@@ -94,6 +94,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     std::vector<VectorLine> _vectorLines;
     BOOL _isOptimizing;
     double _lastRMSE;
+    double _lastMAE; // see -currentMAE's doc comment in DocumentModel.h
     // Which colour space _mesh's C/Cu/Cv/Cuv are actually stored in --
     // snapshotted from self.useCIELUVColorSpace at -buildInitialMeshRows:
     // cols: time (see that method) and used everywhere _mesh's colours are
@@ -163,6 +164,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (NSInteger)meshRows { return _mesh ? _mesh->rows : 0; }
 - (NSInteger)meshCols { return _mesh ? _mesh->cols : 0; }
 - (double)currentRMSE { return _lastRMSE; }
+- (double)currentMAE { return _lastMAE; }
 - (BOOL)meshColorSpaceIsCIELUV { return _mesh ? _meshColorSpaceIsCIELUV : NO; }
 
 #pragma mark - Image loading
@@ -345,6 +347,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     const gmcore::Image& target = [self workingTargetImage];
     _mesh = std::make_unique<GradientMesh>(GradientMesh::buildInitial((int)rows, (int)cols, _boundary, target));
     _lastRMSE = _mesh->reconstructionRMSE(target, 6);
+    _lastMAE = _mesh->reconstructionMAE(target, 6);
 }
 
 - (NSPoint)meshVertexPositionAtRow:(NSInteger)row col:(NSInteger)col {
@@ -545,9 +548,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
                 });
             });
         double finalRmse = meshPtr->reconstructionRMSE(targetCopy, 6);
+        double finalMae = meshPtr->reconstructionMAE(targetCopy, 6);
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_isOptimizing = NO;
             self->_lastRMSE = finalRmse;
+            self->_lastMAE = finalMae;
             self->_lastRunWallClockSeconds = -[runStart timeIntervalSinceNow];
             // Must run AFTER the state above is updated (it dumps
             // _lastRMSE/_lastRunHistory/_lastRunWallClockSeconds) but
@@ -750,6 +755,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // filename-embedded RMSE convention already use -- see
     // -optimizeWithPyramidLevels:progress:completion:'s finalRmse.
     root[@"lastRMSE"] = @(_lastRMSE);
+    // Same sampling/units convention as lastRMSE, just mean(|diff|) instead
+    // of sqrt(mean(diff^2)) -- see gmcore::GradientMesh::reconstructionMAE's
+    // comment for why it's worth reporting alongside RMSE. Absent in JSONs
+    // exported before this field existed.
+    root[@"lastMAE"] = @(_lastMAE);
     root[@"pyramidRestarts"] = @(self.pyramidRestarts);
     root[@"hasRunOptimize"] = @(_hasRunOptimize);
     root[@"lastRunWallClockSeconds"] = @(_lastRunWallClockSeconds);

@@ -223,4 +223,27 @@ double GradientMesh::reconstructionRMSE(const Image& target, int samplesPerPatch
     return std::sqrt(sumSq / (count * 3));
 }
 
+double GradientMesh::reconstructionMAE(const Image& target, int samplesPerPatchEdge) const {
+    double sumAbs = 0; long count = 0;
+    int n = std::max(2, samplesPerPatchEdge);
+    for (int pr = 0; pr < rows - 1; ++pr) {
+        for (int pc = 0; pc < cols - 1; ++pc) {
+            for (int i = 0; i <= n; ++i) {
+                double v = double(i) / n;
+                for (int j = 0; j <= n; ++j) {
+                    double u = double(j) / n;
+                    Vec2 pos = evalPos(pr, pc, u, v);
+                    Color c = evalColor(pr, pc, u, v);
+                    Color t = target.sampleBilinear(pos.x, pos.y);
+                    Color d = c - t;
+                    sumAbs += std::abs(d.r) + std::abs(d.g) + std::abs(d.b);
+                    ++count;
+                }
+            }
+        }
+    }
+    if (count == 0) return 0;
+    return sumAbs / (count * 3);
+}
+
 } // namespace gmcore

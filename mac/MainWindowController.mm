@@ -292,7 +292,8 @@
         [weakSelf.canvasView setNeedsDisplay:YES];
     };
     self.canvasView.onMeshEdited = ^{
-        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"RMSE (unrefit): %.4f%@", weakSelf.documentModel.currentRMSE,
+        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"RMSE (unrefit): %.4f  MAE: %.4f%@",
+                                             weakSelf.documentModel.currentRMSE, weakSelf.documentModel.currentMAE,
                                              weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
     };
 }
@@ -353,8 +354,8 @@
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
     [self.toolSegmented setSelected:YES forSegment:3];
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"Auto rectangular boundary + %ldx%ld grid built. RMSE=%.4f%@. Click Optimize.",
-                                     (long)rows, (long)cols, self.documentModel.currentRMSE,
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Auto rectangular boundary + %ldx%ld grid built. RMSE=%.4f  MAE=%.4f%@. Click Optimize.",
+                                     (long)rows, (long)cols, self.documentModel.currentRMSE, self.documentModel.currentMAE,
                                      self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
     [self.canvasView setNeedsDisplay:YES];
 }
@@ -365,8 +366,8 @@
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
     [self.toolSegmented setSelected:YES forSegment:3];
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"Initial %ldx%ld mesh built. RMSE=%.4f%@. Optionally draw vector lines, then click Optimize.",
-                                     (long)rows, (long)cols, self.documentModel.currentRMSE,
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Initial %ldx%ld mesh built. RMSE=%.4f  MAE=%.4f%@. Optionally draw vector lines, then click Optimize.",
+                                     (long)rows, (long)cols, self.documentModel.currentRMSE, self.documentModel.currentMAE,
                                      self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
     [self.canvasView setNeedsDisplay:YES];
 }
@@ -401,7 +402,7 @@
             weakSelf.optimizeButton.enabled = YES;
             weakSelf.buildMeshButton.enabled = YES;
             NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units -- not comparable to sRGB-mode RMSE)" : @"";
-            NSString* msg = [NSString stringWithFormat:@"Done. Final RMSE=%.4f%@.", weakSelf.documentModel.currentRMSE, unitTag];
+            NSString* msg = [NSString stringWithFormat:@"Done. Final RMSE=%.4f  MAE=%.4f%@.", weakSelf.documentModel.currentRMSE, weakSelf.documentModel.currentMAE, unitTag];
             // -lastDebugExportPath is only non-nil right after a run that
             // both had autoExportDebugData ON and wrote successfully -- see
             // DocumentModel -autoExportDebugDataIfEnabled.

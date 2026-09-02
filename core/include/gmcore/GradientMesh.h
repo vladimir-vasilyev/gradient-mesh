@@ -90,6 +90,19 @@ public:
     void scalePositions(double sx, double sy);
 
     double reconstructionRMSE(const Image& target, int samplesPerPatchEdge = 6) const;
+
+    // Same sampling (same quadrature points, same samplesPerPatchEdge
+    // convention) and the same per-channel-scalar treatment as
+    // reconstructionRMSE (r/g/b differences are pooled as independent
+    // scalar samples, not combined into a per-sample Euclidean norm) --
+    // just mean(|diff|) instead of sqrt(mean(diff^2)). Reported alongside
+    // RMSE specifically because RMSE's squaring makes it disproportionately
+    // sensitive to a few large-error samples (e.g. a sharp edge the mesh
+    // hasn't caught yet); MAE weighs every sample equally, so comparing the
+    // two together says something RMSE alone can't -- a run with similar
+    // RMSE but higher MAE (relative to another run) is making more
+    // widespread small errors and fewer large ones, or vice versa.
+    double reconstructionMAE(const Image& target, int samplesPerPatchEdge = 6) const;
 };
 
 } // namespace gmcore
