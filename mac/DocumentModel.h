@@ -23,6 +23,37 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 @property (nonatomic, readonly) BOOL hasMesh;
 @property (nonatomic, readonly) BOOL isOptimizing;
 
+// When YES, -optimizeWithPyramidLevels:progress:completion: takes a cheap
+// snapshot COPY of the mesh once per outer iteration -- on the SAME
+// background thread that's mutating the live mesh, right after that
+// iteration's writes finish and before the next iteration's begin, so the
+// copy itself is never racing a concurrent write -- and hands it to the
+// main thread for -meshVertexPositionAtRow:col:/-meshVertexColorAtRow:col:/
+// -meshEdgeBezierFromRow:col:toRow:col: to read from (see
+// -hasLivePreviewMesh) instead of the live mesh those three would
+// otherwise read. This is what lets CanvasView draw the in-progress mesh
+// grid while optimizing, toggleable because it costs one small mesh copy
+// per outer iteration (cheap for the mesh sizes this app targets, but
+// nonzero) and a canvas redraw each time -- default NO, matching every
+// other opt-in diagnostic/overlay toggle in this class. Read once into a
+// local BEFORE the background dispatch in -optimizeWithPyramidLevels:...,
+// same pattern as useCeresGeometry/useCeresJoint/the seven weight
+// properties, so toggling it mid-run never half-applies.
+@property (nonatomic, assign) BOOL livePreviewDuringOptimize;
+
+// YES only while a run is in flight AND at least one post-iteration
+// snapshot has arrived (see livePreviewDuringOptimize above) -- i.e.
+// exactly when -meshVertexPositionAtRow:col:/-meshVertexColorAtRow:col:/
+// -meshEdgeBezierFromRow:col:toRow:col: are reading the snapshot instead of
+// the live (possibly-being-mutated) mesh. CanvasView checks this to decide
+// whether it's safe to draw the mesh grid DURING an optimize run -- outside
+// a run, or when livePreviewDuringOptimize was off for it, this is NO and
+// CanvasView keeps its existing behavior of not drawing the mesh overlay
+// while isOptimizing (reading the live mesh from the main thread while the
+// background thread mutates it is a data race -- this property exists
+// specifically so CanvasView never has to do that).
+@property (nonatomic, readonly) BOOL hasLivePreviewMesh;
+
 @property (nonatomic, readonly) NSInteger meshRows;
 @property (nonatomic, readonly) NSInteger meshCols;
 
@@ -165,6 +196,14 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 - (void)useRectangularBoundaryWithMargin:(double)marginPixels;
 
 // --- Mesh ---
+// meshVertexPositionAtRow:col:/meshVertexColorAtRow:col: (and
+// meshEdgeBezierFromRow:col:toRow:col: below) read the live mesh normally,
+// but transparently read the livePreviewDuringOptimize snapshot instead
+// whenever hasLivePreviewMesh is YES -- see that property's comment. Callers
+// (CanvasView's -drawMesh) don't need to know or care which one they're
+// getting; setMeshVertexPosition:/setMeshVertexColor:/findNearestVertexTo...
+// below are unaffected and always read/write the live mesh (editing is not
+// meant to run concurrently with an in-flight optimize).
 - (void)buildInitialMeshRows:(NSInteger)rows cols:(NSInteger)cols;
 - (NSPoint)meshVertexPositionAtRow:(NSInteger)row col:(NSInteger)col;
 - (NSColor*)meshVertexColorAtRow:(NSInteger)row col:(NSInteger)col;

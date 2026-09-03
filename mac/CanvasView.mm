@@ -119,7 +119,16 @@
     [NSGraphicsContext restoreGraphicsState];
 
     [self drawBoundary];
-    if (self.showMeshOverlay && dm.hasMesh && !dm.isOptimizing) [self drawMesh];
+    // -drawMesh reads -meshVertexPositionAtRow:col:/-meshVertexColorAtRow:col:,
+    // which read the LIVE mesh while !dm.isOptimizing (safe, nothing else
+    // touches it then) and the livePreviewDuringOptimize snapshot while
+    // dm.isOptimizing && dm.hasLivePreviewMesh (also safe -- see that
+    // property's comment in DocumentModel.h). Either way this call never
+    // reads the live mesh concurrently with the background optimizer thread
+    // mutating it -- there is no third case where drawing here would race.
+    if (self.showMeshOverlay && dm.hasMesh && (!dm.isOptimizing || dm.hasLivePreviewMesh)) [self drawMesh];
+    // Tangent-arrow overlay stays optimize-only-when-idle -- it isn't part
+    // of this request and doesn't need the preview snapshot to stay safe.
     if (self.showTangents && dm.hasMesh && !dm.isOptimizing) [self drawTangents];
     [self drawVectorLines];
 }

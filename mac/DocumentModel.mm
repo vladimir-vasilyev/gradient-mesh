@@ -91,6 +91,17 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     std::array<CubicBezier, 4> _boundary;
     BOOL _hasBoundary;
     std::unique_ptr<GradientMesh> _mesh;
+    // Post-outer-iteration snapshot copy for livePreviewDuringOptimize (see
+    // DocumentModel.h) -- nullptr except during a run that had the toggle
+    // on, from the first snapshot's arrival to that run's end (reset both
+    // at the start and the end of -optimizeWithPyramidLevels:...). A
+    // SEPARATE mesh from _mesh, never aliased to it: the whole point is
+    // that -meshForReading can hand it to the main thread while _mesh
+    // itself is still being mutated by the background optimizer thread,
+    // with no synchronization needed because the copy that produced it
+    // happened on that SAME background thread, synchronously, between two
+    // outer iterations (see the lambda in -optimizeWithPyramidLevels:...).
+    std::unique_ptr<GradientMesh> _previewMesh;
     std::vector<VectorLine> _vectorLines;
     BOOL _isOptimizing;
     double _lastRMSE;
@@ -129,6 +140,14 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 // -buildInitialMeshRows:cols: time -- see that method and
 // _meshColorSpaceIsCIELUV's comment above for why.
 - (const gmcore::Image&)workingTargetImage;
+
+// The mesh meshVertexPositionAtRow:col:/meshVertexColorAtRow:col:/
+// meshEdgeBezierFromRow:col:toRow:col: should actually read from: _mesh
+// normally, or _previewMesh whenever one is available (see
+// hasLivePreviewMesh's comment in DocumentModel.h) -- centralizing this
+// choice here means those three methods don't each need their own
+// isOptimizing/_previewMesh branch, and it can't drift between them.
+- (const GradientMesh*)meshForReading;
 @end
 
 @implementation DocumentModel
@@ -167,6 +186,8 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (double)currentRMSE { return _lastRMSE; }
 - (double)currentMAE { return _lastMAE; }
 - (BOOL)meshColorSpaceIsCIELUV { return _mesh ? _meshColorSpaceIsCIELUV : NO; }
+- (BOOL)hasLivePreviewMesh { return _isOptimizing && _previewMesh != nullptr; }
+- (const GradientMesh*)meshForReading { return self.hasLivePreviewMesh ? _previewMesh.get() : _mesh.get(); }
 
 #pragma mark - Image loading
 
@@ -352,14 +373,16 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 }
 
 - (NSPoint)meshVertexPositionAtRow:(NSInteger)row col:(NSInteger)col {
-    if (!_mesh) return NSZeroPoint;
-    Vec2 p = _mesh->at((int)row, (int)col).P;
+    const GradientMesh* m = [self meshForReading];
+    if (!m) return NSZeroPoint;
+    Vec2 p = m->at((int)row, (int)col).P;
     return NSMakePoint(p.x, p.y);
 }
 
 - (NSColor*)meshVertexColorAtRow:(NSInteger)row col:(NSInteger)col {
-    if (!_mesh) return [NSColor blackColor];
-    Color c = _mesh->at((int)row, (int)col).C;
+    const GradientMesh* m = [self meshForReading];
+    if (!m) return [NSColor blackColor];
+    Color c = m->at((int)row, (int)col).C;
     // _mesh->C is only actually sRGB when _meshColorSpaceIsCIELUV is NO --
     // see that ivar's comment and ColorSpace.h. clamped01() must run AFTER
     // this conversion: it assumes an sRGB-range [0,1] triple, and would
@@ -403,20 +426,21 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 - (NSArray<NSValue*>*)meshEdgeBezierFromRow:(NSInteger)r0 col:(NSInteger)c0
                                        toRow:(NSInteger)r1 col:(NSInteger)c1 {
-    if (!_mesh) return @[];
-    Vec2 P0 = _mesh->at((int)r0, (int)c0).P;
-    Vec2 P1 = _mesh->at((int)r1, (int)c1).P;
+    const GradientMesh* m = [self meshForReading];
+    if (!m) return @[];
+    Vec2 P0 = m->at((int)r0, (int)c0).P;
+    Vec2 P1 = m->at((int)r1, (int)c1).P;
     Vec2 T0, T1;
     if (r0 == r1 && c1 == c0 + 1) {
         // horizontal edge: position varies with col (u); the relevant
         // derivative is the FREE Pu at each end (Pu/Pv are optimized
         // unknowns now, not derived -- see GradientMesh.h/MeshOptimizer.h).
-        T0 = _mesh->at((int)r0, (int)c0).Pu;
-        T1 = _mesh->at((int)r1, (int)c1).Pu;
+        T0 = m->at((int)r0, (int)c0).Pu;
+        T1 = m->at((int)r1, (int)c1).Pu;
     } else if (c0 == c1 && r1 == r0 + 1) {
         // vertical edge: position varies with row (v); the free Pv at each end.
-        T0 = _mesh->at((int)r0, (int)c0).Pv;
-        T1 = _mesh->at((int)r1, (int)c1).Pv;
+        T0 = m->at((int)r0, (int)c0).Pv;
+        T1 = m->at((int)r1, (int)c1).Pv;
     } else {
         return @[]; // not a grid-adjacent pair
     }
@@ -494,11 +518,17 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
                         completion:(void (^)(void))completion {
     if (!_mesh || _isOptimizing) { if (completion) completion(); return; }
     _isOptimizing = YES;
+    _previewMesh.reset(); // stale snapshot from a previous run, if any -- see hasLivePreviewMesh
 
     // MeshOptimizer mutates the mesh's std::vector storage; keep the mesh
     // pointer stable and avoid touching it from the main thread while this
-    // runs (CanvasView checks isOptimizing before reading mesh geometry).
+    // runs (CanvasView checks isOptimizing -- or, when livePreviewDuringOptimize
+    // is on, hasLivePreviewMesh -- before reading mesh geometry, never _mesh
+    // itself mid-run).
     GradientMesh* meshPtr = _mesh.get();
+    // Read once, here, before the background dispatch -- same reasoning as
+    // opts below (a toggle mid-run must not half-apply).
+    BOOL livePreview = self.livePreviewDuringOptimize;
     // Must match the color space _mesh's C/Cu/Cv/Cuv were actually BUILT in
     // (_meshColorSpaceIsCIELUV, snapshotted at -buildInitialMeshRows:cols:
     // time), NOT the live useCIELUVColorSpace property -- see that ivar's
@@ -540,13 +570,23 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts,
-            [progress, self](const OptimizerProgress& p) {
+            [progress, self, meshPtr, livePreview](const OptimizerProgress& p) {
+                // Snapshot HERE, still on the background thread, still
+                // inside the synchronous callback optimizeAtCurrentResolution
+                // invokes between one outer iteration's writes finishing and
+                // the next one's starting (see MeshOptimizer.cpp) -- so this
+                // copy can never race a concurrent write to *meshPtr. Cheap
+                // (a std::vector<MeshVertex> copy, no allocation-heavy
+                // fields) but still only paid when the toggle is on.
+                std::shared_ptr<GradientMesh> snap;
+                if (livePreview) snap = std::make_shared<GradientMesh>(*meshPtr);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     // Recorded unconditionally, even if the caller passed a
                     // nil UI progress block -- this is the history
                     // -exportDebugDataToURL:error: dumps, independent of
                     // whether anything was listening for live UI updates.
                     self->_lastRunHistory.push_back(p);
+                    if (snap) self->_previewMesh = std::make_unique<GradientMesh>(*snap);
                     if (progress) progress(p.rmse, p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.totalOuterIterations);
                 });
             });
@@ -554,6 +594,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         double finalMae = meshPtr->reconstructionMAE(targetCopy, 6);
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_isOptimizing = NO;
+            self->_previewMesh.reset(); // run over -- CanvasView goes back to reading the live (now-settled) _mesh
             self->_lastRMSE = finalRmse;
             self->_lastMAE = finalMae;
             self->_lastRunWallClockSeconds = -[runStart timeIntervalSinceNow];

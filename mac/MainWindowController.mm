@@ -13,6 +13,10 @@
 @property (nonatomic, strong) NSProgressIndicator* progressSpinner;
 @property (nonatomic, strong) NSButton* previewCheckbox;
 @property (nonatomic, strong) NSButton* tangentsCheckbox;
+// Mirrors DocumentModel.livePreviewDuringOptimize -- see -toggleLivePreview:.
+// When on, the mesh grid overlay redraws once per outer iteration during
+// -optimize: instead of staying frozen until the run completes.
+@property (nonatomic, strong) NSButton* livePreviewCheckbox;
 @property (nonatomic, strong) NSButton* buildMeshButton;
 @property (nonatomic, strong) NSButton* optimizeButton;
 @property (nonatomic, strong) NSButton* exportPNGButton;
@@ -106,6 +110,8 @@
     self.previewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.tangentsCheckbox = [NSButton checkboxWithTitle:@"Show tangents" target:self action:@selector(toggleTangents:)];
     self.tangentsCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    self.livePreviewCheckbox = [NSButton checkboxWithTitle:@"Live mesh preview" target:self action:@selector(toggleLivePreview:)];
+    self.livePreviewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.exportPNGButton = [self buttonTitled:@"Export PNG…" action:@selector(exportPNG:)];
     self.exportSVGButton = [self buttonTitled:@"Export SVG…" action:@selector(exportSVG:)];
     self.progressSpinner = [[NSProgressIndicator alloc] init];
@@ -118,7 +124,7 @@
 
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
                          self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.tangentsCheckbox,
-                         self.exportPNGButton, self.exportSVGButton])
+                         self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton])
         [controlsRow2 addSubview:v];
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
@@ -406,6 +412,12 @@
             NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @"";
             weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Optimizing… pyramid level %ld/%ld, iteration %ld/%ld, RMSE=%.4f%@",
                                                  (long)level, (long)(totalLevels - 1), (long)iter, (long)(totalIters - 1), rmse, unitTag];
+            // Live mesh preview: when DocumentModel.livePreviewDuringOptimize
+            // is on, a fresh snapshot lands in -hasLivePreviewMesh right before
+            // this block runs (see -optimizeWithPyramidLevels:progress:completion:),
+            // so redraw now to actually show it. A no-op cost when the toggle
+            // is off, since CanvasView's guard then still gates the mesh out.
+            [weakSelf.canvasView setNeedsDisplay:YES];
         }
         completion:^{
             [weakSelf.progressSpinner stopAnimation:nil];
@@ -434,6 +446,10 @@
 - (void)toggleTangents:(id)sender {
     self.canvasView.showTangents = (self.tangentsCheckbox.state == NSControlStateValueOn);
     [self.canvasView setNeedsDisplay:YES];
+}
+
+- (void)toggleLivePreview:(id)sender {
+    self.documentModel.livePreviewDuringOptimize = (self.livePreviewCheckbox.state == NSControlStateValueOn);
 }
 
 - (void)solverChanged:(id)sender {
