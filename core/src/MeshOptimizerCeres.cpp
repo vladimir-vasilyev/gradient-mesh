@@ -49,10 +49,27 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <thread>
 #include <vector>
 
 namespace gmcore {
 namespace {
+
+// ceres::Solver::Options::num_threads defaults to 1 if never set -- Ceres
+// does NOT pick a sensible multi-core default on its own the way the
+// hand-rolled path's (currently single-threaded) assembly loop doesn't
+// either. Every ceres::Solve call in this file is a small, independent,
+// re-solved-from-scratch problem (a frozen-snapshot GN sub-iteration, see
+// this file's header comment), so there's no cross-call state that
+// threading could disturb -- SPARSE_NORMAL_CHOLESKY's Jacobian evaluation
+// and the sparse Cholesky factorization itself both parallelize internally
+// across whatever thread count Ceres is given. std::thread::hardware_concurrency()
+// can return 0 if it can't detect the core count (rare, but the standard
+// allows it); fall back to 1 rather than passing 0 to Ceres.
+int ceresNumThreads() {
+    unsigned n = std::thread::hardware_concurrency();
+    return n > 0 ? (int)n : 1;
+}
 
 double areaWeightAt(const GradientMesh& mesh, int pr, int pc, double u, double v, double duv) {
     Vec2 dU, dV;
@@ -1007,6 +1024,10 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
     options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
+    // See ceresNumThreads() above -- unset defaults to 1 thread, leaving
+    // every other core idle for the Jacobian evaluation and sparse Cholesky
+    // factorization SPARSE_NORMAL_CHOLESKY does internally.
+    options.num_threads = ceresNumThreads();
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -1184,6 +1205,11 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
     options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
+    // See ceresNumThreads() above -- matters even more here than in
+    // ceresSolveOnce: the joint problem is 3x the unknowns/vertex (18 vs 6),
+    // so the Jacobian evaluation and sparse Cholesky factorization this
+    // parallelizes are proportionally larger too.
+    options.num_threads = ceresNumThreads();
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
