@@ -69,6 +69,38 @@ struct OptimizerOptions {
     double smoothGeomMinFactor = 0.05; // floor on the relaxation factor above -- never fully zero
                                        // out smoothing even directly on the sharpest edge, so the
                                        // geometry solve stays well-posed.
+    double geomDataWeight = 1.0;      // multiplies the geometry step's PHOTOMETRIC data term only
+                                       // (MeshOptimizer.cpp's computeGeometryEnergy w*d.lengthSq()
+                                       // and the matching accumulateGNRow calls in
+                                       // optimizeAtCurrentResolution; mirrored in
+                                       // MeshOptimizerCeres.cpp's PatchDataCostFunction/
+                                       // JointPatchDataCostFunction via sw=sqrt(w*geomDataWeight)) --
+                                       // NOT the color-solve data term (solveColorExact has no such
+                                       // knob; see smoothWeightColor/colorDerivRidge below, which are
+                                       // already scale-covariant with their own data term and need no
+                                       // equivalent). Exists because this term's magnitude is tied to
+                                       // the TARGET IMAGE'S local color gradient (ColorGrad from
+                                       // target.sampleGradient), so it scales with whatever working
+                                       // color-space magnitude the target is expressed in, while
+                                       // smoothWeightGeom/geomTangentPriorWeight/boundaryWeight/
+                                       // vectorLineWeight are pure position quantities that don't --
+                                       // e.g. switching the target from sRGB (~[0,1]) to raw CIELUV
+                                       // (~[0,100]) grows this term's contribution to the Gauss-Newton
+                                       // normal equations by roughly (100)^2=10000x relative to those
+                                       // fixed regularizers (H's diagonal is weight*coeff^2, and coeff
+                                       // here embeds the image gradient -- see accumulateGNRow), which
+                                       // is exactly what let geometry bend aggressively onto sharp
+                                       // edges (and, unchecked, produce border artifacts/shuffled
+                                       // patches) in this project's first CIELUV attempt, before
+                                       // ColorSpace.h's kCIELUVWorkingScale=100 pulled CIELUV back to
+                                       // sRGB's own magnitude and this term's relative strength along
+                                       // with it. Default 1.0 reproduces current/sRGB-equivalent
+                                       // behavior unchanged (including the current CIELUV mode, which
+                                       // is pre-normalized to sRGB's own scale). Raising it lets the
+                                       // photometric term outweigh the position regularizers again
+                                       // without having to know to shrink four different fields by the
+                                       // same factor and without touching smoothWeightColor/
+                                       // colorDerivRidge (unaffected either way -- see above).
     double smoothWeightColor = 4.0;   // 2nd-difference regularization on control-point base color
     double colorDerivRidge = 1e-3;    // small ridge on Cu,Cv,Cuv for a well-posed linear solve
     double boundaryWeight = 200.0;    // soft pull of boundary vertices back onto their spline,

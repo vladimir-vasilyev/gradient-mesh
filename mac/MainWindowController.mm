@@ -25,11 +25,12 @@
 @property (nonatomic, strong) NSButton* autoDebugCheckbox;
 // Mirrors DocumentModel.useCIELUVColorSpace -- see -toggleCIELUV:.
 @property (nonatomic, strong) NSButton* cieluvCheckbox;
-// Geometry/colour energy-weight fields -- mirror DocumentModel's six
+// Geometry/colour energy-weight fields -- mirror DocumentModel's seven
 // properties of the same name 1:1 (see that header's comment). Read
 // straight into the model at the start of -optimize:, same pattern as
 // rowsField/colsField already use for -buildMesh:/-autoMesh:.
 @property (nonatomic, strong) NSTextField* smoothWeightGeomField;
+@property (nonatomic, strong) NSTextField* geomDataWeightField;
 @property (nonatomic, strong) NSTextField* boundaryWeightField;
 @property (nonatomic, strong) NSTextField* geomTangentPriorWeightField;
 @property (nonatomic, strong) NSTextField* vectorLineWeightField;
@@ -164,6 +165,13 @@
     NSTextField* smoothGeomLabel = [self makeLabel:@"Smooth:"];
     self.smoothWeightGeomField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom]];
+    // "Data:" -- OptimizerOptions::geomDataWeight, the single-knob way to
+    // strengthen/weaken the geometry step's photometric term against the
+    // other four fields in this row (see MeshOptimizer.h's comment on that
+    // field, and DocumentModel.h's comment on this property).
+    NSTextField* geomDataLabel = [self makeLabel:@"Data:"];
+    self.geomDataWeightField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.geomDataWeight]];
     NSTextField* boundaryLabel = [self makeLabel:@"Boundary:"];
     self.boundaryWeightField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight]];
@@ -174,12 +182,13 @@
     self.vectorLineWeightField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight]];
 
-    for (NSView* v in @[geomWeightsLabel, smoothGeomLabel, self.smoothWeightGeomField, boundaryLabel,
+    for (NSView* v in @[geomWeightsLabel, smoothGeomLabel, self.smoothWeightGeomField, geomDataLabel,
+                         self.geomDataWeightField, boundaryLabel,
                          self.boundaryWeightField, tangentPriorLabel, self.geomTangentPriorWeightField,
                          vectorLineLabel, self.vectorLineWeightField])
         [controlsRow4 addSubview:v];
 
-    // --- Row 5: colour energy weights, + a shared reset for all six ---
+    // --- Row 5: colour energy weights, + a shared reset for all seven ---
     NSTextField* colorWeightsLabel = [self makeLabel:@"Color weights —"];
     NSTextField* smoothColorLabel = [self makeLabel:@"Smooth:"];
     self.smoothWeightColorField = [self makeWeightFieldWithValue:
@@ -378,6 +387,7 @@
     // the model, same pattern rowsField/colsField already use for -buildMesh:/
     // -autoMesh:, so whatever's currently typed takes effect on THIS run.
     self.documentModel.smoothWeightGeom = self.smoothWeightGeomField.doubleValue;
+    self.documentModel.geomDataWeight = self.geomDataWeightField.doubleValue;
     self.documentModel.boundaryWeight = self.boundaryWeightField.doubleValue;
     self.documentModel.geomTangentPriorWeight = self.geomTangentPriorWeightField.doubleValue;
     self.documentModel.vectorLineWeight = self.vectorLineWeightField.doubleValue;
@@ -496,6 +506,7 @@
 - (void)resetWeights:(id)sender {
     [self.documentModel resetWeightsToDefaults];
     self.smoothWeightGeomField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom];
+    self.geomDataWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomDataWeight];
     self.boundaryWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight];
     self.geomTangentPriorWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomTangentPriorWeight];
     self.vectorLineWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight];

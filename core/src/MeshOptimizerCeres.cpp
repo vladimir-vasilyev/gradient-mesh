@@ -296,9 +296,10 @@ double computeTrueJointEnergy(const GradientMesh& mesh, const Image& target,
 class PatchDataCostFunction : public ceres::CostFunction {
 public:
     PatchDataCostFunction(const GradientMesh& snapshot, const Image& target,
-                           int patchRow, int patchCol, int samplesPerEdge)
+                           int patchRow, int patchCol, int samplesPerEdge,
+                           double dataWeight = 1.0)
         : snapshot_(snapshot), target_(target), pr_(patchRow), pc_(patchCol),
-          n_(std::max(2, samplesPerEdge)) {
+          n_(std::max(2, samplesPerEdge)), dataWeight_(dataWeight) {
         int numSamples = (n_ + 1) * (n_ + 1);
         set_num_residuals(3 * numSamples);
         for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(6);
@@ -336,8 +337,12 @@ public:
                 Color ctarget = target_.sampleBilinear(pos.x, pos.y);
                 ColorGrad grad = target_.sampleGradient(pos.x, pos.y);
                 // Frozen: from snapshot_, not the trial mesh -- see file header.
+                // dataWeight_ (OptimizerOptions::geomDataWeight) folded into the
+                // sqrt here so residuals^2 sums to w*dataWeight_*r0^2, matching
+                // the hand-rolled path's `w * opts.geomDataWeight` in
+                // MeshOptimizer.cpp's computeGeometryEnergy/optimizeAtCurrentResolution.
                 double w = areaWeightAt(snapshot_, pr_, pc_, u, v, duv);
-                double sw = std::sqrt(w);
+                double sw = std::sqrt(w * dataWeight_);
                 PatchWeights pw = PatchWeights::at(u, v);
 
                 double r0[3] = {cmesh.r - ctarget.r, cmesh.g - ctarget.g, cmesh.b - ctarget.b};
@@ -375,6 +380,7 @@ private:
     const GradientMesh& snapshot_;
     const Image& target_;
     int pr_, pc_, n_;
+    double dataWeight_;
 };
 
 // ---- Joint data term: same as PatchDataCostFunction above, but color is
@@ -390,6 +396,17 @@ private:
 // Used ONLY by optimizeJointCeres/jointSolveOnce -- optimizeGeometryCeres
 // keeps using the frozen-color PatchDataCostFunction above, unchanged. ----
 //
+// dataWeight_ (OptimizerOptions::geomDataWeight) scales this ONE shared
+// residual, which is differentiated w.r.t. BOTH the geometry and the color
+// parameter blocks -- unlike the frozen-color PatchDataCostFunction, there
+// is no way here to strengthen this term against smoothWeightGeom et al.
+// without also strengthening it against smoothWeightColor/colorDerivRidge
+// (both separate, unaffected CostFunctions -- see
+// ColorSmoothTripleCostFunction/ColorRidgeCostFunction below). That's a
+// real difference from the hand-rolled/geometry-only-Ceres paths, not an
+// oversight: it falls out of this solver mode actually being joint.
+//
+
 // 8 parameter blocks per patch: [0..3] = geometry corners (6 doubles:
 // P.x,P.y,Pu.x,Pu.y,Pv.x,Pv.y -- same layout/order as PatchDataCostFunction),
 // [4..7] = color corners (12 doubles: C.r,C.g,C.b, Cu.r,Cu.g,Cu.b, Cv.r,
@@ -400,9 +417,10 @@ private:
 class JointPatchDataCostFunction : public ceres::CostFunction {
 public:
     JointPatchDataCostFunction(const GradientMesh& snapshot, const Image& target,
-                                int patchRow, int patchCol, int samplesPerEdge)
+                                int patchRow, int patchCol, int samplesPerEdge,
+                                double dataWeight = 1.0)
         : snapshot_(snapshot), target_(target), pr_(patchRow), pc_(patchCol),
-          n_(std::max(2, samplesPerEdge)) {
+          n_(std::max(2, samplesPerEdge)), dataWeight_(dataWeight) {
         int numSamples = (n_ + 1) * (n_ + 1);
         set_num_residuals(3 * numSamples);
         for (int k = 0; k < 4; ++k) mutable_parameter_block_sizes()->push_back(6);   // geometry
@@ -448,7 +466,7 @@ public:
                 // Frozen: from snapshot_, not the trial mesh -- see
                 // PatchDataCostFunction's comment above for why.
                 double w = areaWeightAt(snapshot_, pr_, pc_, u, v, duv);
-                double sw = std::sqrt(w);
+                double sw = std::sqrt(w * dataWeight_);
                 PatchWeights pw = PatchWeights::at(u, v);
 
                 double r0[3] = {cmesh.r - ctarget.r, cmesh.g - ctarget.g, cmesh.b - ctarget.b};
@@ -511,6 +529,7 @@ private:
     const GradientMesh& snapshot_;
     const Image& target_;
     int pr_, pc_, n_;
+    double dataWeight_;
 };
 
 // ---- Color smoothness: one residual block per row/col triple on the base
@@ -882,7 +901,7 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
 
     for (int pr = 0; pr < mesh.rows - 1; ++pr) {
         for (int pc = 0; pc < mesh.cols - 1; ++pc) {
-            auto* cost = new PatchDataCostFunction(snapshot, target, pr, pc, n);
+            auto* cost = new PatchDataCostFunction(snapshot, target, pr, pc, n, opts.geomDataWeight);
             std::vector<double*> blocks;
             for (int a = 0; a < 2; ++a)
                 for (int b = 0; b < 2; ++b)
@@ -1043,7 +1062,7 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
 
     for (int pr = 0; pr < mesh.rows - 1; ++pr) {
         for (int pc = 0; pc < mesh.cols - 1; ++pc) {
-            auto* cost = new JointPatchDataCostFunction(snapshot, target, pr, pc, n);
+            auto* cost = new JointPatchDataCostFunction(snapshot, target, pr, pc, n, opts.geomDataWeight);
             std::vector<double*> blocks;
             for (int a = 0; a < 2; ++a)
                 for (int b = 0; b < 2; ++b)

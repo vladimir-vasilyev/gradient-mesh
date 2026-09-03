@@ -214,7 +214,7 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
                     Color ctarget = target.sampleBilinear(pos.x, pos.y);
                     double w = areaWeightAt(mesh, pr, pc, u, v, duv);
                     Color d = cmesh - ctarget;
-                    energy += w * d.lengthSq();
+                    energy += w * opts.geomDataWeight * d.lengthSq();
 
                     // Vector-line guided term (Sec 4.2), evaluated at this
                     // same dense sample grid as the data term -- must
@@ -590,9 +590,13 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                                 }
                                 return row;
                             };
-                            accumulateGNRow(H, g, buildChanneled(grad.dx.r, grad.dy.r), r0r, w);
-                            accumulateGNRow(H, g, buildChanneled(grad.dx.g, grad.dy.g), r0g, w);
-                            accumulateGNRow(H, g, buildChanneled(grad.dx.b, grad.dy.b), r0b, w);
+                            // geomDataWeight scales ONLY this photometric term -- see
+                            // OptimizerOptions::geomDataWeight's comment -- not the
+                            // vector-line term just below, which has its own weight.
+                            double wData = w * opts.geomDataWeight;
+                            accumulateGNRow(H, g, buildChanneled(grad.dx.r, grad.dy.r), r0r, wData);
+                            accumulateGNRow(H, g, buildChanneled(grad.dx.g, grad.dy.g), r0g, wData);
+                            accumulateGNRow(H, g, buildChanneled(grad.dx.b, grad.dy.b), r0b, wData);
 
                             // Vector-line guided term (Sec 4.2): penalizes
                             // the component of the ANALYTIC surface tangent

@@ -63,16 +63,31 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // (useCIELUVColorSpace) needs these RE-tuned for its own colour-magnitude
 // scale (see ColorSpace.h's kCIELUVWorkingScale comment for why) and
 // recompiling for every trial value isn't practical; MainWindowController's
-// "Reset weights to defaults" button restores all six at once via the same
-// default-constructed OptimizerOptions.
+// "Reset weights to defaults" button restores all seven at once via the
+// same default-constructed OptimizerOptions.
 @property (nonatomic, assign) double smoothWeightGeom;      // OptimizerOptions::smoothWeightGeom
 @property (nonatomic, assign) double smoothWeightColor;     // OptimizerOptions::smoothWeightColor
 @property (nonatomic, assign) double colorDerivRidge;       // OptimizerOptions::colorDerivRidge
 @property (nonatomic, assign) double boundaryWeight;        // OptimizerOptions::boundaryWeight
 @property (nonatomic, assign) double geomTangentPriorWeight; // OptimizerOptions::geomTangentPriorWeight
 @property (nonatomic, assign) double vectorLineWeight;      // OptimizerOptions::vectorLineWeight
+@property (nonatomic, assign) double geomDataWeight;        // OptimizerOptions::geomDataWeight -- multiplies
+                                                              // ONLY the geometry step's photometric data
+                                                              // term (see that field's comment in
+                                                              // MeshOptimizer.h); 1.0 = unchanged/default.
+                                                              // The direct, single-knob way to reproduce
+                                                              // this project's pre-kCIELUVWorkingScale
+                                                              // CIELUV behaviour (border artifacts + sharp
+                                                              // edges) WITHOUT touching ColorSpace.cpp:
+                                                              // raising this to ~10000 with the other six
+                                                              // weights left at default reproduces the same
+                                                              // data-term-vs-regularizer imbalance raw
+                                                              // (unscaled) CIELUV had, more directly than
+                                                              // shrinking boundaryWeight/smoothWeightGeom/
+                                                              // geomTangentPriorWeight/vectorLineWeight by
+                                                              // 10000x each by hand.
 
-// Resets all six weight properties above to gmcore::OptimizerOptions' own
+// Resets all seven weight properties above to gmcore::OptimizerOptions' own
 // compiled-in defaults (the same ones -init seeds them with) -- does NOT
 // touch anything else (solver picker, pyramidRestarts, useCIELUVColorSpace,
 // the mesh itself). Wired to MainWindowController's "Reset weights to

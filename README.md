@@ -1532,6 +1532,59 @@ may need `rm -rf build_xcode && cmake -G Xcode -B build_xcode .` first, same as 
 file added to `core/src/`) and a real side-by-side look at whether CIELUV actually gives
 visibly sharper/cleaner colour transitions on real images, which is the actual point.
 
+### Follow-up: CIELUV working-scale fix, and a new `geomDataWeight` knob to trade it off
+
+On-device testing (real photo, not the synthetic gradient) surfaced two things the
+harness above couldn't: raw/unscaled CIELUV gave visibly *sharper* colour boundaries
+than sRGB (matching the original photo closely) but also visible border artifacts and a
+disordered/shuffled patch layout, and `lastRMSE` came out ~2 orders of magnitude bigger
+than sRGB's own -- confirmed as a real units mismatch, not a solver bug: raw CIELUV's
+`L*` spans roughly `[0,100]` (~100x sRGB's `[0,1]`), while every `OptimizerOptions`
+weight (`smoothWeightColor`, `colorDerivRidge`, `boundaryWeight`,
+`smoothWeightGeom`, `geomTangentPriorWeight`, `vectorLineWeight`) is a fixed absolute
+constant tuned for sRGB's scale. Added `ColorSpace.h`'s `kCIELUVWorkingScale = 100.0`
+(divides `srgbToCIELUV`'s output, multiplies `cieluvToSRGB`'s input -- so the working
+representation stored in `MeshVertex::C`/`Cu`/`Cv`/`Cuv` is raw CIELUV / 100, not
+textbook CIELUV) to rebalance this. Verified via a standalone e2e harness: CIELUV-mode
+RMSE went from ~100x sRGB-mode down to ~1.7x: sane, comparable units.
+
+This fix also visibly cost the sharpness (confirmed by a real on-device before/after,
+not assumed) -- expected, since it shares the same root cause, which turned out to sit
+entirely on the geometry side, not the color side. Reading `MeshOptimizer.cpp`'s exact
+Gauss-Newton accumulation (`accumulateGNRow`'s `H += weight*coeff^2`) pins it down:
+`smoothWeightColor`/`colorDerivRidge` live inside `solveColorExact`'s *linear* solve,
+where both the data-term Jacobian pattern and the regularizers' Jacobian patterns are
+purely structural (never reference `C`'s own magnitude) -- rescaling `C` scales the
+right-hand side only, so their relative balance is provably scale-invariant and these
+two needed no change. The geometry Gauss-Newton step's photometric term is different:
+its Jacobian is built from `target.sampleGradient(...)`, the *target image's* local
+colour gradient, which scales linearly with whatever colour-space magnitude the target
+is in -- so this one term's contribution to `H` scales with that magnitude *squared*,
+while `boundaryWeight`/`smoothWeightGeom`/`geomTangentPriorWeight`/`vectorLineWeight`
+are pure position quantities untouched by any of this. Raw CIELUV (~100x sRGB) made the
+photometric term ~10000x stronger relative to those four regularizers than sRGB ever
+was -- geometry bent aggressively onto real edges (sharp, but unstable: border
+artifacts, shuffled patches); `kCIELUVWorkingScale` undoes exactly that 10000x, which is
+also why it flattened the sharpness back out.
+
+Rather than requiring four regularizer fields to be hand-divided by 10000 to get that
+imbalance back deliberately (numerically awkward, easy to get one field wrong), added
+`OptimizerOptions::geomDataWeight` (default `1.0`, UI: "Data:" field in the Geometry
+weights row) as a single direct multiplier on *only* the geometry step's photometric
+term -- `w * opts.geomDataWeight` in `MeshOptimizer.cpp`'s `computeGeometryEnergy` and
+`optimizeAtCurrentResolution`, mirrored as `sw = sqrt(w * geomDataWeight)` in
+`MeshOptimizerCeres.cpp`'s `PatchDataCostFunction` (used by `useCeresGeometry`) and
+`JointPatchDataCostFunction` (used by `useCeresJoint` -- note this one residual is
+differentiated w.r.t. both geometry AND colour parameter blocks in the joint solver, so
+there `geomDataWeight` also strengthens the colour fit against
+`smoothWeightColor`/`colorDerivRidge`, a real difference from the other two solver
+modes, not an oversight). Setting it to `~10000` with the other six weights left at
+their defaults is the direct way to reproduce the pre-`kCIELUVWorkingScale` behaviour
+(border artifacts + sharp edges) without touching `ColorSpace.cpp` at all. **Not yet
+verified**: this derivation is from reading the accumulation code, not from an on-device
+run with `geomDataWeight` actually dialed up -- next real test should confirm it
+reproduces the original artifact/sharpness trade-off before relying on it further.
+
 ## How this was tested
 
 `gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)
