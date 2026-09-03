@@ -761,7 +761,10 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
         }
 
         double rmse = mesh.reconstructionRMSE(target, opts.samplesPerPatchEdge);
-        if (cb) cb({level, totalLevels, outer, opts.outerIterationsPerLevel, rmse});
+        // target.width/height (this LEVEL's downsampled size, not the full-
+        // res image) -- see OptimizerProgress::levelWidth/levelHeight's
+        // comment for why callers need this.
+        if (cb) cb({level, totalLevels, outer, opts.outerIterationsPerLevel, rmse, target.width, target.height});
 
         // Early-exit once several outer iterations IN A ROW show relative
         // improvement in the composite geometry energy (data + vector-line

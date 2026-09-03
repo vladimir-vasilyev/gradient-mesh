@@ -401,6 +401,25 @@ struct OptimizerProgress {
     int outerIteration = 0;
     int totalOuterIterations = 0;
     double rmse = 0.0;
+    // Pixel dimensions of the pyramid level THIS callback fired at (i.e.
+    // what mesh.P/Pu/Pv/boundary are currently scaled to -- see
+    // optimizeCoarseToFine's mesh.scalePositions calls: the mesh lives in
+    // level pyramidLevel's downsampled coordinate space for the whole
+    // duration of that level's optimizeAtCurrentResolution call, only
+    // getting rescaled up once that level finishes entirely). Together with
+    // the caller's own full-resolution (level 0) target image dimensions,
+    // this is exactly what's needed to map a mesh snapshot taken mid-level
+    // back to full-res/level-0 pixel space:
+    //   GradientMesh::scalePositions(fullResWidth / (double)levelWidth,
+    //                                 fullResHeight / (double)levelHeight)
+    // -- see DocumentModel.mm's livePreviewDuringOptimize snapshot, the
+    // motivating use case: without this, the live-preview mesh grid would
+    // be drawn shrunk into a corner of the (always full-res) canvas at
+    // every pyramid level except the finest (0 itself, where the factor is
+    // trivially 1.0). 0 before the first callback of a run, same as every
+    // other field's zero-initialized default.
+    int levelWidth = 0;
+    int levelHeight = 0;
 };
 using OptimizerProgressCallback = std::function<void(const OptimizerProgress&)>;
 

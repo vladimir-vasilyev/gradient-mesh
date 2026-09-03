@@ -262,6 +262,17 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // sensitive to a few large-error samples, while MAE weighs every sample
 // equally -- comparing the two says something neither alone can.
 - (double)currentMAE;
+// Wall-clock duration of the most recently COMPLETED
+// -optimizeWithPyramidLevels:progress:completion: run, in seconds (measured
+// from just before the background dispatch to just after
+// optimizeCoarseToFine returns -- see -optimizeWithPyramidLevels:...'s
+// runStart/-lastRunWallClockSeconds assignment). 0 before any run has
+// completed in this session. This is the same number already written into
+// -exportDebugDataToURL:error:'s "lastRunWallClockSeconds" JSON field (and,
+// when autoExportDebugData is on, every auto-exported log); exposed here
+// too so MainWindowController can show it directly in the status bar
+// without needing a debug export.
+- (double)lastRunWallClockSeconds;
 - (BOOL)exportPNGToURL:(NSURL*)url error:(NSError**)error;
 - (BOOL)exportSVGToURL:(NSURL*)url error:(NSError**)error;
 

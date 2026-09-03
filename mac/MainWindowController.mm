@@ -424,7 +424,8 @@
             weakSelf.optimizeButton.enabled = YES;
             weakSelf.buildMeshButton.enabled = YES;
             NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units -- not comparable to sRGB-mode RMSE)" : @"";
-            NSString* msg = [NSString stringWithFormat:@"Done. Final RMSE=%.4f  MAE=%.4f%@.", weakSelf.documentModel.currentRMSE, weakSelf.documentModel.currentMAE, unitTag];
+            NSString* msg = [NSString stringWithFormat:@"Done in %.2fs. Final RMSE=%.4f  MAE=%.4f%@.",
+                              weakSelf.documentModel.lastRunWallClockSeconds, weakSelf.documentModel.currentRMSE, weakSelf.documentModel.currentMAE, unitTag];
             // -lastDebugExportPath is only non-nil right after a run that
             // both had autoExportDebugData ON and wrote successfully -- see
             // DocumentModel -autoExportDebugDataIfEnabled.

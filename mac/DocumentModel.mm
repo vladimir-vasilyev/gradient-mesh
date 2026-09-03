@@ -185,6 +185,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (NSInteger)meshCols { return _mesh ? _mesh->cols : 0; }
 - (double)currentRMSE { return _lastRMSE; }
 - (double)currentMAE { return _lastMAE; }
+- (double)lastRunWallClockSeconds { return _lastRunWallClockSeconds; }
 - (BOOL)meshColorSpaceIsCIELUV { return _mesh ? _meshColorSpaceIsCIELUV : NO; }
 - (BOOL)hasLivePreviewMesh { return _isOptimizing && _previewMesh != nullptr; }
 - (const GradientMesh*)meshForReading { return self.hasLivePreviewMesh ? _previewMesh.get() : _mesh.get(); }
@@ -567,10 +568,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     _lastRunHistory.clear();
     _hasRunOptimize = YES;
     NSDate* runStart = [NSDate date];
+    // Full-res (pyramid level 0) pixel size, captured once here rather than
+    // capturing the whole (potentially large) targetCopy Image into the C++
+    // progress lambda below -- see its use just below scalePositions'
+    // comment for why the live-preview snapshot needs this.
+    int fullResW = targetCopy.width, fullResH = targetCopy.height;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts,
-            [progress, self, meshPtr, livePreview](const OptimizerProgress& p) {
+            [progress, self, meshPtr, livePreview, fullResW, fullResH](const OptimizerProgress& p) {
                 // Snapshot HERE, still on the background thread, still
                 // inside the synchronous callback optimizeAtCurrentResolution
                 // invokes between one outer iteration's writes finishing and
@@ -579,7 +585,24 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
                 // (a std::vector<MeshVertex> copy, no allocation-heavy
                 // fields) but still only paid when the toggle is on.
                 std::shared_ptr<GradientMesh> snap;
-                if (livePreview) snap = std::make_shared<GradientMesh>(*meshPtr);
+                if (livePreview) {
+                    snap = std::make_shared<GradientMesh>(*meshPtr);
+                    // *meshPtr lives in pyramid level p.pyramidLevel's OWN
+                    // downsampled coordinate space for the whole duration of
+                    // that level (see OptimizerProgress::levelWidth/Height's
+                    // comment) -- only the FINEST level (0) happens to
+                    // already be full-res. CanvasView always draws against
+                    // full-res image pixel coordinates, so without this the
+                    // live mesh grid would render shrunk into a corner of
+                    // the canvas at every level except the last one. Scaling
+                    // up front here (background thread, on the already-
+                    // independent copy) means CanvasView/DocumentModel's
+                    // read accessors don't need to know or care which
+                    // pyramid level produced the snapshot they're reading.
+                    if (p.levelWidth > 0 && p.levelHeight > 0) {
+                        snap->scalePositions(double(fullResW) / p.levelWidth, double(fullResH) / p.levelHeight);
+                    }
+                }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     // Recorded unconditionally, even if the caller passed a
                     // nil UI progress block -- this is the history
@@ -598,6 +621,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
             self->_lastRMSE = finalRmse;
             self->_lastMAE = finalMae;
             self->_lastRunWallClockSeconds = -[runStart timeIntervalSinceNow];
+            // Unconditional console log of this run's timing -- unlike
+            // -exportDebugDataToURL:error:'s JSON (which already carries
+            // this same number, see that method's "lastRunWallClockSeconds"
+            // field) this needs neither autoExportDebugData nor a loaded
+            // image to have somewhere to write to, so it's the one place
+            // every run's duration is always recorded, visible in Xcode's
+            // debug console (Cmd+Shift+Y) without any extra setup.
+            NSLog(@"[GradientMeshStudio] Optimize finished in %.2fs (mesh %ldx%ld, RMSE=%.4f, MAE=%.4f)",
+                  self->_lastRunWallClockSeconds, (long)self->_mesh->rows, (long)self->_mesh->cols, finalRmse, finalMae);
             // Must run AFTER the state above is updated (it dumps
             // _lastRMSE/_lastRunHistory/_lastRunWallClockSeconds) but
             // BEFORE completion(), so a completion handler that checks
