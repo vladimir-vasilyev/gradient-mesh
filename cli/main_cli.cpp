@@ -64,7 +64,7 @@ static void printUsage(const char* prog) {
         "          [--outer-iters N] [--outer-conv-tol X] [--outer-conv-patience N]\n"
         "          [--pyramid-restarts N]\n"
         "          [--gn-iters N] [--samples N] [--cg-iters N] [--use-ceres]\n"
-        "          [--use-ceres-joint]\n"
+        "          [--use-ceres-joint] [--ceres-threads N]\n"
         "  --use-ceres: replace the hand-rolled geometry Gauss-Newton solver with a\n"
         "  ceres::Problem solve (OptimizerOptions::useCeresGeometry) -- only has any\n"
         "  effect if this binary was built with Ceres found (see CMakeLists.txt); a\n"
@@ -73,6 +73,11 @@ static void printUsage(const char* prog) {
         "  solve with one fully-joint ceres::Problem (OptimizerOptions::useCeresJoint) --\n"
         "  wins over --use-ceres if both are given. Same graceful fallback if built\n"
         "  without Ceres.\n"
+        "  --ceres-threads N: ceres::Solver::Options::num_threads for every Ceres solve\n"
+        "  (OptimizerOptions::ceresNumThreads). 0 (default) = auto, every core; 1 forces\n"
+        "  single-threaded -- useful for A/B-testing whether multithreading itself\n"
+        "  changed a result (it shouldn't, beyond floating-point summation-order noise;\n"
+        "  see that field's comment). No effect without --use-ceres/--use-ceres-joint.\n"
         "  With no --input, a synthetic shaded-sphere test image is generated so the\n"
         "  optimizer can be exercised without any external files.\n"
         "  The --smooth-geom/... flags override OptimizerOptions for quick experiments\n"
@@ -135,6 +140,7 @@ int main(int argc, char** argv) {
         else if (a == "--cg-iters") opts.cgMaxIterations = std::stoi(next());
         else if (a == "--use-ceres") opts.useCeresGeometry = true;
         else if (a == "--use-ceres-joint") opts.useCeresJoint = true;
+        else if (a == "--ceres-threads") opts.ceresNumThreads = std::stoi(next());
         else if (a == "-h" || a == "--help") { printUsage(argv[0]); return 0; }
         else { std::fprintf(stderr, "Unknown arg: %s\n", a.c_str()); printUsage(argv[0]); return 1; }
     }

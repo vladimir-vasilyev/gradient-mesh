@@ -70,6 +70,15 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 @property (nonatomic, assign) BOOL useCeresGeometry;
 @property (nonatomic, assign) BOOL useCeresJoint;
 
+// Mirrors gmcore::OptimizerOptions::ceresNumThreads -- see that field's
+// comment in MeshOptimizer.h for the full rationale. YES (default) lets
+// every ceres::Solve call use every CPU core (ceresNumThreads=0, "auto");
+// NO pins it to exactly 1 thread, for an apples-to-apples A/B comparison
+// against a multithreaded run of the same weights, or on a machine you'd
+// rather not saturate. Has no effect on the hand-rolled path (no threading
+// of its own yet) or when this binary wasn't built with Ceres found.
+@property (nonatomic, assign) BOOL ceresMultithreaded;
+
 // How many times -[optimizeWithPyramidLevels:progress:completion:] repeats
 // the full coarse-to-fine sweep in one call -- mirrors
 // gmcore::OptimizerOptions::pyramidRestarts (see MeshOptimizer.h for the

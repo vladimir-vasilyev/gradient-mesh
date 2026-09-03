@@ -292,6 +292,33 @@ struct OptimizerOptions {
     double cgRelTolerance = 1e-5;
     double geomDampingInitial = 1e-2; // relative Levenberg damping added to the GN normal equations
 
+    // ceres::Solver::Options::num_threads for EVERY ceres::Solve call this
+    // binary makes (useCeresGeometry's ceresSolveOnce and useCeresJoint's
+    // jointSolveOnce, see MeshOptimizerCeres.cpp's resolveCeresNumThreads).
+    // 0 (default) = auto: use every core std::thread::hardware_concurrency()
+    // reports (falling back to 1 if that returns 0, which the standard
+    // technically allows). A positive value pins that exact thread count --
+    // in particular 1 forces the old (pre-this-option) single-threaded
+    // behavior. Exists as a toggle/knob rather than silently always-on
+    // multithreading for two reasons: (1) it's the natural way to A/B
+    // "is a result different/worse because of this" against a
+    // single-threaded run of the SAME weights -- SPARSE_NORMAL_CHOLESKY's
+    // per-call Jacobian evaluation and sparse factorization can, in
+    // principle, sum floating-point contributions in a different order
+    // across threads than single-threaded, which (unlike the exact GN
+    // normal-equations assembly in the hand-rolled path) COULD make a
+    // multithreaded run's result not bit-identical to a single-threaded one
+    // even for the same inputs, though it should not be responsible for a
+    // qualitatively different (better/worse-LOOKING) result -- each
+    // ceres::Solve here re-solves an independent, freshly-snapshotted
+    // problem from scratch (see MeshOptimizerCeres.cpp's header comment on
+    // the freezing convention), so there's no cross-call state threading
+    // could disturb; and (2) some environments (a sandboxed CI runner, a
+    // machine already saturated by other work) may want to cap Ceres to
+    // fewer threads than the core count. Ignored entirely on the
+    // hand-rolled path (which has no threading of its own yet).
+    int ceresNumThreads = 0;
+
     // Opt-in: replace the hand-rolled geometry Gauss-Newton block (assembly
     // of H/g, our own sparse block CG, manual Levenberg damping and
     // backtracking) with a ceres::Problem solve, when this binary was built

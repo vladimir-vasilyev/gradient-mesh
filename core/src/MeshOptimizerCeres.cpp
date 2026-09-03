@@ -63,10 +63,18 @@ namespace {
 // this file's header comment), so there's no cross-call state that
 // threading could disturb -- SPARSE_NORMAL_CHOLESKY's Jacobian evaluation
 // and the sparse Cholesky factorization itself both parallelize internally
-// across whatever thread count Ceres is given. std::thread::hardware_concurrency()
-// can return 0 if it can't detect the core count (rare, but the standard
-// allows it); fall back to 1 rather than passing 0 to Ceres.
-int ceresNumThreads() {
+// across whatever thread count Ceres is given.
+//
+// See OptimizerOptions::ceresNumThreads for the full rationale of exposing
+// this as a runtime toggle rather than always silently maxing out cores:
+// requested==0 (the default) means "auto" -- use every core
+// std::thread::hardware_concurrency() reports, falling back to 1 rather
+// than passing 0 to Ceres if that returns 0 (rare, but the standard allows
+// it). A positive requested value pins exactly that many threads, in
+// particular 1 to force single-threaded for an apples-to-apples comparison
+// against a multithreaded run of the same weights.
+int resolveCeresNumThreads(int requested) {
+    if (requested > 0) return requested;
     unsigned n = std::thread::hardware_concurrency();
     return n > 0 ? (int)n : 1;
 }
@@ -1024,10 +1032,12 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
     options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
-    // See ceresNumThreads() above -- unset defaults to 1 thread, leaving
-    // every other core idle for the Jacobian evaluation and sparse Cholesky
-    // factorization SPARSE_NORMAL_CHOLESKY does internally.
-    options.num_threads = ceresNumThreads();
+    // See resolveCeresNumThreads() and OptimizerOptions::ceresNumThreads
+    // above -- unset (0, the default) uses every core, leaving none idle
+    // for the Jacobian evaluation and sparse Cholesky factorization
+    // SPARSE_NORMAL_CHOLESKY does internally; a positive value pins that
+    // exact thread count instead.
+    options.num_threads = resolveCeresNumThreads(opts.ceresNumThreads);
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -1205,11 +1215,12 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
     options.max_num_iterations = std::max(1, maxIters);
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
-    // See ceresNumThreads() above -- matters even more here than in
-    // ceresSolveOnce: the joint problem is 3x the unknowns/vertex (18 vs 6),
-    // so the Jacobian evaluation and sparse Cholesky factorization this
-    // parallelizes are proportionally larger too.
-    options.num_threads = ceresNumThreads();
+    // See resolveCeresNumThreads() and OptimizerOptions::ceresNumThreads
+    // above -- matters even more here than in ceresSolveOnce: the joint
+    // problem is 3x the unknowns/vertex (18 vs 6), so the Jacobian
+    // evaluation and sparse Cholesky factorization this parallelizes are
+    // proportionally larger too.
+    options.num_threads = resolveCeresNumThreads(opts.ceresNumThreads);
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);

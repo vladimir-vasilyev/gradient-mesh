@@ -155,6 +155,12 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (instancetype)init {
     if ((self = [super init])) {
         [self resetWeightsToDefaults];
+        // Default YES ("auto", every core) -- matches gmcore::OptimizerOptions::
+        // ceresNumThreads' own default of 0 ("auto"), NOT this BOOL property's
+        // own zero-value (which would be NO/single-threaded) -- see
+        // ceresMultithreaded's comment in DocumentModel.h for the YES/NO <->
+        // 0/1 mapping.
+        self.ceresMultithreaded = YES;
     }
     return self;
 }
@@ -544,6 +550,9 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // gating and the CLI's --use-ceres/--use-ceres-joint precedence.
     opts.useCeresGeometry = self.useCeresGeometry;
     opts.useCeresJoint = self.useCeresJoint;
+    // YES -> 0 ("auto", every core); NO -> 1 (pinned single-threaded) --
+    // see ceresMultithreaded's comment in DocumentModel.h.
+    opts.ceresNumThreads = self.ceresMultithreaded ? 0 : 1;
     // 0/unset -> 1: see DocumentModel.h's comment on this property.
     opts.pyramidRestarts = (int)std::max((NSInteger)1, self.pyramidRestarts);
     // Geometry/colour energy weights -- see DocumentModel.h's comment on
@@ -875,6 +884,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"geomDampingInitial": @(o.geomDampingInitial),
         @"useCeresGeometry": @(o.useCeresGeometry),
         @"useCeresJoint": @(o.useCeresJoint),
+        @"ceresNumThreads": @(o.ceresNumThreads),
         // Added late -- omitted from the first round of exported debug
         // JSONs (they predate this OptimizerOptions field), so its
         // absence there means "this build's default (0.3), not recorded",

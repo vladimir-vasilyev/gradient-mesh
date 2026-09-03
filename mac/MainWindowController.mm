@@ -29,6 +29,8 @@
 @property (nonatomic, strong) NSButton* autoDebugCheckbox;
 // Mirrors DocumentModel.useCIELUVColorSpace -- see -toggleCIELUV:.
 @property (nonatomic, strong) NSButton* cieluvCheckbox;
+// Mirrors DocumentModel.ceresMultithreaded -- see -toggleCeresMultithreaded:.
+@property (nonatomic, strong) NSButton* ceresMultithreadedCheckbox;
 // Geometry/colour energy-weight fields -- mirror DocumentModel's seven
 // properties of the same name 1:1 (see that header's comment). Read
 // straight into the model at the start of -optimize:, same pattern as
@@ -156,7 +158,17 @@
                                                   target:self action:@selector(toggleCIELUV:)];
     self.cieluvCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
 
-    for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox, self.cieluvCheckbox])
+    // Mirrors DocumentModel.ceresMultithreaded -- see -toggleCeresMultithreaded:
+    // and that property's own comment. Only affects the two Ceres solver
+    // modes (has no effect on hand-rolled, and no effect at all without a
+    // Ceres-enabled build) -- checked ON by default (every core), same as
+    // the behavior this toggle was added to make optional.
+    self.ceresMultithreadedCheckbox = [NSButton checkboxWithTitle:@"Multithread Ceres"
+                                                             target:self action:@selector(toggleCeresMultithreaded:)];
+    self.ceresMultithreadedCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    self.ceresMultithreadedCheckbox.state = NSControlStateValueOn;
+
+    for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox, self.cieluvCheckbox, self.ceresMultithreadedCheckbox])
         [controlsRow3 addSubview:v];
 
     // --- Row 4: geometry energy weights -- see DocumentModel.h's comment
@@ -467,6 +479,12 @@
     NSArray* names = @[@"hand-rolled", @"Ceres (geometry)", @"Ceres (joint)"];
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Solver set to %@. (Next “Optimize” run will use it.)",
                                      names[(NSUInteger)MAX(0, idx)]];
+}
+
+- (void)toggleCeresMultithreaded:(id)sender {
+    self.documentModel.ceresMultithreaded = (self.ceresMultithreadedCheckbox.state == NSControlStateValueOn);
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Ceres solves: %@. (Next “Optimize” run will use it; no effect on the hand-rolled solver.)",
+                                     self.documentModel.ceresMultithreaded ? @"multithreaded (every core)" : @"single-threaded"];
 }
 
 - (void)exportPNG:(id)sender {
