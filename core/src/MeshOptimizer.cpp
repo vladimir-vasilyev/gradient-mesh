@@ -2,6 +2,7 @@
 #include "gmcore/SparseBlockSolver.h"
 #include "gmcore/FergusonPatch.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -15,9 +16,15 @@ struct RowEntry { int vertex; int sub; double coeff; };
 // Accumulates one scalar Gauss-Newton residual row (r(x) ~ r0 + J*delta)
 // into the normal equations H*delta = g (g holds +J^T*(-r0), i.e. the
 // right-hand side such that solving gives the Gauss-Newton update step).
-void accumulateGNRow(SparseBlockMatrix& H, std::vector<double>& g, const std::vector<RowEntry>& row,
+// Pointer+count so the very hot per-sample call sites below (the geometry
+// data term's buildChanneled output and the vector-line term's rowU/rowV,
+// both always a fixed size, and solveColorExact's row) can pass a
+// stack-allocated std::array's .data()/.size() directly instead of first
+// heap-allocating a std::vector just to hold the same fixed-size data --
+// same entries, same iteration order, so results are bit-identical either
+// way; this only removes the allocation, not any computation.
+void accumulateGNRow(SparseBlockMatrix& H, std::vector<double>& g, const RowEntry* row, int n,
                       double r0, double weight) {
-    int n = (int)row.size();
     for (int i = 0; i < n; ++i) {
         const RowEntry& ei = row[i];
         g[ei.vertex * H.blockSize + ei.sub] += -weight * ei.coeff * r0;
@@ -34,6 +41,76 @@ void accumulateGNRow(SparseBlockMatrix& H, std::vector<double>& g, const std::ve
             }
         }
     }
+}
+
+// Convenience overload for the infrequent call sites (smoothness/tangent-
+// prior/boundary terms below -- once per vertex/triple per GN iteration,
+// not once per sample, so their own small std::vector allocation cost is
+// negligible) that still build a literal braced-init-list. Delegates to
+// the pointer+count version above so there's exactly one copy of the
+// actual accumulation logic to keep in sync.
+void accumulateGNRow(SparseBlockMatrix& H, std::vector<double>& g, const std::vector<RowEntry>& row,
+                      double r0, double weight) {
+    accumulateGNRow(H, g, row.data(), (int)row.size(), r0, weight);
+}
+
+// The (bi,bj) block-connectivity pattern of BOTH the geometry-GN normal
+// equations (SparseBlockMatrix blockSize=6, built in
+// optimizeAtCurrentResolution below) and solveColorExact's normal
+// equations (blockSize=4) is identical -- it depends only on which vertex
+// PAIRS ever co-occur in one accumulateGNRow call above, which for every
+// term in this file depends only on mesh TOPOLOGY (mesh.rows/mesh.cols),
+// never on vertex VALUES (position/color), which pyramid level this is,
+// or whether vector lines are present:
+//   - patch data term (and, when present, the vector-line term -- see its
+//     call site below, which touches the SAME 4 corner vertices as the
+//     data term for that same patch, never a different patch's): full
+//     clique among a patch's 4 corner vertices.
+//   - smoothness (addSmoothnessTerms): all pairs among each row/col
+//     second-difference triple (i0,i1,i2).
+//   - every other term (addTangentPriorTerms, the boundary normal-only
+//     constraint, colorDerivRidge, and the Levenberg damping loop) only
+//     ever touches a single vertex's own diagonal block -- covered
+//     unconditionally by the `for (i) addPair(i,i)` below regardless of
+//     which of those terms are actually active (e.g.
+//     geomTangentPriorWeight<=0 skips addTangentPriorTerms itself, but
+//     the diagonal block it WOULD have touched is already declared).
+// So this is the same for every GN sub-iteration and outer iteration at a
+// given resolution level (mesh.rows/cols don't change mid-level) --
+// building it once per optimizeAtCurrentResolution/solveColorExact call
+// and reusing it via SparseBlockMatrix::reserveBlocks is what lets every
+// later addScalar resolve its block via binary search instead of
+// inserting into a map on first touch.
+std::vector<std::pair<int,int>> buildMeshBlockPattern(const GradientMesh& mesh) {
+    std::vector<std::pair<int,int>> pairs;
+    pairs.reserve((size_t)mesh.vertices.size() + (size_t)(mesh.rows - 1) * (mesh.cols - 1) * 10 +
+                  (size_t)mesh.rows * mesh.cols * 3);
+    auto addPair = [&](int i, int j) {
+        if (i > j) std::swap(i, j);
+        pairs.emplace_back(i, j);
+    };
+    for (int i = 0; i < (int)mesh.vertices.size(); ++i) addPair(i, i);
+    for (int pr = 0; pr < mesh.rows - 1; ++pr) {
+        for (int pc = 0; pc < mesh.cols - 1; ++pc) {
+            int verts[4] = {mesh.idx(pr, pc), mesh.idx(pr + 1, pc), mesh.idx(pr, pc + 1), mesh.idx(pr + 1, pc + 1)};
+            for (int a = 0; a < 4; ++a)
+                for (int b = a; b < 4; ++b)
+                    addPair(verts[a], verts[b]);
+        }
+    }
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 1; c < mesh.cols - 1; ++c) {
+            int i0 = mesh.idx(r, c - 1), i1 = mesh.idx(r, c), i2 = mesh.idx(r, c + 1);
+            addPair(i0, i1); addPair(i1, i2); addPair(i0, i2);
+        }
+    }
+    for (int c = 0; c < mesh.cols; ++c) {
+        for (int r = 1; r < mesh.rows - 1; ++r) {
+            int i0 = mesh.idx(r - 1, c), i1 = mesh.idx(r, c), i2 = mesh.idx(r + 1, c);
+            addPair(i0, i1); addPair(i1, i2); addPair(i0, i2);
+        }
+    }
+    return pairs; // reserveBlocks() itself sorts+dedupes -- no need to do it twice.
 }
 
 double areaWeightAt(const GradientMesh& mesh, int pr, int pc, double u, double v, double duv) {
@@ -313,6 +390,7 @@ void solveColorExact(GradientMesh& mesh, const Image& target, const OptimizerOpt
 
     SparseBlockMatrix H;
     H.init(4, numV);
+    H.reserveBlocks(buildMeshBlockPattern(mesh)); // see that function's comment
     std::vector<double> gR(numV * 4, 0.0), gG(numV * 4, 0.0), gB(numV * 4, 0.0);
     std::vector<double> x0R(numV * 4), x0G(numV * 4), x0B(numV * 4);
     for (int i = 0; i < numV; ++i) {
@@ -335,22 +413,29 @@ void solveColorExact(GradientMesh& mesh, const Image& target, const OptimizerOpt
                     double w = areaWeightAt(mesh, pr, pc, u, v, duv);
                     PatchWeights pw = PatchWeights::at(u, v);
 
-                    std::vector<RowEntry> row;
-                    row.reserve(16);
+                    // Fixed size (4 corners * 4 color kinds), always fully
+                    // filled below -- std::array instead of the old
+                    // heap-allocated std::vector avoids an allocation on
+                    // every one of these (n+1)^2 samples per patch (this
+                    // loop's whole point is exact-solving color, so it
+                    // dominates solveColorExact's cost the same way the
+                    // data term dominates the geometry GN step).
+                    std::array<RowEntry, 16> row;
+                    int rowCount = 0;
                     for (int a = 0; a < 2; ++a) {
                         for (int b = 0; b < 2; ++b) {
                             int base = (a * 2 + b) * 4;
                             int vert = mesh.idx(pr + b, pc + a);
                             for (int k = 0; k < 4; ++k)
-                                row.push_back({vert, k, pw.w[base + k]});
+                                row[rowCount++] = {vert, k, pw.w[base + k]};
                         }
                     }
                     double r0R = cmesh.r - ctarget.r;
                     double r0G = cmesh.g - ctarget.g;
                     double r0B = cmesh.b - ctarget.b;
-                    accumulateGNRow(H, gR, row, r0R, w);
-                    accumulateGNRow(H, gG, row, r0G, w);
-                    accumulateGNRow(H, gB, row, r0B, w);
+                    accumulateGNRow(H, gR, row.data(), rowCount, r0R, w);
+                    accumulateGNRow(H, gG, row.data(), rowCount, r0G, w);
+                    accumulateGNRow(H, gB, row.data(), rowCount, r0B, w);
                 }
             }
         }
@@ -532,6 +617,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
 
             SparseBlockMatrix H;
             H.init(6, numV);
+            H.reserveBlocks(buildMeshBlockPattern(mesh)); // see that function's comment
             std::vector<double> g(numV * 6, 0.0);
             std::vector<Vec2> P(numV), Pu(numV), Pv(numV);
             for (int i = 0; i < numV; ++i) {
@@ -564,29 +650,48 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                             // mean "which sub-pair" (0/1/2), not a literal
                             // block sub-index (buildChanneled below expands
                             // it to the real x/y sub-indices).
-                            std::vector<RowEntry> rowCorners;
-                            rowCorners.reserve(12);
+                            // Fixed size (4 corners * 3 free Hermite kinds),
+                            // always fully filled below -- std::array
+                            // instead of a heap-allocated std::vector: this
+                            // is the single hottest loop in the whole
+                            // optimizer (patches * samples * GN sub-iters *
+                            // outer iters * pyramid levels), so avoiding an
+                            // allocation here (and the 3 more below, one per
+                            // color channel via buildChanneled) matters far
+                            // more than anywhere else this same pattern
+                            // appears in this file.
+                            std::array<RowEntry, 12> rowCorners;
+                            int rcCount = 0;
                             for (int a = 0; a < 2; ++a) {
                                 for (int b = 0; b < 2; ++b) {
                                     int base = (a * 2 + b) * 4;
                                     int vert = mesh.idx(pr + b, pc + a);
-                                    rowCorners.push_back({vert, 0, pw.w[base + 0]}); // P
-                                    rowCorners.push_back({vert, 1, pw.w[base + 1]}); // Pu
-                                    rowCorners.push_back({vert, 2, pw.w[base + 2]}); // Pv
+                                    rowCorners[rcCount++] = {vert, 0, pw.w[base + 0]}; // P
+                                    rowCorners[rcCount++] = {vert, 1, pw.w[base + 1]}; // Pu
+                                    rowCorners[rcCount++] = {vert, 2, pw.w[base + 2]}; // Pv
                                 }
                             }
                             double r0r = cmesh.r - ctarget.r;
                             double r0g = cmesh.g - ctarget.g;
                             double r0b = cmesh.b - ctarget.b;
 
+                            // Returns a stack-allocated (not heap) array --
+                            // same 24 entries, same order as the old
+                            // std::vector version, just without the heap
+                            // round-trip. .data() on the returned-by-value
+                            // temporary is valid for the lifetime of the
+                            // accumulateGNRow call it's passed into (the
+                            // temporary lives until the end of that full
+                            // expression).
                             auto buildChanneled = [&](double gx, double gy) {
-                                std::vector<RowEntry> row;
-                                row.reserve(rowCorners.size() * 2);
-                                for (auto& rc : rowCorners) {
+                                std::array<RowEntry, 24> row;
+                                int n2 = 0;
+                                for (int k = 0; k < rcCount; ++k) {
+                                    const RowEntry& rc = rowCorners[k];
                                     int subX = rc.sub * 2 + 0;
                                     int subY = rc.sub * 2 + 1;
-                                    row.push_back({rc.vertex, subX, -gx * rc.coeff});
-                                    row.push_back({rc.vertex, subY, -gy * rc.coeff});
+                                    row[n2++] = {rc.vertex, subX, -gx * rc.coeff};
+                                    row[n2++] = {rc.vertex, subY, -gy * rc.coeff};
                                 }
                                 return row;
                             };
@@ -594,9 +699,9 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                             // OptimizerOptions::geomDataWeight's comment -- not the
                             // vector-line term just below, which has its own weight.
                             double wData = w * opts.geomDataWeight;
-                            accumulateGNRow(H, g, buildChanneled(grad.dx.r, grad.dy.r), r0r, wData);
-                            accumulateGNRow(H, g, buildChanneled(grad.dx.g, grad.dy.g), r0g, wData);
-                            accumulateGNRow(H, g, buildChanneled(grad.dx.b, grad.dy.b), r0b, wData);
+                            accumulateGNRow(H, g, buildChanneled(grad.dx.r, grad.dy.r).data(), 24, r0r, wData);
+                            accumulateGNRow(H, g, buildChanneled(grad.dx.g, grad.dy.g).data(), 24, r0g, wData);
+                            accumulateGNRow(H, g, buildChanneled(grad.dx.b, grad.dy.b).data(), 24, r0b, wData);
 
                             // Vector-line guided term (Sec 4.2): penalizes
                             // the component of the ANALYTIC surface tangent
@@ -623,31 +728,45 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
                                     double weight = opts.vectorLineWeight * match.weight;
                                     double ru = dU.cross(match.dir);
                                     double rv = dV.cross(match.dir);
-                                    std::vector<RowEntry> rowU, rowV;
-                                    rowU.reserve(12);
-                                    rowV.reserve(12);
+                                    // Fixed size (4 corners * 6 subs = 24),
+                                    // always fully filled below -- same
+                                    // std::array-instead-of-std::vector
+                                    // rationale as rowCorners/buildChanneled
+                                    // above (this term runs at the same
+                                    // per-sample frequency as the data term
+                                    // whenever vector lines are in use).
+                                    // NOTE: this was originally (wrongly)
+                                    // sized 12, silently overflowing by 12
+                                    // RowEntry writes past the end of each
+                                    // array on every sample once the b/a
+                                    // loop below reached its 3rd/4th corner
+                                    // -- caught by -Wall's "iteration 1
+                                    // invokes undefined behavior" warning
+                                    // and fixed before this refactor shipped.
+                                    std::array<RowEntry, 24> rowU, rowV;
+                                    int ruCount = 0, rvCount = 0;
                                     for (int a = 0; a < 2; ++a) {
                                         for (int b = 0; b < 2; ++b) {
                                             int base = (a * 2 + b) * 4;
                                             int vert = mesh.idx(pr + b, pc + a);
                                             double wuP = pw.wu[base + 0], wuPu = pw.wu[base + 1], wuPv = pw.wu[base + 2];
                                             double wvP = pw.wv[base + 0], wvPu = pw.wv[base + 1], wvPv = pw.wv[base + 2];
-                                            rowU.push_back({vert, 0,  wuP  * match.dir.y});
-                                            rowU.push_back({vert, 1, -wuP  * match.dir.x});
-                                            rowU.push_back({vert, 2,  wuPu * match.dir.y});
-                                            rowU.push_back({vert, 3, -wuPu * match.dir.x});
-                                            rowU.push_back({vert, 4,  wuPv * match.dir.y});
-                                            rowU.push_back({vert, 5, -wuPv * match.dir.x});
-                                            rowV.push_back({vert, 0,  wvP  * match.dir.y});
-                                            rowV.push_back({vert, 1, -wvP  * match.dir.x});
-                                            rowV.push_back({vert, 2,  wvPu * match.dir.y});
-                                            rowV.push_back({vert, 3, -wvPu * match.dir.x});
-                                            rowV.push_back({vert, 4,  wvPv * match.dir.y});
-                                            rowV.push_back({vert, 5, -wvPv * match.dir.x});
+                                            rowU[ruCount++] = {vert, 0,  wuP  * match.dir.y};
+                                            rowU[ruCount++] = {vert, 1, -wuP  * match.dir.x};
+                                            rowU[ruCount++] = {vert, 2,  wuPu * match.dir.y};
+                                            rowU[ruCount++] = {vert, 3, -wuPu * match.dir.x};
+                                            rowU[ruCount++] = {vert, 4,  wuPv * match.dir.y};
+                                            rowU[ruCount++] = {vert, 5, -wuPv * match.dir.x};
+                                            rowV[rvCount++] = {vert, 0,  wvP  * match.dir.y};
+                                            rowV[rvCount++] = {vert, 1, -wvP  * match.dir.x};
+                                            rowV[rvCount++] = {vert, 2,  wvPu * match.dir.y};
+                                            rowV[rvCount++] = {vert, 3, -wvPu * match.dir.x};
+                                            rowV[rvCount++] = {vert, 4,  wvPv * match.dir.y};
+                                            rowV[rvCount++] = {vert, 5, -wvPv * match.dir.x};
                                         }
                                     }
-                                    accumulateGNRow(H, g, rowU, ru, weight);
-                                    accumulateGNRow(H, g, rowV, rv, weight);
+                                    accumulateGNRow(H, g, rowU.data(), ruCount, ru, weight);
+                                    accumulateGNRow(H, g, rowV.data(), rvCount, rv, weight);
                                 }
                             }
                         }
@@ -676,9 +795,9 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
 
             // Levenberg damping (scale-aware: proportional to each diagonal entry).
             for (int i = 0; i < numV; ++i) {
-                auto it = H.blocks.find(SparseBlockMatrix::key(i, i));
+                const double* diag = H.findBlock(i, i);
                 for (int k = 0; k < 6; ++k) {
-                    double dk = (it != H.blocks.end()) ? it->second[k * 6 + k] : 1.0;
+                    double dk = diag ? diag[k * 6 + k] : 1.0;
                     H.addScalar(i, i, k, k, lambda * std::max(dk, 1e-6));
                 }
             }
