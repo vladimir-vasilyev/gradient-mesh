@@ -311,6 +311,67 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // history and default-constructed optimizerOptions).
 - (BOOL)exportDebugDataToURL:(NSURL*)url error:(NSError**)error;
 
+// --- Presets ---
+// A preset captures exactly the settings the LAST completed
+// -optimizeWithPyramidLevels:progress:completion: run used -- the same
+// seven weight properties, solver choice, pyramidRestarts/ceresNumThreads,
+// and colour space -exportDebugDataToURL:error:'s own "optimizerOptions"/
+// "colorSpace" fields already carry (same source: _lastOptsUsed/
+// _meshColorSpaceIsCIELUV, snapshotted at that run's start, not whatever
+// may have been typed into the UI since) -- plus that run's mesh
+// dimensions, as a small standalone JSON file that can be reloaded later,
+// on this image or a different one, without retyping every field by hand.
+// Deliberately does NOT capture the mesh itself, the boundary, or vector
+// lines -- those are per-image content, not a reusable "setting". Requires
+// a completed run (mirrors exportDebugDataToURL:error:'s _mesh guard, but
+// on _hasRunOptimize instead -- an unoptimized initial mesh has no
+// meaningful "settings that produced this result" yet); returns NO with an
+// error otherwise.
+- (BOOL)savePresetToURL:(NSURL*)url error:(NSError**)error;
+
+// Sibling "Presets" folder next to the currently loaded image, creating it
+// if needed -- same convention (and same nil cases: no loaded image, or
+// the folder couldn't be created) as -debugOutDirectoryURL.
+- (nullable NSURL*)presetsDirectoryURL;
+
+// "gm_preset_<solver>[_cieluv]_<rows>x<cols>_<timestamp>.json" -- the exact
+// same naming convention -debugExportFilename uses for its debug JSONs
+// (see that method's comment for the full rationale), just "preset"
+// instead of "debug", so a preset's filename is legible at a glance the
+// same way a debug log's already is.
+- (NSString*)presetExportFilename;
+
+// Every ".json" file currently in -presetsDirectoryURL, newest first, as
+// display names (WITHOUT the ".json" extension -- pass this same string to
+// -loadPresetNamed:rows:cols:error: to load one back). Empty (not nil) if
+// there's no image loaded yet or the folder doesn't exist/has nothing in
+// it. Re-scans the folder every call -- presets are small and infrequent,
+// and this is only ever called right before populating a menu, so there's
+// no reason to cache.
+- (NSArray<NSString*>*)availablePresetNames;
+
+// Loads the preset previously saved as `name` (see -availablePresetNames,
+// same string, no ".json") back onto this DocumentModel's live properties
+// (the seven weights, solver choice, pyramidRestarts, ceresMultithreaded,
+// useCIELUVColorSpace) -- exactly the settings -savePresetToURL:error:
+// captured, applied the same way a user typing them in by hand would be:
+// takes effect on the NEXT "Optimize" (and, for useCIELUVColorSpace, the
+// next "Build Initial Mesh" -- see that property's own doc comment;
+// loading a preset does NOT retroactively touch an already-built mesh).
+// outRows/outCols (if non-NULL) receive the preset's saved mesh
+// dimensions, since Rows/Cols are plain UI text fields, not DocumentModel
+// properties -- for MainWindowController to copy them in itself, same
+// pattern as -findNearestVertexToPoint:maxDistance:row:col:'s out-params.
+// Returns NO with an error if `name` doesn't match a file in
+// -presetsDirectoryURL or it couldn't be parsed.
+- (BOOL)loadPresetNamed:(NSString*)name rows:(NSInteger*)outRows cols:(NSInteger*)outCols
+                   error:(NSError**)error;
+
+// Full path of the most recent successful -savePresetToURL:error: call, or
+// nil if none has happened yet in this session -- same convention as
+// lastDebugExportPath, for MainWindowController's status bar.
+@property (nonatomic, readonly, nullable) NSString* lastPresetSavePath;
+
 @end
 
 NS_ASSUME_NONNULL_END

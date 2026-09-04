@@ -3,7 +3,7 @@
 #import "DocumentModel.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-@interface MainWindowController () <NSWindowDelegate>
+@interface MainWindowController () <NSWindowDelegate, NSMenuDelegate>
 @property (nonatomic, strong) DocumentModel* documentModel;
 @property (nonatomic, strong) CanvasView* canvasView;
 @property (nonatomic, strong) NSSegmentedControl* toolSegmented;
@@ -42,6 +42,13 @@
 @property (nonatomic, strong) NSTextField* vectorLineWeightField;
 @property (nonatomic, strong) NSTextField* smoothWeightColorField;
 @property (nonatomic, strong) NSTextField* colorDerivRidgeField;
+// Small sidebar to the right of canvasView (see -buildUI's canvasRow) --
+// "Save Preset…" snapshots the settings the last completed Optimize run
+// used (see DocumentModel -savePresetToURL:error:); the popup below it
+// lists+loads any preset previously saved next to the current image. See
+// -savePreset:/-presetsPopupWillOpen:/-presetSelected:.
+@property (nonatomic, strong) NSButton* savePresetButton;
+@property (nonatomic, strong) NSPopUpButton* presetsPopup;
 @end
 
 @implementation MainWindowController
@@ -225,26 +232,70 @@
     self.canvasView.documentModel = self.documentModel;
     [self wireCanvasCallbacks];
 
+    // --- Preset sidebar, next to the canvas (see canvasRow below) ---
+    // "Save Preset…" writes the LAST completed Optimize run's settings
+    // (DocumentModel -savePresetToURL:error:) to a timestamped JSON in a
+    // "Presets" folder next to the loaded image, named the same way
+    // -autoExportDebugData's log files are (see -savePreset:). The popup
+    // below it lists (newest first) + loads any preset already saved next
+    // to the current image -- its items are rebuilt from
+    // -availablePresetNames right before it opens (see -menuNeedsUpdate:),
+    // so a preset saved a moment ago always shows up without relaunching.
+    self.savePresetButton = [self buttonTitled:@"Save Preset…" action:@selector(savePreset:)];
+    self.presetsPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:YES];
+    self.presetsPopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.presetsPopup addItemWithTitle:@"Load Preset…"];
+    self.presetsPopup.target = self;
+    self.presetsPopup.action = @selector(presetSelected:);
+    self.presetsPopup.menu.delegate = self;
+
+    NSView* presetSidebar = [[NSView alloc] initWithFrame:NSZeroRect];
+    presetSidebar.translatesAutoresizingMaskIntoConstraints = NO;
+    [presetSidebar addSubview:self.savePresetButton];
+    [presetSidebar addSubview:self.presetsPopup];
+    [self.savePresetButton.topAnchor constraintEqualToAnchor:presetSidebar.topAnchor constant:8].active = YES;
+    [self.savePresetButton.leadingAnchor constraintEqualToAnchor:presetSidebar.leadingAnchor].active = YES;
+    [self.savePresetButton.trailingAnchor constraintEqualToAnchor:presetSidebar.trailingAnchor].active = YES;
+    [self.presetsPopup.topAnchor constraintEqualToAnchor:self.savePresetButton.bottomAnchor constant:6].active = YES;
+    [self.presetsPopup.leadingAnchor constraintEqualToAnchor:presetSidebar.leadingAnchor].active = YES;
+    [self.presetsPopup.trailingAnchor constraintEqualToAnchor:presetSidebar.trailingAnchor].active = YES;
+
+    // canvasRow: canvasView + presetSidebar side by side, replacing
+    // canvasView's old direct placement in the outer vertical stack below
+    // -- everything about canvasView itself (documentModel, callbacks,
+    // CanvasView's own drawing) is unchanged, it just now shares its row
+    // with the sidebar instead of spanning the full window width.
+    NSView* canvasRow = [[NSView alloc] initWithFrame:NSZeroRect];
+    canvasRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [canvasRow addSubview:self.canvasView];
+    [canvasRow addSubview:presetSidebar];
+    NSDictionary* canvasRowViews = NSDictionaryOfVariableBindings(_canvasView, presetSidebar);
+    [canvasRow addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-8-[presetSidebar(150)]-8-|"
+                                                                       options:0 metrics:nil views:canvasRowViews]];
+    [self.canvasView.topAnchor constraintEqualToAnchor:canvasRow.topAnchor].active = YES;
+    [self.canvasView.bottomAnchor constraintEqualToAnchor:canvasRow.bottomAnchor].active = YES;
+    [presetSidebar.topAnchor constraintEqualToAnchor:canvasRow.topAnchor].active = YES;
+
     [content addSubview:controlsRow1];
     [content addSubview:controlsRow2];
     [content addSubview:controlsRow3];
     [content addSubview:controlsRow4];
     [content addSubview:controlsRow5];
-    [content addSubview:self.canvasView];
+    [content addSubview:canvasRow];
     [content addSubview:self.statusLabel];
 
     NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow2, controlsRow3, controlsRow4,
-                                                           controlsRow5, _canvasView, _statusLabel);
+                                                           controlsRow5, canvasRow, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow3]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow4]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow5]-8-|" options:0 metrics:nil views:views]];
-    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-0-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[canvasRow]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
         @"V:|-8-[controlsRow1(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
-        "-6-[_canvasView]-4-[_statusLabel(18)]-6-|"
+        "-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
@@ -548,6 +599,68 @@
     self.smoothWeightColorField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightColor];
     self.colorDerivRidgeField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.colorDerivRidge];
     self.statusLabel.stringValue = @"Geometry/color weights reset to defaults. Takes effect on the next “Optimize” click.";
+}
+
+- (void)savePreset:(id)sender {
+    if (!self.documentModel.hasImage) { self.statusLabel.stringValue = @"Open an image first."; return; }
+    NSURL* dir = [self.documentModel presetsDirectoryURL];
+    if (!dir) { self.statusLabel.stringValue = @"Could not create/find a Presets folder next to the image."; return; }
+    NSURL* url = [dir URLByAppendingPathComponent:[self.documentModel presetExportFilename]];
+    NSError* error = nil;
+    if (![self.documentModel savePresetToURL:url error:&error]) {
+        [self presentError:error];
+        return;
+    }
+    self.statusLabel.stringValue = [NSString stringWithFormat:@"Saved preset: %@", url.lastPathComponent];
+}
+
+// NSMenuDelegate: rebuilds self.presetsPopup's item list from
+// -availablePresetNames right before the popup opens, so a preset saved a
+// moment ago (this session, or by hand outside it) always shows up without
+// a relaunch. Keeps item 0 ("Load Preset…" -- a pull-down's always-shown
+// label, never itself a loadable preset) and replaces everything after it.
+- (void)menuNeedsUpdate:(NSMenu*)menu {
+    if (menu != self.presetsPopup.menu) return;
+    while (menu.numberOfItems > 1) [menu removeItemAtIndex:1];
+    for (NSString* name in [self.documentModel availablePresetNames]) {
+        [menu addItemWithTitle:name action:nil keyEquivalent:@""];
+    }
+}
+
+// self.presetsPopup is a PULL-DOWN (pullsDown:YES, see -buildUI): item 0's
+// title is always what's displayed, and clicking ANY item (including item
+// 0 itself) fires this action with -indexOfSelectedItem telling us which
+// one -- the standard AppKit idiom for a pull-down "menu of actions" button
+// (same reason self.solverPopup -- a NORMAL, pullsDown:NO popup that DOES
+// persist the picked item as its displayed title -- doesn't need this
+// index<=0 guard in -solverChanged:).
+- (void)presetSelected:(id)sender {
+    NSInteger idx = self.presetsPopup.indexOfSelectedItem;
+    if (idx <= 0) return; // the "Load Preset…" label itself, not a real preset
+    NSString* name = [self.presetsPopup itemTitleAtIndex:idx];
+    NSInteger rows = 0, cols = 0;
+    NSError* error = nil;
+    if (![self.documentModel loadPresetNamed:name rows:&rows cols:&cols error:&error]) {
+        [self presentError:error];
+        return;
+    }
+    if (rows > 0) self.rowsField.integerValue = rows;
+    if (cols > 0) self.colsField.integerValue = cols;
+    // Mirror every field/control this preset touched -- same pattern
+    // -resetWeights: already uses for the seven weight fields.
+    self.smoothWeightGeomField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom];
+    self.geomDataWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomDataWeight];
+    self.boundaryWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight];
+    self.geomTangentPriorWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomTangentPriorWeight];
+    self.vectorLineWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight];
+    self.smoothWeightColorField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightColor];
+    self.colorDerivRidgeField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.colorDerivRidge];
+    NSInteger solverIdx = self.documentModel.useCeresJoint ? 2 : self.documentModel.useCeresGeometry ? 1 : 0;
+    [self.solverPopup selectItemAtIndex:solverIdx];
+    self.ceresMultithreadedCheckbox.state = self.documentModel.ceresMultithreaded ? NSControlStateValueOn : NSControlStateValueOff;
+    self.cieluvCheckbox.state = self.documentModel.useCIELUVColorSpace ? NSControlStateValueOn : NSControlStateValueOff;
+    self.statusLabel.stringValue = [NSString stringWithFormat:
+        @"Loaded preset “%@”. Takes effect on the next “Optimize” (and, for CIELUV, the next “Build Initial Mesh”).", name];
 }
 
 - (void)presentError:(NSError*)error {

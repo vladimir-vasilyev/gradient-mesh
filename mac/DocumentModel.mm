@@ -134,6 +134,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 }
 @property (nonatomic, strong, nullable) NSImage* displayImage;
 @property (nonatomic, strong, nullable) NSString* lastDebugExportPath;
+@property (nonatomic, strong, nullable) NSString* lastPresetSavePath;
 // The Image that -buildInitialMeshRows:cols:/-optimizeWithPyramidLevels:...
 // should actually fit against: _target (sRGB) or _targetLUV (CIELUV),
 // chosen by the LIVE useCIELUVColorSpace property. Only ever consulted at
@@ -952,6 +953,175 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     BOOL ok = [data writeToURL:url options:NSDataWritingAtomic error:&jsonErr];
     if (!ok && error) *error = jsonErr ?: gmError(@"Could not write debug data file.");
     return ok;
+}
+
+#pragma mark - Presets
+
+// Sibling "Presets" folder next to the currently loaded image -- see
+// -debugOutDirectoryURL above, which this is a direct copy of (down to the
+// nil cases) with only the folder name changed.
+- (nullable NSURL*)presetsDirectoryURL {
+    if (!_imageURL) return nil;
+    NSURL* dir = [[_imageURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"Presets" isDirectory:YES];
+    NSError* mkdirErr = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtURL:dir withIntermediateDirectories:YES
+                                                     attributes:nil error:&mkdirErr]) {
+        NSLog(@"[GMCORE] presets: could not create Presets folder at %@: %@", dir, mkdirErr);
+        return nil;
+    }
+    return dir;
+}
+
+// Same "<solver>[_cieluv]_<rows>x<cols>_<timestamp>" convention as
+// -debugExportFilename (see that method's comment), "preset" instead of
+// "debug".
+- (NSString*)presetExportFilename {
+    NSString* solverTag = self.useCeresJoint ? @"ceres_joint" : self.useCeresGeometry ? @"ceres_geom" : @"hand_rolled";
+    NSString* colorSpaceTag = _meshColorSpaceIsCIELUV ? @"_cieluv" : @"";
+    static NSDateFormatter* fmt;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyyMMdd-HHmmss-SSS";
+    });
+    NSString* stamp = [fmt stringFromDate:[NSDate date]];
+    return [NSString stringWithFormat:@"gm_preset_%@%@_%ldx%ld_%@.json", solverTag, colorSpaceTag,
+            (long)self.meshRows, (long)self.meshCols, stamp];
+}
+
+// See DocumentModel.h's comment: same source data (_lastOptsUsed,
+// _meshColorSpaceIsCIELUV) as -exportDebugDataToURL:error:'s
+// "optimizerOptions"/"colorSpace" fields, same key names too (so a saved
+// preset and a debug log's optimizerOptions block are directly
+// eyeball-comparable) -- just without the mesh/history/git noise a debug
+// dump also carries, since a preset is only ever meant to be re-loaded as
+// settings, not inspected as a run record.
+- (BOOL)savePresetToURL:(NSURL*)url error:(NSError**)error {
+    if (!_hasRunOptimize) {
+        if (error) *error = gmError(@"Run Optimize at least once before saving a preset.");
+        return NO;
+    }
+
+    NSMutableDictionary* root = [NSMutableDictionary dictionary];
+    root[@"kind"] = @"GradientMeshStudioPreset";
+    if (@available(macOS 10.12, *)) {
+        NSISO8601DateFormatter* iso = [[NSISO8601DateFormatter alloc] init];
+        root[@"savedAt"] = [iso stringFromDate:[NSDate date]];
+    }
+    root[@"colorSpace"] = _meshColorSpaceIsCIELUV ? @"CIELUV" : @"sRGB";
+    root[@"meshRows"] = @(self.meshRows);
+    root[@"meshCols"] = @(self.meshCols);
+    // For context when browsing saved presets later -- NOT reapplied by
+    // -loadPresetNamed:rows:cols:error: (a preset restores SETTINGS, not a
+    // remembered result; the numbers themselves depend on the image too).
+    root[@"lastRMSE"] = @(_lastRMSE);
+    root[@"lastMAE"] = @(_lastMAE);
+
+    const OptimizerOptions& o = _lastOptsUsed;
+    root[@"optimizerOptions"] = @{
+        @"samplesPerPatchEdge": @(o.samplesPerPatchEdge),
+        @"smoothWeightGeom": @(o.smoothWeightGeom),
+        @"smoothGeomEdgeGain": @(o.smoothGeomEdgeGain),
+        @"smoothGeomMinFactor": @(o.smoothGeomMinFactor),
+        @"geomDataWeight": @(o.geomDataWeight),
+        @"smoothWeightColor": @(o.smoothWeightColor),
+        @"colorDerivRidge": @(o.colorDerivRidge),
+        @"boundaryWeight": @(o.boundaryWeight),
+        @"vectorLineWeight": @(o.vectorLineWeight),
+        @"vectorLineInfluenceRadius": @(o.vectorLineInfluenceRadius),
+        @"geomTangentPriorWeight": @(o.geomTangentPriorWeight),
+        @"outerIterationsPerLevel": @(o.outerIterationsPerLevel),
+        @"outerConvergenceRelTol": @(o.outerConvergenceRelTol),
+        @"outerConvergencePatience": @(o.outerConvergencePatience),
+        @"pyramidRestarts": @(o.pyramidRestarts),
+        @"geomGaussNewtonItersPerOuter": @(o.geomGaussNewtonItersPerOuter),
+        @"cgMaxIterations": @(o.cgMaxIterations),
+        @"cgRelTolerance": @(o.cgRelTolerance),
+        @"geomDampingInitial": @(o.geomDampingInitial),
+        @"useCeresGeometry": @(o.useCeresGeometry),
+        @"useCeresJoint": @(o.useCeresJoint),
+        @"ceresNumThreads": @(o.ceresNumThreads),
+        @"jointGeomStepDampingWeight": @(o.jointGeomStepDampingWeight),
+    };
+
+    NSError* jsonErr = nil;
+    NSData* data = [NSJSONSerialization dataWithJSONObject:root
+                                                     options:(NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys)
+                                                       error:&jsonErr];
+    if (!data) { if (error) *error = jsonErr ?: gmError(@"Could not serialize preset."); return NO; }
+    BOOL ok = [data writeToURL:url options:NSDataWritingAtomic error:&jsonErr];
+    if (ok) {
+        self.lastPresetSavePath = url.path;
+    } else if (error) {
+        *error = jsonErr ?: gmError(@"Could not write preset file.");
+    }
+    return ok;
+}
+
+- (NSArray<NSString*>*)availablePresetNames {
+    NSURL* dir = [self presetsDirectoryURL];
+    if (!dir) return @[];
+    NSArray<NSURL*>* contents = [[NSFileManager defaultManager] contentsOfDirectoryAtURL:dir
+                                                                includingPropertiesForKeys:@[NSURLContentModificationDateKey]
+                                                                                   options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                                     error:nil];
+    if (!contents) return @[];
+    NSArray<NSURL*>* jsonFiles = [contents filteredArrayUsingPredicate:
+        [NSPredicate predicateWithBlock:^BOOL(NSURL* u, NSDictionary* __unused bindings) {
+            return [u.pathExtension.lowercaseString isEqualToString:@"json"];
+        }]];
+    NSArray<NSURL*>* sorted = [jsonFiles sortedArrayUsingComparator:^NSComparisonResult(NSURL* a, NSURL* b) {
+        NSDate* da = nil; NSDate* db = nil;
+        [a getResourceValue:&da forKey:NSURLContentModificationDateKey error:nil];
+        [b getResourceValue:&db forKey:NSURLContentModificationDateKey error:nil];
+        return [(db ?: [NSDate distantPast]) compare:(da ?: [NSDate distantPast])]; // newest first
+    }];
+    NSMutableArray<NSString*>* names = [NSMutableArray arrayWithCapacity:sorted.count];
+    for (NSURL* u in sorted) [names addObject:u.lastPathComponent.stringByDeletingPathExtension];
+    return names;
+}
+
+- (BOOL)loadPresetNamed:(NSString*)name rows:(NSInteger*)outRows cols:(NSInteger*)outCols
+                   error:(NSError**)error {
+    NSURL* dir = [self presetsDirectoryURL];
+    if (!dir) { if (error) *error = gmError(@"No Presets folder yet (load an image first)."); return NO; }
+    NSURL* url = [dir URLByAppendingPathComponent:[name stringByAppendingPathExtension:@"json"]];
+    NSData* data = [NSData dataWithContentsOfURL:url options:0 error:error];
+    if (!data) return NO;
+    NSError* jsonErr = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
+    if (![parsed isKindOfClass:[NSDictionary class]]) {
+        if (error) *error = jsonErr ?: gmError(@"Preset file is not valid JSON.");
+        return NO;
+    }
+    NSDictionary* root = (NSDictionary*)parsed;
+    NSDictionary* o = root[@"optimizerOptions"];
+    if (![o isKindOfClass:[NSDictionary class]]) {
+        if (error) *error = gmError(@"Preset is missing its optimizerOptions.");
+        return NO;
+    }
+
+    self.smoothWeightGeom = [o[@"smoothWeightGeom"] doubleValue];
+    self.smoothWeightColor = [o[@"smoothWeightColor"] doubleValue];
+    self.colorDerivRidge = [o[@"colorDerivRidge"] doubleValue];
+    self.boundaryWeight = [o[@"boundaryWeight"] doubleValue];
+    self.geomTangentPriorWeight = [o[@"geomTangentPriorWeight"] doubleValue];
+    self.vectorLineWeight = [o[@"vectorLineWeight"] doubleValue];
+    self.geomDataWeight = [o[@"geomDataWeight"] doubleValue];
+    self.pyramidRestarts = [o[@"pyramidRestarts"] integerValue];
+    self.useCeresGeometry = [o[@"useCeresGeometry"] boolValue];
+    self.useCeresJoint = [o[@"useCeresJoint"] boolValue];
+    // ceresNumThreads' YES/NO <-> 0/1 mapping -- see ceresMultithreaded's
+    // comment in DocumentModel.h: 0 or absent (an older preset) -> YES
+    // ("auto", this property's own default); any pinned positive value ->
+    // NO.
+    self.ceresMultithreaded = (o[@"ceresNumThreads"] == nil || [o[@"ceresNumThreads"] integerValue] == 0);
+    self.useCIELUVColorSpace = [root[@"colorSpace"] isEqualToString:@"CIELUV"];
+
+    if (outRows) *outRows = [root[@"meshRows"] integerValue];
+    if (outCols) *outCols = [root[@"meshCols"] integerValue];
+    return YES;
 }
 
 @end
