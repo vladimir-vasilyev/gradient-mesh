@@ -331,17 +331,35 @@ public:
     }
 
     bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override {
-        GradientMesh mesh = snapshot_;
+        // Build the 4 corners' Hermite data directly from `parameters` --
+        // NO full-mesh copy needed. evalHermitePatch (FergusonPatch.h)
+        // only ever reads these 4 corners' P/Pu/Pv/Puv, never anything
+        // else about the mesh -- see GradientMesh::evalPos/geomCorner,
+        // which do exactly this same 4-corner gather internally. Color is
+        // NOT a parameter of this cost function (only geometry is, here --
+        // see JointPatchDataCostFunction below for the version where color
+        // is live too), so it's read straight from snapshot_ instead of a
+        // copy of it: mesh.evalColor(...) below was always numerically
+        // identical to snapshot_.evalColor(...) since nothing ever wrote
+        // to C/Cu/Cv/Cuv in the old copy.
+        //
+        // This replaces `GradientMesh mesh = snapshot_;` -- a full
+        // heap-allocating copy of EVERY vertex in the mesh (all rows*cols
+        // of them, not just this patch's 4 corners) -- done on every
+        // single Evaluate() call. This is the hottest CostFunction in the
+        // whole Ceres problem (one data term per patch, evaluated on every
+        // residual/Jacobian pass Ceres makes), so that copy's cost was
+        // multiplied by patch count * every LM iteration * every GN
+        // sub-iteration * every outer iteration * every pyramid level.
+        HermiteCorner<Vec2> corners[2][2];
         for (int a = 0; a < 2; ++a) {
             for (int b = 0; b < 2; ++b) {
                 int k = a * 2 + b;
-                int vert = mesh.idx(pr_ + b, pc_ + a);
                 const double* p = parameters[k];
-                mesh.vertices[vert].P  = {p[0], p[1]};
-                mesh.vertices[vert].Pu = {p[2], p[3]};
-                mesh.vertices[vert].Pv = {p[4], p[5]};
-                // Puv left at snapshot's value -- always {0,0}, fixed, not a
-                // parameter (see GradientMesh.h / geomCorner()).
+                corners[a][b].P   = {p[0], p[1]};
+                corners[a][b].Pu  = {p[2], p[3]};
+                corners[a][b].Pv  = {p[4], p[5]};
+                corners[a][b].Puv = {0, 0}; // fixed, not a parameter -- see geomCorner()
             }
         }
 
@@ -357,8 +375,8 @@ public:
             double v = double(i) / n_;
             for (int j = 0; j <= n_; ++j, row += 3) {
                 double u = double(j) / n_;
-                Vec2 pos = mesh.evalPos(pr_, pc_, u, v);
-                Color cmesh = mesh.evalColor(pr_, pc_, u, v);
+                Vec2 pos = evalHermitePatch<Vec2>(corners, u, v);
+                Color cmesh = snapshot_.evalColor(pr_, pc_, u, v);
                 Color ctarget = target_.sampleBilinear(pos.x, pos.y);
                 ColorGrad grad = target_.sampleGradient(pos.x, pos.y);
                 // Frozen: from snapshot_, not the trial mesh -- see file header.
@@ -453,20 +471,27 @@ public:
     }
 
     bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override {
-        GradientMesh mesh = snapshot_;
+        // Same rationale as PatchDataCostFunction::Evaluate() above -- both
+        // geometry AND color are live parameters here (that's the whole
+        // point of "joint"), so there is NOTHING left that needs to come
+        // from a copy of snapshot_'s vertices; build both corner arrays
+        // directly from `parameters`. snapshot_ itself is still used
+        // un-copied, just below, for the frozen area weight.
+        HermiteCorner<Vec2> geomCorners[2][2];
+        HermiteCorner<Color> colorCorners[2][2];
         for (int a = 0; a < 2; ++a) {
             for (int b = 0; b < 2; ++b) {
                 int k = a * 2 + b;
-                int vert = mesh.idx(pr_ + b, pc_ + a);
                 const double* pg = parameters[k];
-                mesh.vertices[vert].P  = {pg[0], pg[1]};
-                mesh.vertices[vert].Pu = {pg[2], pg[3]};
-                mesh.vertices[vert].Pv = {pg[4], pg[5]};
+                geomCorners[a][b].P   = {pg[0], pg[1]};
+                geomCorners[a][b].Pu  = {pg[2], pg[3]};
+                geomCorners[a][b].Pv  = {pg[4], pg[5]};
+                geomCorners[a][b].Puv = {0, 0}; // fixed, not a parameter -- see geomCorner()
                 const double* pc = parameters[4 + k];
-                mesh.vertices[vert].C   = {pc[0],  pc[1],  pc[2]};
-                mesh.vertices[vert].Cu  = {pc[3],  pc[4],  pc[5]};
-                mesh.vertices[vert].Cv  = {pc[6],  pc[7],  pc[8]};
-                mesh.vertices[vert].Cuv = {pc[9],  pc[10], pc[11]};
+                colorCorners[a][b].P   = {pc[0],  pc[1],  pc[2]};
+                colorCorners[a][b].Pu  = {pc[3],  pc[4],  pc[5]};
+                colorCorners[a][b].Pv  = {pc[6],  pc[7],  pc[8]};
+                colorCorners[a][b].Puv = {pc[9],  pc[10], pc[11]};
             }
         }
 
@@ -484,8 +509,8 @@ public:
             double v = double(i) / n_;
             for (int j = 0; j <= n_; ++j, row += 3) {
                 double u = double(j) / n_;
-                Vec2 pos = mesh.evalPos(pr_, pc_, u, v);
-                Color cmesh = mesh.evalColor(pr_, pc_, u, v);
+                Vec2 pos = evalHermitePatch<Vec2>(geomCorners, u, v);
+                Color cmesh = evalHermitePatch<Color>(colorCorners, u, v);
                 Color ctarget = target_.sampleBilinear(pos.x, pos.y);
                 ColorGrad grad = target_.sampleGradient(pos.x, pos.y);
                 // Frozen: from snapshot_, not the trial mesh -- see
