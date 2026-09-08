@@ -6,6 +6,7 @@
 #include "gmcore/MeshOptimizer.h"
 #include "gmcore/SVGExporter.h"
 #include "gmcore/ColorSpace.h"
+#include "gmcore/MeshRenderBuffers.h"
 #include <vector>
 #include <array>
 #include <memory>
@@ -765,6 +766,34 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     NSImage* img = [[NSImage alloc] initWithCGImage:cgImage size:NSMakeSize(w, h)];
     CGImageRelease(cgImage);
     return img;
+}
+
+- (nullable GMGPUMeshBuffers*)gpuMeshBuffersWithSamplesPerPatchEdge:(NSInteger)samplesPerPatchEdge {
+    if (!_mesh) return nil;
+    gmcore::MeshRenderBuffers buf = gmcore::MeshRenderBuffers::build(*_mesh, (int)samplesPerPatchEdge);
+
+    // Mesh geometry (P) bounding box -- see GMGPUMeshBuffers.minX/etc's
+    // doc comment; lets GLReconstructionView fit+center the mesh the same
+    // way CanvasView's -imageDisplayRect letterboxes the CPU preview.
+    double minX = 1e300, minY = 1e300, maxX = -1e300, maxY = -1e300;
+    for (int row = 0; row < _mesh->rows; ++row) {
+        for (int col = 0; col < _mesh->cols; ++col) {
+            const Vec2& p = _mesh->at(row, col).P;
+            minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+            minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+        }
+    }
+
+    GMGPUMeshBuffers* out = [GMGPUMeshBuffers new];
+    out.vertexData = [NSData dataWithBytes:buf.vertexData.data() length:buf.vertexData.size() * sizeof(float)];
+    out.uvTemplate = [NSData dataWithBytes:buf.uvTemplate.data() length:buf.uvTemplate.size() * sizeof(float)];
+    out.indexData = [NSData dataWithBytes:buf.indices.data() length:buf.indices.size() * sizeof(uint32_t)];
+    out.cols = buf.cols;
+    out.patchRows = buf.patchRows;
+    out.patchCols = buf.patchCols;
+    out.cieluv = _meshColorSpaceIsCIELUV;
+    out.minX = minX; out.minY = minY; out.maxX = maxX; out.maxY = maxY;
+    return out;
 }
 
 - (BOOL)exportPNGToURL:(NSURL*)url error:(NSError**)error {

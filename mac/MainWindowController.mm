@@ -1,11 +1,18 @@
 #import "MainWindowController.h"
 #import "CanvasView.h"
 #import "DocumentModel.h"
+#import "GLReconstructionView.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 @interface MainWindowController () <NSWindowDelegate, NSMenuDelegate>
 @property (nonatomic, strong) DocumentModel* documentModel;
 @property (nonatomic, strong) CanvasView* canvasView;
+// GPU (OpenGL) counterpart to canvasView's CPU reconstruction preview --
+// see GLReconstructionView.h and -refreshActivePreview. Stacked exactly
+// on top of canvasView within canvasRow (see -buildUI); exactly one of the
+// two is visible at a time.
+@property (nonatomic, strong) GLReconstructionView* glReconstructionView;
+@property (nonatomic, strong) NSButton* gpuPreviewCheckbox;
 @property (nonatomic, strong) NSSegmentedControl* toolSegmented;
 @property (nonatomic, strong) NSTextField* rowsField;
 @property (nonatomic, strong) NSTextField* colsField;
@@ -117,6 +124,12 @@
     self.optimizeButton = [self buttonTitled:@"Optimize" action:@selector(optimize:)];
     self.previewCheckbox = [NSButton checkboxWithTitle:@"Show reconstruction" target:self action:@selector(togglePreview:)];
     self.previewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    // Sub-toggle of previewCheckbox: when both are on, the GPU/OpenGL
+    // renderer (GLReconstructionView) replaces the CPU one -- see
+    // -refreshActivePreview. Meaningless (and left unused) while
+    // previewCheckbox itself is off.
+    self.gpuPreviewCheckbox = [NSButton checkboxWithTitle:@"GPU (OpenGL)" target:self action:@selector(toggleGPUPreview:)];
+    self.gpuPreviewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.tangentsCheckbox = [NSButton checkboxWithTitle:@"Show tangents" target:self action:@selector(toggleTangents:)];
     self.tangentsCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.livePreviewCheckbox = [NSButton checkboxWithTitle:@"Live mesh preview" target:self action:@selector(toggleLivePreview:)];
@@ -132,8 +145,8 @@
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
-                         self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.tangentsCheckbox,
-                         self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton])
+                         self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.gpuPreviewCheckbox,
+                         self.tangentsCheckbox, self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton])
         [controlsRow2 addSubview:v];
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
@@ -232,6 +245,13 @@
     self.canvasView.documentModel = self.documentModel;
     [self wireCanvasCallbacks];
 
+    // GPU (OpenGL) preview view -- stacked exactly on top of canvasView
+    // (see the canvasRow constraints below), hidden until
+    // -refreshActivePreview turns it on. See GLReconstructionView.h.
+    self.glReconstructionView = [[GLReconstructionView alloc] initWithFrame:NSZeroRect];
+    self.glReconstructionView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.glReconstructionView.hidden = YES;
+
     // --- Preset sidebar, next to the canvas (see canvasRow below) ---
     // "Save Preset…" writes the LAST completed Optimize run's settings
     // (DocumentModel -savePresetToURL:error:) to a timestamped JSON in a
@@ -268,7 +288,16 @@
     NSView* canvasRow = [[NSView alloc] initWithFrame:NSZeroRect];
     canvasRow.translatesAutoresizingMaskIntoConstraints = NO;
     [canvasRow addSubview:self.canvasView];
+    [canvasRow addSubview:self.glReconstructionView];
     [canvasRow addSubview:presetSidebar];
+    // glReconstructionView exactly overlays canvasView (not part of the
+    // visual-format layout below, which only positions _canvasView/
+    // presetSidebar within canvasRow) -- see -refreshActivePreview for how
+    // the two are switched between.
+    [self.glReconstructionView.leadingAnchor constraintEqualToAnchor:self.canvasView.leadingAnchor].active = YES;
+    [self.glReconstructionView.trailingAnchor constraintEqualToAnchor:self.canvasView.trailingAnchor].active = YES;
+    [self.glReconstructionView.topAnchor constraintEqualToAnchor:self.canvasView.topAnchor].active = YES;
+    [self.glReconstructionView.bottomAnchor constraintEqualToAnchor:self.canvasView.bottomAnchor].active = YES;
     NSDictionary* canvasRowViews = NSDictionaryOfVariableBindings(_canvasView, presetSidebar);
     [canvasRow addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-8-[presetSidebar(150)]-8-|"
                                                                        options:0 metrics:nil views:canvasRowViews]];
@@ -398,6 +427,11 @@
         [weakSelf.canvasView resetBoundaryDrawing];
         [weakSelf.canvasView resetCornerPicking];
         weakSelf.canvasView.showReconstructionPreview = NO;
+        weakSelf.canvasView.hidden = NO;
+        weakSelf.previewCheckbox.state = NSControlStateValueOff;
+        weakSelf.gpuPreviewCheckbox.state = NSControlStateValueOff;
+        [weakSelf.glReconstructionView clearMesh];
+        weakSelf.glReconstructionView.hidden = YES;
         weakSelf.canvasView.toolMode = GMToolModeBoundary;
         [weakSelf.toolSegmented setSelected:YES forSegment:0];
         weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Loaded %ld×%ld image. Trace the object boundary (click points, double-click to close), or use “Auto (no markup)”.",
@@ -496,14 +530,56 @@
                 msg = [msg stringByAppendingFormat:@" Debug log: %@", weakSelf.documentModel.lastDebugExportPath];
             }
             weakSelf.statusLabel.stringValue = msg;
-            [weakSelf.canvasView refreshReconstructionPreview];
-            [weakSelf.canvasView setNeedsDisplay:YES];
+            [weakSelf refreshActivePreview];
         }];
 }
 
 - (void)togglePreview:(id)sender {
-    self.canvasView.showReconstructionPreview = (self.previewCheckbox.state == NSControlStateValueOn);
-    if (self.canvasView.showReconstructionPreview) [self.canvasView refreshReconstructionPreview];
+    [self refreshActivePreview];
+}
+
+- (void)toggleGPUPreview:(id)sender {
+    [self refreshActivePreview];
+}
+
+// Shared refresh for BOTH reconstruction-preview backends -- canvasView
+// (CPU, gmcore::GradientMesh::render()) and glReconstructionView (GPU,
+// OpenGL/GLSL -- see GLReconstructionView.h). previewCheckbox gates
+// whether ANY reconstruction preview shows at all; gpuPreviewCheckbox
+// picks which of the two renders it when it does. Exactly one of the two
+// views is ever visible; the other is hidden (and, for the GPU view,
+// explicitly told it has nothing current to draw via -clearMesh) so
+// switching back to it later never shows a stale render from before the
+// last mesh change.
+//
+// v1 limitation, deliberate for now: unlike the CPU path, the GPU preview
+// does not also draw the mesh-control-point/boundary/vector-line overlays
+// canvasView draws on top of its own preview -- it is a plain side-by-side
+// visual comparison of the two renderers, not (yet) an interactive editing
+// surface. canvasView itself is hidden while the GPU preview is showing,
+// so none of the click/drag tool interactions are reachable in that mode
+// either.
+- (void)refreshActivePreview {
+    BOOL showPreview = (self.previewCheckbox.state == NSControlStateValueOn);
+    BOOL useGPU = showPreview && (self.gpuPreviewCheckbox.state == NSControlStateValueOn);
+
+    self.canvasView.showReconstructionPreview = showPreview && !useGPU;
+    self.canvasView.hidden = useGPU;
+    self.glReconstructionView.hidden = !useGPU;
+
+    if (useGPU) {
+        // 8 == the same samplesPerPatchEdge -renderReconstructionPreview
+        // hardcodes for the CPU path (see DocumentModel.mm), so the two
+        // previews are tessellated at a visually comparable density.
+        GMGPUMeshBuffers* buffers = [self.documentModel gpuMeshBuffersWithSamplesPerPatchEdge:8];
+        if (buffers) {
+            [self.glReconstructionView uploadMeshBuffers:buffers];
+        } else {
+            [self.glReconstructionView clearMesh];
+        }
+    } else if (showPreview) {
+        [self.canvasView refreshReconstructionPreview];
+    }
     [self.canvasView setNeedsDisplay:YES];
 }
 

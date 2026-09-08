@@ -12,6 +12,32 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
     GMBoundarySideLeft = 3
 };
 
+// GMGPUMeshBuffers -- the flat, GPU-renderer-ready data for the CURRENT
+// mesh, produced by -gpuMeshBuffersWithSamplesPerPatchEdge: and consumed by
+// GLReconstructionView (mac/GLReconstructionView.h). Deliberately a plain
+// Objective-C value type (NSData, not a gmcore C++ type) so this
+// (Objective-C-only) header and GLReconstructionView.h stay decoupled from
+// gmcore's C++ types -- only DocumentModel.mm and GLReconstructionView.mm
+// (both already Objective-C++) touch gmcore directly. See
+// gmcore/MeshRenderBuffers.h for exactly what each NSData holds; the field
+// names here match 1:1.
+@interface GMGPUMeshBuffers : NSObject
+@property (nonatomic, strong) NSData* vertexData;  // rows*cols*18 floats
+@property (nonatomic, strong) NSData* uvTemplate;   // (samplesPerEdge+1)^2 * 2 floats
+@property (nonatomic, strong) NSData* indexData;    // 2 triangles/cell, uint32 indices
+@property (nonatomic, assign) NSInteger cols;
+@property (nonatomic, assign) NSInteger patchRows;
+@property (nonatomic, assign) NSInteger patchCols;
+// Mirrors DocumentModel.meshColorSpaceIsCIELUV at the moment these buffers
+// were built -- tells GLReconstructionView's fragment shader whether to
+// run its cieluvToSRGB port (see GLShaderSources.h).
+@property (nonatomic, assign) BOOL cieluv;
+// Mesh geometry (P) bounding box, image/mesh-space -- lets
+// GLReconstructionView fit + center the mesh the same way CanvasView's
+// -imageDisplayRect letterboxes the CPU preview.
+@property (nonatomic, assign) double minX, minY, maxX, maxY;
+@end
+
 @interface DocumentModel : NSObject
 
 @property (nonatomic, readonly) BOOL hasImage;
@@ -261,6 +287,14 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 
 // --- Output ---
 - (nullable NSImage*)renderReconstructionPreview;
+// GPU (OpenGL) counterpart to -renderReconstructionPreview -- builds the
+// same mesh's data as flat, shader-ready buffers instead of a rasterized
+// NSImage (see GMGPUMeshBuffers and mac/GLReconstructionView.h). Returns
+// nil if !hasMesh. samplesPerPatchEdge should normally be passed as 8 to
+// match -renderReconstructionPreview's own hardcoded tessellation density,
+// so the CPU and GPU previews are visually comparable at the same
+// settings.
+- (nullable GMGPUMeshBuffers*)gpuMeshBuffersWithSamplesPerPatchEdge:(NSInteger)samplesPerPatchEdge;
 - (double)currentRMSE;
 // Mean Absolute Error, same sampling/units convention as currentRMSE (see
 // gmcore::GradientMesh::reconstructionMAE) -- computed and updated at

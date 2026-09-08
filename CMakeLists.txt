@@ -63,7 +63,8 @@ if(APPLE)
   file(GLOB GMSTUDIO_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/mac/*.mm)
   add_executable(GradientMeshStudio MACOSX_BUNDLE ${GMSTUDIO_SOURCES})
   target_link_libraries(GradientMeshStudio PRIVATE gmcore
-    "-framework Cocoa" "-framework AppKit" "-framework QuartzCore" "-framework CoreGraphics" "-framework ImageIO" "-framework UniformTypeIdentifiers")
+    "-framework Cocoa" "-framework AppKit" "-framework QuartzCore" "-framework CoreGraphics" "-framework ImageIO" "-framework UniformTypeIdentifiers"
+    "-framework OpenGL")  # GLReconstructionView.mm's NSOpenGLView/CGL-based GPU reconstruction preview (optional, toggleable -- see mac/GLReconstructionView.h)
   set_target_properties(GradientMeshStudio PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME "Gradient Mesh Studio"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.gradientmeshstudio.app"
