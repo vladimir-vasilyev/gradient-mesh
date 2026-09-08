@@ -5,6 +5,15 @@
 #include "gmcore/GLShaderSources.h"
 #import <OpenGL/gl3.h>
 
+// This whole file legitimately uses the NSOpenGLView/NSOpenGLContext/
+// NSOpenGLPixelFormat family throughout -- see GLReconstructionView.h's
+// header comment on why OpenGL (not Metal) is used here at all, and the
+// note on GL_SILENCE_DEPRECATION above only covering OpenGL.framework
+// itself, not this separate AppKit deprecation. Blanket-silenced for the
+// whole file rather than at every individual call site.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 @interface GLReconstructionView () {
     GLuint _program;
     GLuint _vao;
@@ -220,3 +229,4 @@
 }
 
 @end
+#pragma clang diagnostic pop

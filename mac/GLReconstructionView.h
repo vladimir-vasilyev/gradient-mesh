@@ -42,6 +42,18 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// NSOpenGLView/NSOpenGLContext/NSOpenGLPixelFormat have been deprecated
+// (in favor of MTKView/Metal) since macOS 10.14, but remain fully
+// functional -- this project deliberately still targets OpenGL (see the
+// header comment above: needs to also run on Windows eventually, ruling
+// out Metal). NOTE, corrected after an actual Xcode build: GL_SILENCE_DEPRECATION
+// (defined in GLReconstructionView.mm) silences OpenGL.framework's OWN
+// deprecated symbols but does NOT cover this separate AppKit-level
+// deprecation tag on the NSOpenGLView class itself -- confirmed by a real
+// build still emitting the warning even with that macro defined. Silenced
+// explicitly here instead.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 @interface GLReconstructionView : NSOpenGLView
 
 // Uploads (or replaces) the mesh data to render — see
@@ -56,5 +68,6 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)clearMesh;
 
 @end
+#pragma clang diagnostic pop
 
 NS_ASSUME_NONNULL_END

@@ -152,6 +152,16 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (const GradientMesh*)meshForReading;
 @end
 
+// Plain NSObject subclass declared in DocumentModel.h (see GMGPUMeshBuffers'
+// doc comment there) -- needs its own @implementation even though every
+// field is an auto-synthesized @property, or the compiler never emits the
+// class's Objective-C metadata at all (caught at LINK time as an undefined
+// "_OBJC_CLASS_$_GMGPUMeshBuffers" symbol, not at compile time -- this was
+// missed originally because nothing in this dev environment can link/run
+// an actual Objective-C binary to catch it; a real Xcode build did).
+@implementation GMGPUMeshBuffers
+@end
+
 @implementation DocumentModel
 
 - (instancetype)init {
