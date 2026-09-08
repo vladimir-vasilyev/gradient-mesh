@@ -125,6 +125,27 @@
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
     glEnableVertexAttribArray(0);
 
+    // Explicit belt-and-suspenders: GL_FRAMEBUFFER_SRGB defaults to
+    // disabled per spec (we never enable it), so this SHOULD be a no-op --
+    // but it directly targets a reported symptom (GPU preview looking
+    // slightly lighter/less saturated than the CPU one, in BOTH sRGB and
+    // CIELUV modes) that matches a known class of bug: if this GPU/driver
+    // combo's legacy (deprecated since 10.14, unmaintained since) OpenGL
+    // implementation doesn't honor that default and silently treats the
+    // default framebuffer as sRGB-encoded, it would apply an extra
+    // linear->sRGB re-encode on top of the ALREADY sRGB-encoded values our
+    // fragment shader writes (same convention DocumentModel's CPU path
+    // uses) -- which would brighten and flatten every pixel, independent of
+    // which color-space branch produced it. This is the same SHAPE of bug
+    // (an ambiguous/generic colorspace interpretation) as the one already
+    // found and fixed in -renderReconstructionPreview's own history (see
+    // that method's comment on CGColorSpaceCreateDeviceRGB() vs explicit
+    // kCGColorSpaceSRGB) -- NOT verified against a real GPU/driver here
+    // (no macOS/OpenGL environment available in this project's dev
+    // environment), just the best-supported hypothesis pending an on-device
+    // check of whether this alone resolves it.
+    glDisable(GL_FRAMEBUFFER_SRGB);
+
     // Matches CanvasView.mm drawRect:'s own background fill color
     // ([NSColor colorWithCalibratedWhite:0.16 alpha:1.0]) so switching
     // between the CPU and GPU previews doesn't visibly flash a different
