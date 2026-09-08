@@ -19,6 +19,10 @@
 @property (nonatomic, strong) NSTextField* statusLabel;
 @property (nonatomic, strong) NSProgressIndicator* progressSpinner;
 @property (nonatomic, strong) NSButton* previewCheckbox;
+// Mirrors CanvasView.showMeshOverlay -- see -toggleShowMesh:. Checked by
+// default, matching CanvasView's own default (_showMeshOverlay = YES in
+// -initWithFrame:).
+@property (nonatomic, strong) NSButton* meshCheckbox;
 @property (nonatomic, strong) NSButton* tangentsCheckbox;
 // Mirrors DocumentModel.livePreviewDuringOptimize -- see -toggleLivePreview:.
 // When on, the mesh grid overlay redraws once per outer iteration during
@@ -130,6 +134,9 @@
     // previewCheckbox itself is off.
     self.gpuPreviewCheckbox = [NSButton checkboxWithTitle:@"GPU (OpenGL)" target:self action:@selector(toggleGPUPreview:)];
     self.gpuPreviewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    self.meshCheckbox = [NSButton checkboxWithTitle:@"Show mesh" target:self action:@selector(toggleShowMesh:)];
+    self.meshCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    self.meshCheckbox.state = NSControlStateValueOn;  // matches CanvasView.showMeshOverlay's default (YES)
     self.tangentsCheckbox = [NSButton checkboxWithTitle:@"Show tangents" target:self action:@selector(toggleTangents:)];
     self.tangentsCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.livePreviewCheckbox = [NSButton checkboxWithTitle:@"Live mesh preview" target:self action:@selector(toggleLivePreview:)];
@@ -146,7 +153,7 @@
 
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
                          self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.gpuPreviewCheckbox,
-                         self.tangentsCheckbox, self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton])
+                         self.meshCheckbox, self.tangentsCheckbox, self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton])
         [controlsRow2 addSubview:v];
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
@@ -580,6 +587,11 @@
     } else if (showPreview) {
         [self.canvasView refreshReconstructionPreview];
     }
+    [self.canvasView setNeedsDisplay:YES];
+}
+
+- (void)toggleShowMesh:(id)sender {
+    self.canvasView.showMeshOverlay = (self.meshCheckbox.state == NSControlStateValueOn);
     [self.canvasView setNeedsDisplay:YES];
 }
 
