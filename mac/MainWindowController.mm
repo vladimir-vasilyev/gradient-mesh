@@ -49,12 +49,13 @@
 @property (nonatomic, strong) NSButton* cieluvCheckbox;
 // Mirrors DocumentModel.ceresMultithreaded -- see -toggleCeresMultithreaded:.
 @property (nonatomic, strong) NSButton* ceresMultithreadedCheckbox;
-// Geometry/colour energy-weight fields -- mirror DocumentModel's seven
+// Geometry/colour energy-weight fields -- mirror DocumentModel's eight
 // properties of the same name 1:1 (see that header's comment). Read
 // straight into the model at the start of -optimize:, same pattern as
 // rowsField/colsField already use for -buildMesh:/-autoMesh:.
 @property (nonatomic, strong) NSTextField* smoothWeightGeomField;
 @property (nonatomic, strong) NSTextField* geomDataWeightField;
+@property (nonatomic, strong) NSTextField* smoothGeomEdgeGainField;
 @property (nonatomic, strong) NSTextField* boundaryWeightField;
 @property (nonatomic, strong) NSTextField* geomTangentPriorWeightField;
 @property (nonatomic, strong) NSTextField* vectorLineWeightField;
@@ -226,6 +227,17 @@
     NSTextField* geomDataLabel = [self makeLabel:@"Data:"];
     self.geomDataWeightField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.geomDataWeight]];
+    // "Edge gain:" -- OptimizerOptions::smoothGeomEdgeGain, makes the
+    // "Smooth:" field above ANISOTROPIC near strong local image gradients
+    // instead of a single flat weight (see MeshOptimizer.h's comment on
+    // that field and DocumentModel.h's comment on this property for the
+    // real, on-device-measured trade-off: tighter edge-snapping on a
+    // coarse mesh vs. a regression on smooth images -- NOT a strictly
+    // better value, which is why it stays a separate opt-in field rather
+    // than a change to the compiled-in default).
+    NSTextField* edgeGainLabel = [self makeLabel:@"Edge gain:"];
+    self.smoothGeomEdgeGainField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.smoothGeomEdgeGain]];
     NSTextField* boundaryLabel = [self makeLabel:@"Boundary:"];
     self.boundaryWeightField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight]];
@@ -237,12 +249,12 @@
         [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight]];
 
     for (NSView* v in @[geomWeightsLabel, smoothGeomLabel, self.smoothWeightGeomField, geomDataLabel,
-                         self.geomDataWeightField, boundaryLabel,
+                         self.geomDataWeightField, edgeGainLabel, self.smoothGeomEdgeGainField, boundaryLabel,
                          self.boundaryWeightField, tangentPriorLabel, self.geomTangentPriorWeightField,
                          vectorLineLabel, self.vectorLineWeightField])
         [controlsRow4 addSubview:v];
 
-    // --- Row 5: colour energy weights, + a shared reset for all seven ---
+    // --- Row 5: colour energy weights, + a shared reset for all eight ---
     NSTextField* colorWeightsLabel = [self makeLabel:@"Color weights —"];
     NSTextField* smoothColorLabel = [self makeLabel:@"Smooth:"];
     self.smoothWeightColorField = [self makeWeightFieldWithValue:
@@ -507,6 +519,7 @@
     // -autoMesh:, so whatever's currently typed takes effect on THIS run.
     self.documentModel.smoothWeightGeom = self.smoothWeightGeomField.doubleValue;
     self.documentModel.geomDataWeight = self.geomDataWeightField.doubleValue;
+    self.documentModel.smoothGeomEdgeGain = self.smoothGeomEdgeGainField.doubleValue;
     self.documentModel.boundaryWeight = self.boundaryWeightField.doubleValue;
     self.documentModel.geomTangentPriorWeight = self.geomTangentPriorWeightField.doubleValue;
     self.documentModel.vectorLineWeight = self.vectorLineWeightField.doubleValue;
@@ -760,6 +773,7 @@
     [self.documentModel resetWeightsToDefaults];
     self.smoothWeightGeomField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom];
     self.geomDataWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomDataWeight];
+    self.smoothGeomEdgeGainField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothGeomEdgeGain];
     self.boundaryWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight];
     self.geomTangentPriorWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomTangentPriorWeight];
     self.vectorLineWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight];
@@ -814,9 +828,10 @@
     if (rows > 0) self.rowsField.integerValue = rows;
     if (cols > 0) self.colsField.integerValue = cols;
     // Mirror every field/control this preset touched -- same pattern
-    // -resetWeights: already uses for the seven weight fields.
+    // -resetWeights: already uses for the eight weight fields.
     self.smoothWeightGeomField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothWeightGeom];
     self.geomDataWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomDataWeight];
+    self.smoothGeomEdgeGainField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.smoothGeomEdgeGain];
     self.boundaryWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.boundaryWeight];
     self.geomTangentPriorWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.geomTangentPriorWeight];
     self.vectorLineWeightField.stringValue = [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight];

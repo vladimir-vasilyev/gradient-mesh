@@ -177,10 +177,10 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     return self;
 }
 
-// Single source of truth for these seven starting values is
+// Single source of truth for these eight starting values is
 // gmcore::OptimizerOptions' own member-initializers (MeshOptimizer.h) --
 // default-constructing one here and copying out of it, rather than typing
-// the same seven numbers again, means they can never silently drift out of
+// the same eight numbers again, means they can never silently drift out of
 // sync with the struct's real compiled-in defaults.
 - (void)resetWeightsToDefaults {
     OptimizerOptions defaults;
@@ -191,6 +191,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     self.geomTangentPriorWeight = defaults.geomTangentPriorWeight;
     self.vectorLineWeight = defaults.vectorLineWeight;
     self.geomDataWeight = defaults.geomDataWeight;
+    self.smoothGeomEdgeGain = defaults.smoothGeomEdgeGain;
 }
 
 - (BOOL)hasImage { return _hasImage; }
@@ -568,7 +569,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // 0/unset -> 1: see DocumentModel.h's comment on this property.
     opts.pyramidRestarts = (int)std::max((NSInteger)1, self.pyramidRestarts);
     // Geometry/colour energy weights -- see DocumentModel.h's comment on
-    // these seven properties. Read fresh here (not cached), so a value
+    // these eight properties. Read fresh here (not cached), so a value
     // edited in the UI since the last run takes effect on THIS "Optimize"
     // click.
     opts.smoothWeightGeom = self.smoothWeightGeom;
@@ -578,6 +579,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     opts.geomTangentPriorWeight = self.geomTangentPriorWeight;
     opts.vectorLineWeight = self.vectorLineWeight;
     opts.geomDataWeight = self.geomDataWeight;
+    opts.smoothGeomEdgeGain = self.smoothGeomEdgeGain;
 
     // Snapshot the exact opts this run uses and reset the per-run progress
     // log/timer, for -exportDebugDataToURL:error: -- must happen here, on
@@ -1148,6 +1150,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     self.geomTangentPriorWeight = [o[@"geomTangentPriorWeight"] doubleValue];
     self.vectorLineWeight = [o[@"vectorLineWeight"] doubleValue];
     self.geomDataWeight = [o[@"geomDataWeight"] doubleValue];
+    self.smoothGeomEdgeGain = [o[@"smoothGeomEdgeGain"] doubleValue];
     self.pyramidRestarts = [o[@"pyramidRestarts"] integerValue];
     self.useCeresGeometry = [o[@"useCeresGeometry"] boolValue];
     self.useCeresJoint = [o[@"useCeresJoint"] boolValue];

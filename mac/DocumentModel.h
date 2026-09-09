@@ -63,7 +63,7 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // nonzero) and a canvas redraw each time -- default NO, matching every
 // other opt-in diagnostic/overlay toggle in this class. Read once into a
 // local BEFORE the background dispatch in -optimizeWithPyramidLevels:...,
-// same pattern as useCeresGeometry/useCeresJoint/the seven weight
+// same pattern as useCeresGeometry/useCeresJoint/the eight weight
 // properties, so toggling it mid-run never half-applies.
 @property (nonatomic, assign) BOOL livePreviewDuringOptimize;
 
@@ -129,7 +129,7 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // (useCIELUVColorSpace) needs these RE-tuned for its own colour-magnitude
 // scale (see ColorSpace.h's kCIELUVWorkingScale comment for why) and
 // recompiling for every trial value isn't practical; MainWindowController's
-// "Reset weights to defaults" button restores all seven at once via the
+// "Reset weights to defaults" button restores all eight at once via the
 // same default-constructed OptimizerOptions.
 @property (nonatomic, assign) double smoothWeightGeom;      // OptimizerOptions::smoothWeightGeom
 @property (nonatomic, assign) double smoothWeightColor;     // OptimizerOptions::smoothWeightColor
@@ -152,8 +152,40 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
                                                               // shrinking boundaryWeight/smoothWeightGeom/
                                                               // geomTangentPriorWeight/vectorLineWeight by
                                                               // 10000x each by hand.
+@property (nonatomic, assign) double smoothGeomEdgeGain;    // OptimizerOptions::smoothGeomEdgeGain --
+                                                              // makes smoothWeightGeom ANISOTROPIC, relaxing
+                                                              // it near a strong local image gradient (see
+                                                              // that field's -- and edgeRelaxFactor's --
+                                                              // comments in MeshOptimizer.h/.cpp); 0.0 =
+                                                              // fully isotropic (edgeRelaxFactor degenerates
+                                                              // to exactly 1.0 everywhere), matching Sec
+                                                              // 4.1's original flat-weight smoothness term;
+                                                              // 40.0 = this project's compiled-in default.
+                                                              // A real, on-device sweep (see README's
+                                                              // "smoothGeomEdgeGain sweep" section) found
+                                                              // 150-200 snaps a coarse mesh to a sharp edge
+                                                              // (Fig. 4-style) noticeably tighter than the
+                                                              // default -- but the SAME sweep measurably
+                                                              // REGRESSED a smooth synthetic-sphere test
+                                                              // case (56.5% -> 52.6% RMSE reduction), so
+                                                              // this is a genuine trade-off, not a strictly
+                                                              // better value, and 40.0 stays the global
+                                                              // default; exposed here so it can be raised
+                                                              // per-image for a mesh that needs tighter
+                                                              // edge-snapping without changing that default
+                                                              // for everyone else. NOTE: because this
+                                                              // property was added after geomDataWeight (and
+                                                              // -loadPresetNamed:rows:cols:error: has no
+                                                              // per-field presence guard, same as every
+                                                              // other weight), a preset saved before this
+                                                              // property existed will load it as 0.0 -- which
+                                                              // happens to be the safe, paper-faithful
+                                                              // isotropic fallback above, not a broken value,
+                                                              // unlike a missing geomDataWeight (0.0 there
+                                                              // would zero out the geometry data term
+                                                              // entirely).
 
-// Resets all seven weight properties above to gmcore::OptimizerOptions' own
+// Resets all eight weight properties above to gmcore::OptimizerOptions' own
 // compiled-in defaults (the same ones -init seeds them with) -- does NOT
 // touch anything else (solver picker, pyramidRestarts, useCIELUVColorSpace,
 // the mesh itself). Wired to MainWindowController's "Reset weights to
@@ -348,7 +380,7 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // --- Presets ---
 // A preset captures exactly the settings the LAST completed
 // -optimizeWithPyramidLevels:progress:completion: run used -- the same
-// seven weight properties, solver choice, pyramidRestarts/ceresNumThreads,
+// eight weight properties, solver choice, pyramidRestarts/ceresNumThreads,
 // and colour space -exportDebugDataToURL:error:'s own "optimizerOptions"/
 // "colorSpace" fields already carry (same source: _lastOptsUsed/
 // _meshColorSpaceIsCIELUV, snapshotted at that run's start, not whatever
@@ -386,7 +418,7 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 
 // Loads the preset previously saved as `name` (see -availablePresetNames,
 // same string, no ".json") back onto this DocumentModel's live properties
-// (the seven weights, solver choice, pyramidRestarts, ceresMultithreaded,
+// (the eight weights, solver choice, pyramidRestarts, ceresMultithreaded,
 // useCIELUVColorSpace) -- exactly the settings -savePresetToURL:error:
 // captured, applied the same way a user typing them in by hand would be:
 // takes effect on the NEXT "Optimize" (and, for useCIELUVColorSpace, the

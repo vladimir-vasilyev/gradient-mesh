@@ -1493,6 +1493,80 @@ updated to match) -- present in exports from now on; the runs in the table above
 the fix, so their own JSON files don't show the weight actually in effect (0.3, this
 build's default -- there's no UI to change it yet).
 
+### Follow-up: `smoothGeomEdgeGain` sweep on the Fig. 4 edge-snapping gap -- real improvement, but a real trade-off, not adopted as a new default
+
+Revisited "Deeper finding: coarse meshes still don't snap to an edge the way Fig. 4
+does" (above) now that `--geom-data-weight` exists in `gmesh_cli` and this project has a
+device that can actually run the hand-rolled solver directly (no Xcode/Ceres needed for
+this -- `smoothGeomEdgeGain` only affects the hand-rolled geometry Gauss-Newton path).
+First, located the same 5x5/`gradient.png` test's actual target edge directly (a small
+one-off probe measuring the sharpest per-row colour gradient, not eyeballed): the true
+edge sits at approximately x=115, 114, 88, 135, 125 for the mesh's 5 rows (top to
+bottom) -- confirming the "true edge's x spans ~89-138" figure quoted in the original
+finding, and giving exact per-row targets to compare against instead of just a min/max
+range.
+
+Baseline (current defaults, `smoothGeomEdgeGain=40`): interior column (col 2) x =
+107.6, 107.2, 103.3, 108.7, 115.3 (range 12.0px) against a true target of
+115, 114, 88, 135, 125 (range 47px) -- i.e. today's defaults recover only the faintest
+hint of the actual shape (barely dips at row 2, barely rises at row 3), consistent with
+the original finding.
+
+Swept `--edge-gain` (`smoothGeomEdgeGain`) from 40 up to 400 on the same case:
+
+| `--edge-gain` | col-2 x by row | range | final RMSE |
+|---|---|---|---|
+| 40 (current default) | 107.6, 107.2, 103.3, 108.7, 115.3 | 12.0 | 0.03067 (62.3%) |
+| 100 | 115.4, 114.0, 95.4, 104.1, 115.2 | 20.0 | 0.02802 (65.6%) |
+| **150** | 115.3, 114.8, 96.3, 107.7, 112.0 | 19.0 | 0.02815 (65.4%) |
+| 200 | 115.3, 114.8, 96.0, 107.8, 112.0 | 19.3 | 0.02815 (65.4%) |
+| 300 | 108.2, 107.3, 96.9, 110.2, 111.5 | 14.5 | 0.03026 (62.8%) |
+| 150 + `--pyramid-restarts 3` | 115.4, 114.0, 92.3, 106.7, 115.7 | 23.4 | 0.02622 (**67.8%**) |
+
+150-200 is a clear sweet spot (400+ trails back off, matching the earlier
+`smoothWeightGeom` sweep's own shape: too little regularization becomes its own
+problem). At `--edge-gain 150 --pyramid-restarts 3`, the mesh's row-0/row-1 values
+(115.4, 114.0) now match the true edge (115, 114) almost exactly, and row 2's dip
+(92.3 vs true 88) and row 4's rise (115.7 vs true 125) both move substantially in the
+right direction -- a real, qualitative improvement in tracking the notch's actual shape,
+not just a wider but still-wrong range. Row 3 (106.7 vs true 135) remains the biggest
+remaining gap; edge-gain alone doesn't close it.
+
+**But this is not a free win -- regression-checked exactly the way this project always
+checks a change like this, and it is NOT clean:**
+
+| test case | default (`edge-gain=40`) | `edge-gain=150, restarts=3` |
+|---|---|---|
+| 5x5 `gradient.png` (the case above) | RMSE 0.03067 (62.3%) | RMSE 0.02622 (**67.8%**, better) |
+| 25x25 `gradient.png` (finer mesh, same image) | RMSE 0.00601 (65.6%) | RMSE 0.00601 (65.7%, a wash) |
+| 9x9 synthetic sphere (smooth image, no sharp edges) | RMSE 0.03944 (56.5%) | RMSE 0.04298 (**52.6%, worse**) |
+
+Raising `smoothGeomEdgeGain` measurably helps a COARSE mesh snap onto a real sharp edge
+(the whole point of this investigation), is roughly neutral on a finer mesh of the same
+image (makes sense: a 25x25 mesh already has enough control points that individual
+patches are small relative to the edge, so this specific coarse-mesh failure mode
+barely applies), but measurably HURTS a smooth image with no real edges at all -- almost
+certainly because "relax smoothing near a strong local image gradient" starts
+mistaking ordinary smooth shading/noise gradients for edges once the gain is high
+enough, over-relaxing regularization somewhere it shouldn't. This is exactly the kind
+of trade-off a global default change would silently impose on every image, sharp-edged
+or not -- so **not adopted as a new default**. Given this real, per-image trade-off,
+the right fix is exposing it as a UI-tunable weight rather than changing what every
+image gets by default -- done in the app as `smoothGeomEdgeGain`, DocumentModel's
+eighth tunable `OptimizerOptions` weight (its own "Edge gain:" field in
+MainWindowController's geometry-weights row, mirroring `geomDataWeight`'s field at
+every touch point: `-optimize:`'s read, `-resetWeights:`'s and preset-load's reload,
+and the preset JSON round-trip -- see `DocumentModel.h`'s comment on the property for
+this same sweep summary), still defaulting to 40.0, so someone working on a specific
+sharp-edged image can dial it up deliberately in the UI (not just via
+`gmesh_cli --edge-gain`) without changing what every other image gets by default.
+
+The bigger remaining gap (row 3's 106.7 vs true 135, still the largest miss even at the
+best setting found) still points at the same conclusion the original finding reached:
+an annealed `smoothWeightGeom` schedule (or some other mechanism that isn't just "turn
+one existing knob up") is probably still needed to close this fully -- not attempted
+yet, flagged here as the next real candidate.
+
 ## Optional CIELUV colour space (colour interpolation, not geometry)
 
 Added after reading Hogervorst (2017), *"Colour Interpolation in Gradient Meshes"*
