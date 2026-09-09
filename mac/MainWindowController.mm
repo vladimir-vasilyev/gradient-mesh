@@ -3,6 +3,8 @@
 #import "DocumentModel.h"
 #import "GLReconstructionView.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <CoreGraphics/CoreGraphics.h>  // CGImageDestinationRef etc. for -exportGPUPNG: (mirrors DocumentModel.mm's -exportPNGToURL:)
+#import <ImageIO/ImageIO.h>            // CGImageDestinationCreateWithURL/AddImage/Finalize
 
 @interface MainWindowController () <NSWindowDelegate, NSMenuDelegate>
 @property (nonatomic, strong) DocumentModel* documentModel;
@@ -32,6 +34,11 @@
 @property (nonatomic, strong) NSButton* optimizeButton;
 @property (nonatomic, strong) NSButton* exportPNGButton;
 @property (nonatomic, strong) NSButton* exportSVGButton;
+// Saves exactly what glReconstructionView renders (GPU/OpenGL, exact
+// per-pixel Hermite color) rather than DocumentModel's CPU rasterization
+// -- see -exportGPUPNG: and GLReconstructionView.renderToImageWithWidth:height:.
+// Independent of whether the on-screen GPU preview toggle is currently on.
+@property (nonatomic, strong) NSButton* exportGPUPNGButton;
 // Solver picker: Hand-rolled (default) / Ceres (geometry) / Ceres (joint) --
 // mirrors gmcore::OptimizerOptions::useCeresGeometry/useCeresJoint via
 // DocumentModel's properties of the same name. See -solverChanged:.
@@ -143,6 +150,7 @@
     self.livePreviewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.exportPNGButton = [self buttonTitled:@"Export PNG…" action:@selector(exportPNG:)];
     self.exportSVGButton = [self buttonTitled:@"Export SVG…" action:@selector(exportSVG:)];
+    self.exportGPUPNGButton = [self buttonTitled:@"Export GPU PNG…" action:@selector(exportGPUPNG:)];
     self.progressSpinner = [[NSProgressIndicator alloc] init];
     self.progressSpinner.translatesAutoresizingMaskIntoConstraints = NO;
     self.progressSpinner.style = NSProgressIndicatorStyleSpinning;
@@ -153,7 +161,8 @@
 
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
                          self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.gpuPreviewCheckbox,
-                         self.meshCheckbox, self.tangentsCheckbox, self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton])
+                         self.meshCheckbox, self.tangentsCheckbox, self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton,
+                         self.exportGPUPNGButton])
         [controlsRow2 addSubview:v];
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
@@ -649,6 +658,76 @@
         NSError* error = nil;
         if (![weakSelf.documentModel exportSVGToURL:panel.URL error:&error]) [weakSelf presentError:error];
         else weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Exported SVG (mesh gradient) to %@", panel.URL.path];
+    }];
+}
+
+// Saves what GLReconstructionView (GPU/OpenGL) actually draws, as opposed
+// to -exportPNG: above (which always goes through DocumentModel's CPU
+// rasterization -- see DocumentModel.exportPNGToURL:/renderReconstructionPreview
+// -- regardless of which preview mode is currently shown on screen). Freshly
+// builds and uploads GPU mesh buffers here rather than relying on
+// glReconstructionView already having them, so this works even if the
+// on-screen "GPU (OpenGL)" checkbox was never turned on.
+- (void)exportGPUPNG:(id)sender {
+    if (!self.documentModel.hasMesh) { self.statusLabel.stringValue = @"Build (and ideally optimize) a mesh first."; return; }
+
+    // 8 == the same samplesPerPatchEdge used everywhere else in this app
+    // for the GPU preview (see -refreshActivePreview) and the CPU preview
+    // (DocumentModel.mm's -renderReconstructionPreview).
+    GMGPUMeshBuffers* buffers = [self.documentModel gpuMeshBuffersWithSamplesPerPatchEdge:8];
+    if (!buffers) {
+        self.statusLabel.stringValue = @"Could not build GPU mesh buffers.";
+        return;
+    }
+    [self.glReconstructionView uploadMeshBuffers:buffers];
+
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.nameFieldStringValue = @"gradient-mesh-gpu-reconstruction.png";
+    __weak typeof(self) weakSelf = self;
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK) return;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        // Export at the ORIGINAL loaded image's resolution -- matches
+        // DocumentModel.exportPNGToURL:'s own (CPU) convention, so the two
+        // export paths produce comparably-sized files regardless of
+        // whatever size the on-screen view happens to be.
+        NSInteger w = strongSelf.documentModel.imageWidth;
+        NSInteger h = strongSelf.documentModel.imageHeight;
+        NSImage* image = [strongSelf.glReconstructionView renderToImageWithWidth:w height:h];
+        if (!image) {
+            [strongSelf presentError:[NSError errorWithDomain:@"GradientMeshStudio" code:1
+                                                       userInfo:@{NSLocalizedDescriptionKey: @"GPU render failed (no mesh uploaded, or invalid image size)."}]];
+            return;
+        }
+
+        // Same CGImageForProposedRect: + CGImageDestination pattern as
+        // DocumentModel.mm's -exportPNGToURL: -- renderToImageWithWidth:height:
+        // already built `image` from an explicitly kCGColorSpaceSRGB-tagged
+        // CGImage (see GLReconstructionView.mm), so this just writes those
+        // exact bytes out; no extra color conversion happens here.
+        CGImageRef cgImage = [image CGImageForProposedRect:NULL context:nil hints:nil];
+        if (!cgImage) {
+            [strongSelf presentError:[NSError errorWithDomain:@"GradientMeshStudio" code:1
+                                                       userInfo:@{NSLocalizedDescriptionKey: @"Could not rasterize GPU render."}]];
+            return;
+        }
+        CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)panel.URL, CFSTR("public.png"), 1, NULL);
+        if (!dest) {
+            [strongSelf presentError:[NSError errorWithDomain:@"GradientMeshStudio" code:1
+                                                       userInfo:@{NSLocalizedDescriptionKey: @"Could not create PNG file."}]];
+            return;
+        }
+        CGImageDestinationAddImage(dest, cgImage, NULL);
+        BOOL ok = CGImageDestinationFinalize(dest);
+        CFRelease(dest);
+        if (!ok) {
+            [strongSelf presentError:[NSError errorWithDomain:@"GradientMeshStudio" code:1
+                                                       userInfo:@{NSLocalizedDescriptionKey: @"Could not write PNG file."}]];
+        } else {
+            strongSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Exported GPU-rendered PNG to %@", panel.URL.path];
+        }
     }];
 }
 

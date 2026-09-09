@@ -67,6 +67,19 @@ NS_ASSUME_NONNULL_BEGIN
 // first mesh exists, or when switching away from the GPU preview.
 - (void)clearMesh;
 
+// Renders the CURRENTLY UPLOADED mesh (see -uploadMeshBuffers:) into an
+// offscreen framebuffer at the given pixel size, using the exact same draw
+// code as the on-screen preview, and returns it as an NSImage -- this is
+// what "Export GPU PNG..." (MainWindowController) saves, kept deliberately
+// separate from -drawRect: so the exported resolution can match the
+// ORIGINAL loaded image's resolution (matching
+// DocumentModel.renderReconstructionPreview's own convention) rather than
+// whatever size the on-screen view happens to be. Returns nil if no mesh
+// has been uploaded yet, or if width/height are not positive. Restores the
+// default framebuffer and the view's own on-screen viewport before
+// returning, so a subsequent normal -drawRect: is unaffected.
+- (nullable NSImage*)renderToImageWithWidth:(NSInteger)width height:(NSInteger)height;
+
 @end
 #pragma clang diagnostic pop
 

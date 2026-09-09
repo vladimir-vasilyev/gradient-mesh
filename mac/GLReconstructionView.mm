@@ -4,6 +4,9 @@
 #import "GLReconstructionView.h"
 #include "gmcore/GLShaderSources.h"
 #import <OpenGL/gl3.h>
+#import <CoreGraphics/CoreGraphics.h>  // CGImageRef/CGColorSpaceRef/CGDataProviderRef for -renderToImageWithWidth:height: -- explicit include rather than relying on it coming in transitively via Cocoa.h, matching DocumentModel.mm's own explicit CoreGraphics import for the same CG calls.
+#include <vector>   // std::vector<uint8_t> pixel buffers in -renderToImageWithWidth:height:
+#include <cstring>  // memcpy (row flip) in -renderToImageWithWidth:height:
 
 // This whole file legitimately uses the NSOpenGLView/NSOpenGLContext/
 // NSOpenGLPixelFormat family throughout -- see GLReconstructionView.h's
@@ -200,41 +203,116 @@
     [self setNeedsDisplay:YES];
 }
 
+// Shared by -drawRect: and -renderToImageWithWidth:height: -- issues the
+// actual mesh draw call (assumes the target framebuffer is already bound
+// and glClear'd, and the viewport already matches `size`). Pulled out so
+// "what gets exported" is provably the exact same code as "what's shown
+// on screen", not a separate reimplementation that could quietly drift.
+- (void)drawMeshFittedToSize:(NSSize)size {
+    if (!_hasMesh) return;
+
+    glUseProgram(_program);
+    glBindVertexArray(_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_BUFFER, _tboTexture);
+    glUniform1i(_uCols, (GLint)_cols);
+    glUniform1i(_uPatchCols, (GLint)_patchCols);
+    glUniform1i(_uCieluv, _cieluv ? 1 : 0);
+
+    // Fit the mesh's geometry bounding box into `size`, preserving aspect
+    // ratio and centering -- mirrors CanvasView's -imageDisplayRect
+    // letterboxing so the GPU preview lines up visually with the CPU one.
+    // Y is flipped (mesh/image space has row 0 at the top; NDC +Y is up),
+    // matching CanvasView.mm drawRect:'s own explicit vertical-flip fix
+    // for the CPU image.
+    double meshW = MAX(1e-6, _meshMaxX - _meshMinX);
+    double meshH = MAX(1e-6, _meshMaxY - _meshMinY);
+    double scale = MIN(size.width / meshW, size.height / meshH);
+    double ndcScaleX = scale / (size.width * 0.5);
+    double ndcScaleY = scale / (size.height * 0.5);
+    double centerX = (_meshMinX + _meshMaxX) * 0.5;
+    double centerY = (_meshMinY + _meshMaxY) * 0.5;
+    glUniform4f(_uXform, (GLfloat)ndcScaleX, (GLfloat)(-ndcScaleY), (GLfloat)centerX, (GLfloat)centerY);
+
+    glDrawElementsInstanced(GL_TRIANGLES, _indexCount, GL_UNSIGNED_INT, NULL, (GLsizei)(_patchRows * _patchCols));
+}
+
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
     if (!_glSetUp) { [self prepareOpenGL]; }
     [[self openGLContext] makeCurrentContext];
     glClear(GL_COLOR_BUFFER_BIT);
+    [self drawMeshFittedToSize:self.bounds.size];
+    [[self openGLContext] flushBuffer];
+}
 
-    if (_hasMesh) {
-        glUseProgram(_program);
-        glBindVertexArray(_vao);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_BUFFER, _tboTexture);
-        glUniform1i(_uCols, (GLint)_cols);
-        glUniform1i(_uPatchCols, (GLint)_patchCols);
-        glUniform1i(_uCieluv, _cieluv ? 1 : 0);
+- (nullable NSImage*)renderToImageWithWidth:(NSInteger)width height:(NSInteger)height {
+    if (!_hasMesh || width <= 0 || height <= 0) return nil;
+    if (!_glSetUp) { [self prepareOpenGL]; }
+    [[self openGLContext] makeCurrentContext];
 
-        // Fit the mesh's geometry bounding box into the view, preserving
-        // aspect ratio and centering -- mirrors CanvasView's
-        // -imageDisplayRect letterboxing so the GPU preview lines up
-        // visually with the CPU one. Y is flipped (mesh/image space has
-        // row 0 at the top; NDC +Y is up), matching CanvasView.mm
-        // drawRect:'s own explicit vertical-flip fix for the CPU image.
-        NSRect bounds = self.bounds;
-        double meshW = MAX(1e-6, _meshMaxX - _meshMinX);
-        double meshH = MAX(1e-6, _meshMaxY - _meshMinY);
-        double scale = MIN(bounds.size.width / meshW, bounds.size.height / meshH);
-        double ndcScaleX = scale / (bounds.size.width * 0.5);
-        double ndcScaleY = scale / (bounds.size.height * 0.5);
-        double centerX = (_meshMinX + _meshMaxX) * 0.5;
-        double centerY = (_meshMinY + _meshMaxY) * 0.5;
-        glUniform4f(_uXform, (GLfloat)ndcScaleX, (GLfloat)(-ndcScaleY), (GLfloat)centerX, (GLfloat)centerY);
+    // One-shot offscreen FBO at the EXPORT resolution -- deliberately not
+    // tied to the on-screen view's (window-dependent) pixel size, so the
+    // exported PNG matches the original loaded image's resolution instead
+    // (see this method's header comment).
+    GLuint fbo = 0, colorTex = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glGenTextures(1, &colorTex);
+    glBindTexture(GL_TEXTURE_2D, colorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
 
-        glDrawElementsInstanced(GL_TRIANGLES, _indexCount, GL_UNSIGNED_INT, NULL, (GLsizei)(_patchRows * _patchCols));
+    NSImage* result = nil;
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        glViewport(0, 0, (GLsizei)width, (GLsizei)height);
+        glClearColor(0.16f, 0.16f, 0.16f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        [self drawMeshFittedToSize:NSMakeSize(width, height)];
+        glFinish();
+
+        size_t rowBytes = (size_t)width * 4;
+        std::vector<uint8_t> rows(rowBytes * (size_t)height);
+        glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, rows.data());
+
+        // glReadPixels' row 0 is the BOTTOM of the image (GL's Y-up
+        // convention); flip to row-0-at-top to match every other image in
+        // this app (see MeshRenderBuffers.h/GradientMesh.h's own
+        // row-0-at-top convention) before handing it to CoreGraphics.
+        std::vector<uint8_t> flipped(rows.size());
+        for (NSInteger y = 0; y < height; ++y) {
+            memcpy(&flipped[(size_t)y * rowBytes], &rows[(size_t)(height - 1 - y) * rowBytes], rowBytes);
+        }
+
+        // Explicit sRGB tag, NOT a generic/device color space -- see
+        // DocumentModel.mm's -renderReconstructionPreview comment on
+        // exactly why an untagged raster looks washed out on screen
+        // (the same class of bug this project already hit once).
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, flipped.data(), flipped.size(), NULL);
+        CGImageRef cgImage = CGImageCreate((size_t)width, (size_t)height, 8, 32, rowBytes, cs,
+                                            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
+                                            provider, NULL, false, kCGRenderingIntentDefault);
+        CGDataProviderRelease(provider);
+        CGColorSpaceRelease(cs);
+        if (cgImage) {
+            result = [[NSImage alloc] initWithCGImage:cgImage size:NSMakeSize(width, height)];
+            CGImageRelease(cgImage);
+        }
     }
 
-    [[self openGLContext] flushBuffer];
+    // Restore the default framebuffer and the on-screen viewport so a
+    // subsequent normal -drawRect: isn't left drawing into (or sized for)
+    // this one-shot offscreen target.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    NSRect backingBounds = [self convertRectToBacking:self.bounds];
+    glViewport(0, 0, (GLsizei)backingBounds.size.width, (GLsizei)backingBounds.size.height);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &colorTex);
+
+    return result;
 }
 
 - (void)dealloc {
