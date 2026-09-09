@@ -102,9 +102,25 @@ constexpr double kCIELUVWorkingScale = 100.0;
 Color srgbToCIELUV(const Color& srgb);
 
 // Inverse of srgbToCIELUV (undoes both the CIE formulas and the /
-// kCIELUVWorkingScale division). Round-trips srgbToCIELUV to within
-// floating-point precision for any input (including the signed-extended
-// out-of-gamut regime described above).
+// kCIELUVWorkingScale division). Round-trips srgbToCIELUV closely, but
+// NOT to full floating-point precision (an earlier version of this
+// comment claimed it did -- corrected after core/tests/test_main.cpp's
+// cieluv_roundtrip test measured otherwise: up to ~3.8e-6 absolute error
+// on real sample colors, not the ~1e-15 double-precision noise floor
+// "floating-point precision" would imply). Root cause: the sRGB<->XYZ
+// conversion below uses the standard published 3x3 matrices, each
+// direction independently rounded to 7 significant figures -- they are
+// two separately-rounded approximations, not exact algebraic inverses of
+// each other, so even a mathematically perfect round-trip through them
+// (plus the sRGB gamma curve and cbrt-based L*u*v* formulas, each adding
+// their own tiny rounding) accumulates real, structural error on this
+// order. Not considered a bug worth fixing -- deriving an exact algebraic
+// inverse matrix pair would be needless complexity for a cosmetic
+// precision claim, and ~1e-6 in a [0,1]-ish colour channel is far below
+// anything visible or anything the optimizer's own convergence
+// tolerances care about -- but the claim itself is corrected here to
+// match reality rather than left overstated. Holds for any input
+// (including the signed-extended out-of-gamut regime described above).
 Color cieluvToSRGB(const Color& luv);
 
 // Per-pixel srgbToCIELUV/cieluvToSRGB applied to an entire Image (same

@@ -52,6 +52,18 @@ add_executable(gmesh_cli cli/main_cli.cpp)
 target_link_libraries(gmesh_cli PRIVATE gmcore)
 
 # ---------------------------------------------------------------------------
+# gmcore_tests: permanent, dependency-free regression suite (see
+# core/tests/test_main.cpp's header comment for why this exists -- this
+# sandbox has no Xcode/AppKit compiler, so this is the one part of the
+# project that CAN be built and run automatically after every change).
+# Build/run:
+#     cmake -B build . && cmake --build build -j --target gmcore_tests
+#     ./build/gmcore_tests
+# ---------------------------------------------------------------------------
+add_executable(gmcore_tests core/tests/test_main.cpp)
+target_link_libraries(gmcore_tests PRIVATE gmcore)
+
+# ---------------------------------------------------------------------------
 # GradientMeshStudio.app: the interactive macOS AppKit front-end. Only
 # builds on Apple platforms. On macOS, generate the actual Xcode project
 # with:

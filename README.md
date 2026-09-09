@@ -25,12 +25,57 @@ GradientMeshStudio/
                           external dependencies beyond an optional system libpng)
     include/gmcore/*.h
     src/*.cpp
+    tests/test_main.cpp  gmcore_tests: permanent regression suite (see "Regression
+                          tests" below) -- run this after any core/ change
   cli/main_cli.cpp        gmesh_cli: dependency-free command-line test harness
   mac/                    GradientMeshStudio.app: the interactive AppKit UI
                           (Objective-C++, macOS-only)
-  CMakeLists.txt          builds gmcore + gmesh_cli everywhere; builds the macOS
-                          app bundle only when configured on Apple platforms
+  CMakeLists.txt          builds gmcore + gmesh_cli + gmcore_tests everywhere;
+                          builds the macOS app bundle only when configured on
+                          Apple platforms
 ```
+
+## Regression tests
+
+```sh
+cmake -B build . && cmake --build build -j --target gmcore_tests
+./build/gmcore_tests
+```
+
+`core/tests/test_main.cpp` is a small, dependency-free suite (no external test
+framework -- same "no external dependency" convention as the rest of `gmcore`,
+see `SparseBlockSolver.h`'s header comment) covering: `CubicBezier`
+endpoints/closest-point and `fitCubicBezier`; `srgbToCIELUV`/`cieluvToSRGB`
+round-tripping; `GradientMesh::evalPos`/`evalColor`'s exact Hermite-corner
+property; that geometry twist (`Puv`) stays fixed at `{0,0}` regardless of
+whatever is stored in `MeshVertex::Puv` (a paper-fidelity regression --
+Sec. 3's "muv... usually set to zero"); `MeshRenderBuffers::build()` against
+`GradientMesh`'s own `evalPos`/`evalColor` (promoted from an earlier ad hoc,
+throwaway verification program used once during the GPU-preview work);
+`SparseBlockSolver.h`'s block-sparse PCG against an independent dense
+reference solve; `Image`'s row-0-at-top addressing convention; the optimizer
+actually reducing RMSE while keeping the 4 mesh corners hard-fixed; boundary
+vertices staying on their spline after optimizing; and an `SVGExporter` smoke
+test. Exists because this project's development environment has no
+Objective-C++/AppKit compiler at all (only `g++` on Linux) -- every
+`mac/*.mm`/`.h` change ships genuinely unverified until a real Xcode build
+runs, but the pure-C++ `core/` library CAN be compiled and run right here, and
+this project's history (see the bug-fix sections below) is full of real bugs
+this suite would have caught in seconds instead of needing a human to notice a
+washed-out preview or a mirrored image. Meant to be re-run after every
+`core/` change from now on, not just written once and left to bit-rot.
+
+First real run of this suite immediately found one thing: `ColorSpace.h`'s
+`cieluvToSRGB` doc comment claimed round-tripping "to within floating-point
+precision," but a 1e-9-tolerance check failed on 33/36 samples (up to ~3.8e-6
+off) -- traced to the standard published sRGB<->XYZ matrices being
+independently-rounded approximations in each direction, not exact algebraic
+inverses of each other, so real (if tiny and functionally harmless) error
+accumulates through a round trip. Not a bug worth fixing, but the doc comment
+was corrected to match measured reality instead of left overstated -- see
+`ColorSpace.h` and `core/tests/test_main.cpp`'s `test_cieluv_roundtrip`. Kept
+here as the first concrete example of this suite finding something real on
+its very first run, not just passing trivially.
 
 ## Building on macOS (the Xcode project)
 
