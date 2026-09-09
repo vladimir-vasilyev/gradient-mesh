@@ -128,25 +128,23 @@
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
     glEnableVertexAttribArray(0);
 
-    // Explicit belt-and-suspenders: GL_FRAMEBUFFER_SRGB defaults to
-    // disabled per spec (we never enable it), so this SHOULD be a no-op --
-    // but it directly targets a reported symptom (GPU preview looking
-    // slightly lighter/less saturated than the CPU one, in BOTH sRGB and
-    // CIELUV modes) that matches a known class of bug: if this GPU/driver
-    // combo's legacy (deprecated since 10.14, unmaintained since) OpenGL
-    // implementation doesn't honor that default and silently treats the
-    // default framebuffer as sRGB-encoded, it would apply an extra
-    // linear->sRGB re-encode on top of the ALREADY sRGB-encoded values our
-    // fragment shader writes (same convention DocumentModel's CPU path
-    // uses) -- which would brighten and flatten every pixel, independent of
-    // which color-space branch produced it. This is the same SHAPE of bug
-    // (an ambiguous/generic colorspace interpretation) as the one already
-    // found and fixed in -renderReconstructionPreview's own history (see
-    // that method's comment on CGColorSpaceCreateDeviceRGB() vs explicit
-    // kCGColorSpaceSRGB) -- NOT verified against a real GPU/driver here
-    // (no macOS/OpenGL environment available in this project's dev
-    // environment), just the best-supported hypothesis pending an on-device
-    // check of whether this alone resolves it.
+    // Kept as cheap belt-and-suspenders, but see -applySRGBWindowColorSpace
+    // below for the fix that actually turned out to matter: this flag only
+    // affects a framebuffer whose COLOR ATTACHMENT format is itself
+    // GL_SRGB8_ALPHA8. The default framebuffer here is a plain 32-bit RGBA
+    // surface (see the NSOpenGLPixelFormat request in -initWithFrame:,
+    // NSOpenGLPFAColorSize 32 -- not an sRGB format), so this was very
+    // likely a no-op for the on-screen path all along. Confirmed by
+    // comparing the on-screen preview against a PNG saved via
+    // -renderToImageWithWidth:height: (same shader, same draw call --
+    // -drawMeshFittedToSize: -- same numeric bytes, just read straight out
+    // of an offscreen FBO with no window compositor involved): the
+    // exported file came out correctly saturated while the on-screen view
+    // was still washed out, with this flag already disabled either way.
+    // That rules the fragment shader and vertex data out a second, more
+    // direct way and narrows the bug specifically to the "present the
+    // swapped GL buffer to the screen" step -- which is a compositor-level
+    // concern this flag never touches.
     glDisable(GL_FRAMEBUFFER_SRGB);
 
     // Matches CanvasView.mm drawRect:'s own background fill color
@@ -155,6 +153,41 @@
     // background.
     glClearColor(0.16f, 0.16f, 0.16f, 1.0f);
     _glSetUp = YES;
+
+    // See -applySRGBWindowColorSpace's comment. Usually redundant with the
+    // -viewDidMoveToWindow call below (that fires first in the normal
+    // "add view to window, then it gets a live GL context" order), but
+    // cheap, idempotent, and guards the case where this view is already
+    // in a window by the time -prepareOpenGL runs.
+    [self applySRGBWindowColorSpace];
+}
+
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self applySRGBWindowColorSpace];
+}
+
+// Explicitly tags this window's backing store as sRGB, rather than
+// whatever color space the window/display defaults to (frequently Display
+// P3 on modern Macs). This is the fix for the reported "GPU preview looks
+// washed out ON SCREEN, but a PNG saved via -renderToImageWithWidth:height:
+// from the exact same draw call looks correctly saturated": the fragment
+// shader writes sRGB-encoded bytes (same convention as every other
+// renderer in this app -- see DocumentModel.mm's -renderReconstructionPreview
+// comment on the same underlying "ambiguous/generic colorspace -> ColorSync
+// picks a flatter fallback" bug class this project has now hit three
+// times), but the raw swapped OpenGL buffer the window compositor presents
+// carries no per-pixel color-space tag the way a CGImage does -- so
+// without this, the compositor can interpret those bytes as though they
+// were already in the window's native (often wider-gamut) space, muting
+// the on-screen result relative to what the identical bytes decode to as
+// sRGB, exactly matching the reported symptom and exactly explaining why
+// only the on-screen path (not the read-back/export path, which tags its
+// CGImage sRGB explicitly) was affected.
+- (void)applySRGBWindowColorSpace {
+    if (self.window && ![self.window.colorSpace isEqual:[NSColorSpace sRGBColorSpace]]) {
+        self.window.colorSpace = [NSColorSpace sRGBColorSpace];
+    }
 }
 
 - (void)reshape {
