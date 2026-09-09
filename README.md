@@ -1625,10 +1625,34 @@ there `geomDataWeight` also strengthens the colour fit against
 `smoothWeightColor`/`colorDerivRidge`, a real difference from the other two solver
 modes, not an oversight). Setting it to `~10000` with the other six weights left at
 their defaults is the direct way to reproduce the pre-`kCIELUVWorkingScale` behaviour
-(border artifacts + sharp edges) without touching `ColorSpace.cpp` at all. **Not yet
-verified**: this derivation is from reading the accumulation code, not from an on-device
-run with `geomDataWeight` actually dialed up -- next real test should confirm it
-reproduces the original artifact/sharpness trade-off before relying on it further.
+(border artifacts + sharp edges) without touching `ColorSpace.cpp` at all.
+
+**Verified** (this was previously an unverified derivation from reading the
+accumulation code -- now confirmed with a real on-device run): added a
+`--geom-data-weight W` flag to `gmesh_cli` (there wasn't one before, unlike every
+other `OptimizerOptions` field) and ran the same 5x5/`gradient.png` case from the
+tables above, sRGB throughout (no CIELUV involved at all), comparing the default
+`geomDataWeight=1.0` against `10000`:
+
+| `--geom-data-weight` | interior column (col=2) x across rows | other symptoms |
+|---|---|---|
+| 1.0 (current default) | 103.3-115.8 (~12.5px), monotonic-ish | none; matches the "new defaults" row in the earlier table |
+| 10000 | 96.3-115.8 (~19.5px), but row 2 dips to 96.3 between rows 1 (115.5) and 3 (109.5) -- non-monotonic | row 3's `y` (165.94) overshoots the mesh's own bottom-right neighbors; per-vertex `Pv` tangent magnitudes swing as high as ~195 (vs ~50 at default) -- visibly unstable |
+
+This reproduces exactly the predicted shape: wider geometric movement, but
+non-monotonic/disordered rather than a clean sharper snap, plus tangent
+magnitudes blowing up -- the same "sharp, but unstable: border artifacts,
+shuffled patches" signature the original raw-CIELUV run produced, now shown to
+be reproducible from `geomDataWeight` alone in plain sRGB, confirming this
+field's effect is exactly what its comment (and `kCIELUVWorkingScale`'s own
+derivation) claims. Final RMSE also dropped further (0.03067 -> 0.02265, a
+72.2% reduction vs. the default's 62.3%) -- i.e. `geomDataWeight=10000` finds a
+*lower-energy* configuration by the optimizer's own metric, it's just a worse
+one geometrically (a real, useful caution for anyone tempted to just crank this
+value for a "better" RMSE number). Not adopted as a new default -- this
+confirms the mechanism, it doesn't argue for using it; the practical edge-
+snapping gap below still needs a real fix, not just amplifying the data term
+until it dominates and destabilizes.
 
 ## How this was tested
 

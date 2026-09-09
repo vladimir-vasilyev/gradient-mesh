@@ -59,7 +59,8 @@ static void printUsage(const char* prog) {
         "Usage: %s [--input path.ppm|.png] [--out-prefix name] [--rows N] [--cols N]\n"
         "          [--pyramid-levels N] [--margin px] [--width W --height H]\n"
         "          [--smooth-geom W] [--smooth-color W] [--color-ridge W] [--boundary-weight W]\n"
-        "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--vline \"x,y;x,y;...\"]\n"
+        "          [--tangent-prior W] [--edge-gain W] [--edge-min-factor W] [--geom-data-weight W]\n"
+        "          [--vline \"x,y;x,y;...\"]\n"
         "          [--vector-line-weight W]\n"
         "          [--outer-iters N] [--outer-conv-tol X] [--outer-conv-patience N]\n"
         "          [--pyramid-restarts N]\n"
@@ -80,6 +81,11 @@ static void printUsage(const char* prog) {
         "  see that field's comment). No effect without --use-ceres/--use-ceres-joint.\n"
         "  With no --input, a synthetic shaded-sphere test image is generated so the\n"
         "  optimizer can be exercised without any external files.\n"
+        "  --geom-data-weight W: OptimizerOptions::geomDataWeight -- multiplies the\n"
+        "  geometry step's photometric data term only (see that field's comment in\n"
+        "  MeshOptimizer.h). Default 1.0 reproduces normal sRGB-scale behavior; ~10000\n"
+        "  is the documented hypothesis for reproducing the pre-kCIELUVWorkingScale\n"
+        "  aggressive-edge-bending/border-artifact behavior without touching CIELUV.\n"
         "  The --smooth-geom/... flags override OptimizerOptions for quick experiments\n"
         "  without recompiling; also writes <out-prefix>_mesh_points.csv (row,col,x,y)\n"
         "  for visualizing/overlaying the control-point grid.\n",
@@ -124,6 +130,7 @@ int main(int argc, char** argv) {
         else if (a == "--width") synthW = std::stoi(next());
         else if (a == "--height") synthH = std::stoi(next());
         else if (a == "--smooth-geom") opts.smoothWeightGeom = std::stod(next());
+        else if (a == "--geom-data-weight") opts.geomDataWeight = std::stod(next());
         else if (a == "--smooth-color") opts.smoothWeightColor = std::stod(next());
         else if (a == "--color-ridge") opts.colorDerivRidge = std::stod(next());
         else if (a == "--boundary-weight") opts.boundaryWeight = std::stod(next());
