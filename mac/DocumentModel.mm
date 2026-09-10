@@ -7,6 +7,8 @@
 #include "gmcore/SVGExporter.h"
 #include "gmcore/ColorSpace.h"
 #include "gmcore/MeshRenderBuffers.h"
+#include "gmcore/LazySnapping.h"
+#include "gmcore/ContourTracing.h"
 #include <vector>
 #include <array>
 #include <memory>
@@ -104,6 +106,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // outer iterations (see the lambda in -optimizeWithPyramidLevels:...).
     std::unique_ptr<GradientMesh> _previewMesh;
     std::vector<VectorLine> _vectorLines;
+    // Foreground/background scribble strokes for the Lazy-Snapping-style
+    // segmentation tool (see -segmentBoundaryFromScribblesWithError: below).
+    // Reuses VectorLine as a generic polyline container purely for
+    // convenience (it's just {std::vector<Vec2> points;}) -- these are NOT
+    // rendered as vector guide lines and have nothing to do with _vectorLines.
+    std::vector<VectorLine> _fgScribbles;
+    std::vector<VectorLine> _bgScribbles;
     BOOL _isOptimizing;
     double _lastRMSE;
     double _lastMAE; // see -currentMAE's doc comment in DocumentModel.h
@@ -317,6 +326,8 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     _hasBoundary = NO;
     _mesh.reset();
     _vectorLines.clear();
+    _fgScribbles.clear();
+    _bgScribbles.clear();
     _boundaryPolygon.clear();
     self.displayImage = [[NSImage alloc] initWithContentsOfURL:url];
     return YES;
@@ -529,6 +540,114 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         [lines addObject:pts];
     }
     return lines;
+}
+
+#pragma mark - Scribble-based segmentation (Lazy Snapping)
+
+- (void)addForegroundScribbleWithPoints:(NSArray<NSValue*>*)points {
+    if (points.count < 1) return;
+    VectorLine line;
+    for (NSValue* v in points) {
+        NSPoint p = [v pointValue];
+        line.points.push_back(Vec2(p.x, p.y));
+    }
+    _fgScribbles.push_back(std::move(line));
+}
+
+- (void)addBackgroundScribbleWithPoints:(NSArray<NSValue*>*)points {
+    if (points.count < 1) return;
+    VectorLine line;
+    for (NSValue* v in points) {
+        NSPoint p = [v pointValue];
+        line.points.push_back(Vec2(p.x, p.y));
+    }
+    _bgScribbles.push_back(std::move(line));
+}
+
+- (void)removeLastForegroundScribble {
+    if (!_fgScribbles.empty()) _fgScribbles.pop_back();
+}
+
+- (void)removeLastBackgroundScribble {
+    if (!_bgScribbles.empty()) _bgScribbles.pop_back();
+}
+
+- (void)clearScribbles {
+    _fgScribbles.clear();
+    _bgScribbles.clear();
+}
+
+- (NSArray<NSArray<NSValue*>*>*)foregroundScribblePoints {
+    NSMutableArray* lines = [NSMutableArray arrayWithCapacity:_fgScribbles.size()];
+    for (auto& line : _fgScribbles) {
+        NSMutableArray* pts = [NSMutableArray arrayWithCapacity:line.points.size()];
+        for (auto& p : line.points) [pts addObject:[NSValue valueWithPoint:NSMakePoint(p.x, p.y)]];
+        [lines addObject:pts];
+    }
+    return lines;
+}
+
+- (NSArray<NSArray<NSValue*>*>*)backgroundScribblePoints {
+    NSMutableArray* lines = [NSMutableArray arrayWithCapacity:_bgScribbles.size()];
+    for (auto& line : _bgScribbles) {
+        NSMutableArray* pts = [NSMutableArray arrayWithCapacity:line.points.size()];
+        for (auto& p : line.points) [pts addObject:[NSValue valueWithPoint:NSMakePoint(p.x, p.y)]];
+        [lines addObject:pts];
+    }
+    return lines;
+}
+
+- (BOOL)hasForegroundScribbles { return !_fgScribbles.empty(); }
+- (BOOL)hasBackgroundScribbles { return !_bgScribbles.empty(); }
+
+- (BOOL)segmentBoundaryFromScribblesWithError:(NSError**)error {
+    if (!_hasImage) { if (error) *error = gmError(@"Load an image first."); return NO; }
+    if (_fgScribbles.empty() || _bgScribbles.empty()) {
+        if (error) *error = gmError(@"Scribble both foreground (green) and background (pink) before segmenting.");
+        return NO;
+    }
+
+    // Rasterize each stroke's stored points into pixel-coordinate scribble
+    // sets by stamping a filled disc around every point -- a single click
+    // (or a widely-spaced drag) should still paint a usable patch of
+    // scribble, not just a lone pixel. Radius matches CanvasView's 3px
+    // drag-sampling density so a drawn stroke ends up as a solid band, not
+    // a dotted line, once rasterized. Uses the raw sRGB _target, not the
+    // CIELUV conversion -- segmentation is a pre-mesh-building step,
+    // unaffected by useCIELUVColorSpace (see -workingTargetImage).
+    const int kScribbleRadius = 4;
+    const int w = _target.width, h = _target.height;
+    gmcore::SegmentationScribbles scribbles;
+    auto stampDisc = [&](double cx, double cy, std::vector<std::pair<int, int>>& out) {
+        int ix = (int)std::lround(cx), iy = (int)std::lround(cy);
+        for (int dy = -kScribbleRadius; dy <= kScribbleRadius; ++dy) {
+            for (int dx = -kScribbleRadius; dx <= kScribbleRadius; ++dx) {
+                if (dx * dx + dy * dy > kScribbleRadius * kScribbleRadius) continue;
+                int x = ix + dx, y = iy + dy;
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                out.emplace_back(x, y);
+            }
+        }
+    };
+    for (auto& line : _fgScribbles)
+        for (auto& p : line.points) stampDisc(p.x, p.y, scribbles.foreground);
+    for (auto& line : _bgScribbles)
+        for (auto& p : line.points) stampDisc(p.x, p.y, scribbles.background);
+
+    std::vector<uint8_t> mask = gmcore::segmentForeground(_target, scribbles);
+    std::vector<Vec2> contour = gmcore::traceOuterContour(mask, w, h);
+    if (contour.size() < 3) {
+        if (error) *error = gmError(@"Segmentation didn't find a usable region -- try adding more scribbles.");
+        return NO;
+    }
+    std::vector<Vec2> simplified = gmcore::simplifyClosedPolygon(contour, /*epsilonPixels=*/2.0);
+
+    NSMutableArray<NSValue*>* poly = [NSMutableArray arrayWithCapacity:simplified.size()];
+    for (auto& p : simplified) [poly addObject:[NSValue valueWithPoint:NSMakePoint(p.x, p.y)]];
+    // Reuses the EXACT same entry point manual click-tracing already feeds
+    // -- corner-picking and boundary Bezier fitting are unchanged from here.
+    [self setBoundaryPolygonPoints:poly];
+    return YES;
 }
 
 #pragma mark - Optimize

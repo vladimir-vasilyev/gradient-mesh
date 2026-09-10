@@ -5,6 +5,7 @@
     NSMutableArray<NSValue*>* _boundaryDraft;   // points while tracing (image coords)
     NSMutableArray<NSNumber*>* _cornerDraft;    // indices into documentModel.boundaryPolygonPoints
     NSMutableArray<NSValue*>* _vectorLineDraft; // points while drawing the current guide line
+    NSMutableArray<NSValue*>* _scribbleDraft;   // points while painting the current scribble stroke
     BOOL _draggingVertex;
     NSInteger _dragRow, _dragCol;
     NSInteger _editingRow, _editingCol; // for the color panel callback
@@ -13,6 +14,8 @@
 - (void)appendCurveInto:(NSBezierPath*)path from:(NSPoint)p0 dm:(DocumentModel*)dm
                       r0:(NSInteger)r0 c0:(NSInteger)c0 r1:(NSInteger)r1 c1:(NSInteger)c1;
 - (void)drawArrowFromImagePoint:(NSPoint)aImg toImagePoint:(NSPoint)bImg color:(NSColor*)color;
+- (void)drawScribbles;
+- (void)strokeScribble:(NSArray<NSValue*>*)pts color:(NSColor*)color;
 @end
 
 @implementation CanvasView
@@ -22,6 +25,7 @@
         _boundaryDraft = [NSMutableArray array];
         _cornerDraft = [NSMutableArray array];
         _vectorLineDraft = [NSMutableArray array];
+        _scribbleDraft = [NSMutableArray array];
         _showMeshOverlay = YES;
     }
     return self;
@@ -83,6 +87,7 @@
 - (void)setToolMode:(GMToolMode)toolMode {
     _toolMode = toolMode;
     [_vectorLineDraft removeAllObjects];
+    [_scribbleDraft removeAllObjects];
     [self setNeedsDisplay:YES];
 }
 
@@ -131,6 +136,7 @@
     // of this request and doesn't need the preview snapshot to stay safe.
     if (self.showTangents && dm.hasMesh && !dm.isOptimizing) [self drawTangents];
     [self drawVectorLines];
+    [self drawScribbles];
 }
 
 - (void)drawBoundary {
@@ -153,28 +159,43 @@
         [path closePath];
         [[NSColor systemYellowColor] setStroke];
         [path stroke];
-    } else if (_boundaryDraft.count > 0) {
+    } else if (_boundaryDraft.count > 0 || dm.boundaryPolygonPoints.count > 0) {
+        // Falls back to dm.boundaryPolygonPoints when _boundaryDraft is
+        // empty -- the same fallback the corner-picking mouseDown: handler
+        // below already used (so clicking corners already worked on a
+        // segmentation-produced polygon), but -drawBoundary itself didn't
+        // draw anything in that case until now: a polygon set via
+        // -segmentBoundaryFromScribblesWithError: (instead of manual
+        // click-tracing, which populates _boundaryDraft as it goes) would
+        // otherwise be invisible right up until the user started clicking
+        // corners blind.
+        NSArray<NSValue*>* polyPts = _boundaryDraft.count > 0 ? _boundaryDraft : dm.boundaryPolygonPoints;
         NSBezierPath* path = [NSBezierPath bezierPath];
         path.lineWidth = 1.5;
-        NSPoint first = [self viewPointFromImagePoint:[_boundaryDraft[0] pointValue]];
+        NSPoint first = [self viewPointFromImagePoint:[polyPts[0] pointValue]];
         [path moveToPoint:first];
-        for (NSUInteger i = 1; i < _boundaryDraft.count; ++i)
-            [path lineToPoint:[self viewPointFromImagePoint:[_boundaryDraft[i] pointValue]]];
+        for (NSUInteger i = 1; i < polyPts.count; ++i)
+            [path lineToPoint:[self viewPointFromImagePoint:[polyPts[i] pointValue]]];
         [[NSColor systemYellowColor] setStroke];
         [path stroke];
-        for (NSValue* v in _boundaryDraft) {
+        for (NSValue* v in polyPts) {
             NSPoint p = [self viewPointFromImagePoint:[v pointValue]];
             NSRect dot = NSMakeRect(p.x - 3, p.y - 3, 6, 6);
             [[NSColor systemYellowColor] setFill];
             [[NSBezierPath bezierPathWithOvalInRect:dot] fill];
         }
     }
-    // corner picks (only meaningful before hasBoundary is finalized)
+    // corner picks (only meaningful before hasBoundary is finalized) --
+    // NOTE: indices are into whichever polygon GMToolModeCorners' own
+    // mouseDown: snapped against (_boundaryDraft if non-empty, else
+    // dm.boundaryPolygonPoints -- see that switch case below), so this
+    // lookup must use the SAME fallback, not _boundaryDraft unconditionally.
+    NSArray<NSValue*>* cornerLookupPts = _boundaryDraft.count > 0 ? _boundaryDraft : dm.boundaryPolygonPoints;
     NSInteger ci = 0;
     for (NSNumber* idx in _cornerDraft) {
         NSInteger i = idx.integerValue;
-        if (i < 0 || i >= (NSInteger)_boundaryDraft.count) continue;
-        NSPoint p = [self viewPointFromImagePoint:[_boundaryDraft[(NSUInteger)i] pointValue]];
+        if (i < 0 || i >= (NSInteger)cornerLookupPts.count) continue;
+        NSPoint p = [self viewPointFromImagePoint:[cornerLookupPts[(NSUInteger)i] pointValue]];
         NSRect dot = NSMakeRect(p.x - 5, p.y - 5, 10, 10);
         [[NSColor systemRedColor] setStroke];
         NSBezierPath* ring = [NSBezierPath bezierPathWithOvalInRect:dot];
@@ -316,6 +337,54 @@
     [path stroke];
 }
 
+// Foreground scribbles draw green, background magenta/pink -- deliberately
+// far apart on the color wheel (and from the yellow boundary/red corner-
+// pick markers already used elsewhere in this view) so they stay legible
+// on top of any source photo. The in-progress stroke (still being dragged)
+// draws in the same color at reduced alpha, so it's visually distinct from
+// already-committed strokes without needing a second color.
+- (void)drawScribbles {
+    DocumentModel* dm = self.documentModel;
+    NSColor* fgColor = [NSColor systemGreenColor];
+    NSColor* bgColor = [NSColor systemPinkColor];
+    for (NSArray<NSValue*>* stroke in dm.foregroundScribblePoints) [self strokeScribble:stroke color:fgColor];
+    for (NSArray<NSValue*>* stroke in dm.backgroundScribblePoints) [self strokeScribble:stroke color:bgColor];
+    if (_scribbleDraft.count > 0) {
+        NSColor* liveColor = (self.toolMode == GMToolModeScribbleBackground) ? bgColor : fgColor;
+        [self strokeScribble:_scribbleDraft color:[liveColor colorWithAlphaComponent:0.55]];
+    }
+}
+
+// Deliberately thicker (6pt) than strokeLine:'s 2pt vector-line stroke --
+// scribbles are meant to read as a "paint brush" mark, not a thin guide
+// line, and DocumentModel rasterizes each stored point into a matching-
+// radius filled disc when building the actual segmentation scribble pixel
+// set (see -addForegroundScribbleWithPoints:'s comment in DocumentModel.mm)
+// -- the on-screen width here is a cosmetic echo of that, not read back
+// from it, so the two are kept visually close but not algorithmically
+// coupled to the exact same constant.
+- (void)strokeScribble:(NSArray<NSValue*>*)pts color:(NSColor*)color {
+    if (pts.count == 0) return;
+    if (pts.count == 1) {
+        // A single click with no drag -- a "dab" -- has no line to stroke;
+        // draw it as a filled dot so it's still visible and still counts.
+        NSPoint p = [self viewPointFromImagePoint:[pts[0] pointValue]];
+        NSRect dot = NSMakeRect(p.x - 4, p.y - 4, 8, 8);
+        [color setFill];
+        [[NSBezierPath bezierPathWithOvalInRect:dot] fill];
+        return;
+    }
+    NSBezierPath* path = [NSBezierPath bezierPath];
+    path.lineWidth = 6.0;
+    path.lineCapStyle = NSLineCapStyleRound;
+    path.lineJoinStyle = NSLineJoinStyleRound;
+    NSPoint first = [self viewPointFromImagePoint:[pts[0] pointValue]];
+    [path moveToPoint:first];
+    for (NSUInteger i = 1; i < pts.count; ++i) [path lineToPoint:[self viewPointFromImagePoint:[pts[i] pointValue]]];
+    [color setStroke];
+    [path stroke];
+}
+
 #pragma mark - Mouse handling
 
 - (NSPoint)clampedImagePointForEvent:(NSEvent*)event {
@@ -366,6 +435,13 @@
             [_vectorLineDraft addObject:[NSValue valueWithPoint:ip]];
             break;
         }
+        case GMToolModeScribbleForeground:
+        case GMToolModeScribbleBackground: {
+            [_scribbleDraft removeAllObjects];
+            [_scribbleDraft addObject:[NSValue valueWithPoint:ip]];
+            [self setNeedsDisplay:YES];
+            break;
+        }
         case GMToolModeEditMesh: {
             NSInteger row = 0, col = 0;
             double thresholdImageSpace = 10.0 / MAX(0.001, [self currentScale]);
@@ -397,6 +473,17 @@
         double dx = last.x - ip.x, dy = last.y - ip.y;
         if (dx * dx + dy * dy > 16) [_vectorLineDraft addObject:[NSValue valueWithPoint:ip]];
         [self setNeedsDisplay:YES];
+    } else if (self.toolMode == GMToolModeScribbleForeground || self.toolMode == GMToolModeScribbleBackground) {
+        // Denser sampling (3px) than vector lines' 4px -- DocumentModel
+        // stamps a filled disc around each stored point to build the
+        // actual scribble pixel set (see -addForegroundScribbleWithPoints:'s
+        // comment), and consecutive discs need to overlap for the painted
+        // stroke to read as one continuous region rather than a dotted
+        // line; see that comment for the matching disc radius.
+        NSPoint last = _scribbleDraft.count > 0 ? [_scribbleDraft.lastObject pointValue] : ip;
+        double dx = last.x - ip.x, dy = last.y - ip.y;
+        if (dx * dx + dy * dy > 9) [_scribbleDraft addObject:[NSValue valueWithPoint:ip]];
+        [self setNeedsDisplay:YES];
     } else if (self.toolMode == GMToolModeEditMesh && _draggingVertex) {
         [dm setMeshVertexPosition:ip atRow:_dragRow col:_dragCol];
         [self setNeedsDisplay:YES];
@@ -407,6 +494,18 @@
     if (self.toolMode == GMToolModeVectorLine) {
         if (_vectorLineDraft.count >= 2 && self.onVectorLineFinished) self.onVectorLineFinished([_vectorLineDraft copy]);
         [_vectorLineDraft removeAllObjects];
+        [self setNeedsDisplay:YES];
+    } else if (self.toolMode == GMToolModeScribbleForeground || self.toolMode == GMToolModeScribbleBackground) {
+        // >=1 (not >=2 like vector lines): a single click with no drag is a
+        // valid one-pixel "dab", useful for touching up a small mistake
+        // without a full stroke.
+        if (_scribbleDraft.count >= 1) {
+            DocumentModel* dm = self.documentModel;
+            if (self.toolMode == GMToolModeScribbleForeground) [dm addForegroundScribbleWithPoints:_scribbleDraft];
+            else [dm addBackgroundScribbleWithPoints:_scribbleDraft];
+            if (self.onScribblesChanged) self.onScribblesChanged();
+        }
+        [_scribbleDraft removeAllObjects];
         [self setNeedsDisplay:YES];
     } else if (self.toolMode == GMToolModeEditMesh && _draggingVertex) {
         _draggingVertex = NO;

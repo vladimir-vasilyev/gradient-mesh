@@ -103,6 +103,7 @@
     NSView* content = self.window.contentView;
 
     NSView* controlsRow1 = [self makeRow];
+    NSView* controlsRow1b = [self makeRow];
     NSView* controlsRow2 = [self makeRow];
     NSView* controlsRow3 = [self makeRow];
     NSView* controlsRow4 = [self makeRow];
@@ -114,11 +115,15 @@
 
     self.toolSegmented = [[NSSegmentedControl alloc] init];
     self.toolSegmented.translatesAutoresizingMaskIntoConstraints = NO;
-    self.toolSegmented.segmentCount = 4;
-    NSArray* labels = @[@"1. Trace Boundary", @"2. Pick 4 Corners", @"3. Vector Line", @"4. Edit Mesh"];
+    self.toolSegmented.segmentCount = 6;
+    // Scribble FG/BG are the new Lazy-Snapping-style cutout tool (see
+    // -segmentBoundary: below); Corners/Vector Line/Edit Mesh are
+    // renumbered 3/4 to make room but are otherwise unchanged.
+    NSArray* labels = @[@"1. Trace Boundary", @"1. Scribble FG", @"1. Scribble BG",
+                        @"2. Pick 4 Corners", @"3. Vector Line", @"4. Edit Mesh"];
     for (NSUInteger i = 0; i < labels.count; ++i) {
         [self.toolSegmented setLabel:labels[i] forSegment:i];
-        [self.toolSegmented setWidth:120 forSegment:i];
+        [self.toolSegmented setWidth:110 forSegment:i];
     }
     self.toolSegmented.target = self;
     self.toolSegmented.action = @selector(toolChanged:);
@@ -126,6 +131,12 @@
     NSButton* clearLineBtn = [self buttonTitled:@"Clear Last Line" action:@selector(clearLastLine:)];
 
     for (NSView* v in @[openBtn, autoBtn, self.toolSegmented, clearLineBtn]) [controlsRow1 addSubview:v];
+
+    // --- Row 1b: Lazy-Snapping-style segmentation (scribble tools above) ---
+    NSButton* segmentBtn = [self buttonTitled:@"Segment" action:@selector(segmentBoundary:)];
+    NSButton* clearScribblesBtn = [self buttonTitled:@"Clear Scribbles" action:@selector(clearScribbles:)];
+    NSTextField* scribbleHintLabel = [self makeLabel:@"(scribble foreground/background above, then Segment)"];
+    for (NSView* v in @[segmentBtn, clearScribblesBtn, scribbleHintLabel]) [controlsRow1b addSubview:v];
 
     // --- Row 2: mesh + optimize + export ---
     NSTextField* rowsLabel = [self makeLabel:@"Rows:"];
@@ -334,6 +345,7 @@
     [presetSidebar.topAnchor constraintEqualToAnchor:canvasRow.topAnchor].active = YES;
 
     [content addSubview:controlsRow1];
+    [content addSubview:controlsRow1b];
     [content addSubview:controlsRow2];
     [content addSubview:controlsRow3];
     [content addSubview:controlsRow4];
@@ -341,9 +353,10 @@
     [content addSubview:canvasRow];
     [content addSubview:self.statusLabel];
 
-    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow2, controlsRow3, controlsRow4,
+    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow1b, controlsRow2, controlsRow3, controlsRow4,
                                                            controlsRow5, canvasRow, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1b]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow3]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow4]-8-|" options:0 metrics:nil views:views]];
@@ -351,11 +364,12 @@
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[canvasRow]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
-        @"V:|-8-[controlsRow1(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
+        @"V:|-8-[controlsRow1(28)]-6-[controlsRow1b(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
         "-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
+    [self layoutRowChildren:controlsRow1b];
     [self layoutRowChildren:controlsRow2];
     [self layoutRowChildren:controlsRow3];
     [self layoutRowChildren:controlsRow4];
@@ -426,6 +440,12 @@
         [weakSelf.documentModel addVectorLineWithPoints:points];
         [weakSelf.canvasView setNeedsDisplay:YES];
     };
+    self.canvasView.onScribblesChanged = ^{
+        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Scribbles: %lu foreground, %lu background. Click “Segment” when ready.",
+                                             (unsigned long)weakSelf.documentModel.foregroundScribblePoints.count,
+                                             (unsigned long)weakSelf.documentModel.backgroundScribblePoints.count];
+        [weakSelf.canvasView setNeedsDisplay:YES];
+    };
     self.canvasView.onMeshEdited = ^{
         weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"RMSE (unrefit): %.4f  MAE: %.4f%@",
                                              weakSelf.documentModel.currentRMSE, weakSelf.documentModel.currentMAE,
@@ -471,14 +491,36 @@
 - (void)toolChanged:(id)sender {
     switch (self.toolSegmented.selectedSegment) {
         case 0: self.canvasView.toolMode = GMToolModeBoundary; break;
-        case 1: self.canvasView.toolMode = GMToolModeCorners; break;
-        case 2: self.canvasView.toolMode = GMToolModeVectorLine; break;
-        case 3: self.canvasView.toolMode = GMToolModeEditMesh; break;
+        case 1: self.canvasView.toolMode = GMToolModeScribbleForeground; break;
+        case 2: self.canvasView.toolMode = GMToolModeScribbleBackground; break;
+        case 3: self.canvasView.toolMode = GMToolModeCorners; break;
+        case 4: self.canvasView.toolMode = GMToolModeVectorLine; break;
+        case 5: self.canvasView.toolMode = GMToolModeEditMesh; break;
     }
 }
 
 - (void)clearLastLine:(id)sender {
     [self.documentModel removeLastVectorLine];
+    [self.canvasView setNeedsDisplay:YES];
+}
+
+- (void)segmentBoundary:(id)sender {
+    NSError* error = nil;
+    if (![self.documentModel segmentBoundaryFromScribblesWithError:&error]) {
+        [self presentError:error];
+        return;
+    }
+    // Mirrors -wireCanvasCallbacks' onBoundaryChanged status message --
+    // segmentBoundaryFromScribblesWithError: feeds the exact same
+    // -setBoundaryPolygonPoints: entry point manual click-tracing does, so
+    // the next step (corner-picking) is identical either way.
+    self.statusLabel.stringValue = @"Boundary segmented from scribbles. Switch to “Pick 4 Corners” and click the 4 corner points (in order).";
+    [self.canvasView setNeedsDisplay:YES];
+}
+
+- (void)clearScribbles:(id)sender {
+    [self.documentModel clearScribbles];
+    self.statusLabel.stringValue = @"Scribbles cleared.";
     [self.canvasView setNeedsDisplay:YES];
 }
 
@@ -493,7 +535,7 @@
     NSInteger rows = MAX(3, self.rowsField.integerValue), cols = MAX(3, self.colsField.integerValue);
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
-    [self.toolSegmented setSelected:YES forSegment:3];
+    [self.toolSegmented setSelected:YES forSegment:5];
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Auto rectangular boundary + %ldx%ld grid built. RMSE=%.4f  MAE=%.4f%@. Click Optimize.",
                                      (long)rows, (long)cols, self.documentModel.currentRMSE, self.documentModel.currentMAE,
                                      self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
@@ -505,7 +547,7 @@
     NSInteger rows = MAX(3, self.rowsField.integerValue), cols = MAX(3, self.colsField.integerValue);
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
-    [self.toolSegmented setSelected:YES forSegment:3];
+    [self.toolSegmented setSelected:YES forSegment:5];
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Initial %ldx%ld mesh built. RMSE=%.4f  MAE=%.4f%@. Optionally draw vector lines, then click Optimize.",
                                      (long)rows, (long)cols, self.documentModel.currentRMSE, self.documentModel.currentMAE,
                                      self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];

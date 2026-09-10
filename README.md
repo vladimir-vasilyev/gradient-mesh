@@ -252,14 +252,15 @@ comments at the relevant spot too:
   block-sparse Conjugate Gradient solver (`SparseBlockSolver.h`) with Jacobi
   preconditioning, instead of e.g. Eigen -- this sandbox has no network access to vendor
   a third-party library, and it keeps the Xcode project dependency-free too.
-* **The "cutout tool" is plain click-tracing (algorithm now exists, UI wiring
-  pending).** The paper cites a separate Lazy-Snapping-style interactive segmentation
-  tool for isolating the object; this project's boundary tool was originally just
-  click-to-add-a-point polygon tracing, fitted with cubic Beziers per side afterward.
-  See "A real cutout tool, part 1" below -- the graph-cut segmentation algorithm itself
-  (`MaxFlowGraph`/`LazySnapping`/`ContourTracing`) is now implemented and tested, but not
-  yet wired into `CanvasView`/`MainWindowController`, so manual click-tracing is still
-  the only option in the app today.
+* **The "cutout tool" is now a real Lazy-Snapping-style graph cut, alongside
+  manual tracing.** The paper cites a separate Lazy-Snapping-style interactive
+  segmentation tool for isolating the object; this project's boundary tool was
+  originally just click-to-add-a-point polygon tracing, fitted with cubic Beziers per
+  side afterward. See "A real cutout tool, part 1" and "part 2" below -- the graph-cut
+  segmentation algorithm (`MaxFlowGraph`/`LazySnapping`/`ContourTracing`) is implemented,
+  tested, and now wired into `CanvasView`/`MainWindowController` as two new scribble
+  tool modes plus a "Segment" action; manual click-tracing remains available
+  side-by-side as a fallback, not replaced.
 * **SVG mesh-gradient export uses one `<meshgradient>` per patch** rather than one mesh
   object with SVG2's inter-patch implicit-shared-edge stop omission encoding. A mesh
   gradient only paints inside its own patch boundary, so adjacent patches still tile
@@ -1649,16 +1650,18 @@ an annealed `smoothWeightGeom` schedule (or some other mechanism that isn't just
 one existing knob up") is probably still needed to close this fully -- not attempted
 yet, flagged here as the next real candidate.
 
-## A real cutout tool, part 1: Lazy-Snapping-style graph-cut segmentation (core algorithm)
+## A real cutout tool: Lazy-Snapping-style graph-cut segmentation
 
 Task 3 in this project's current priority order (regression tests, then paper-fidelity
 accuracy work, then a real selection tool -- both earlier items are done, see "Regression
 tests" above and the Ceres/`smoothGeomEdgeGain` sections). This is the item "Known
 simplifications" already flagged: *"The 'cutout tool' is plain click-tracing... the
-paper cites a separate Lazy-Snapping-style interactive segmentation tool."* This first
-piece adds the actual segmentation ALGORITHM as pure, tested `core/` C++ -- no UI yet
-(that's part 2); the goal here was getting the algorithm itself right and verified
-before touching `CanvasView`/`MainWindowController` at all.
+paper cites a separate Lazy-Snapping-style interactive segmentation tool."* Part 1
+(below) added the actual segmentation ALGORITHM as pure, tested `core/` C++ before any
+UI code was written against it -- the goal was getting the algorithm itself right and
+verified first. Part 2 (further below) wires it into `CanvasView`/`MainWindowController`.
+
+### Part 1: the segmentation algorithm (`core/`, no UI)
 
 **Design.** Three new, independent, dependency-free `core/` modules:
 
@@ -1727,19 +1730,60 @@ test image with ~40 scribble pixels of each colour took 119ms; a synthetic 500x5
 two-colour-block image took 44ms, and 1000x1000 took 227ms. All comfortably interactive
 for this project's typical image sizes -- though these are all high-colour-contrast,
 low-texture cases (the easiest kind for a graph cut to converge quickly on); a real
-photo with more texture/noise will need more augmenting paths and take longer, not
-measured here since part 2 (the actual UI, and real user photos to test with) doesn't
-exist yet.
+photo with more texture/noise will need more augmenting paths and take longer -- not
+measured here, since this was run against the same easy synthetic/test cases part 1
+was verified against, before part 2's UI existed to test with real user photos.
 
-**Not yet done (part 2, next):** wiring this into the UI -- new `CanvasView` scribble
-tool modes (foreground/background brush strokes), a "Segment" action in
-`MainWindowController`, and a `DocumentModel` method that runs `segmentForeground` +
-`traceOuterContour` + `simplifyClosedPolygon` and feeds the result into the existing
-`-setBoundaryPolygonPoints:` the manual click-tracing tool already produces (so corner-
-picking and Bezier fitting need zero changes). The manual click-tracing tool stays
-available alongside it -- Lazy Snapping is a faster alternative for a clean
-foreground/background split, not a strict replacement for e.g. a boundary that's easier
-to just click by hand.
+### Part 2: wired into the UI
+
+`DocumentModel` gained foreground/
+background scribble storage (`_fgScribbles`/`_bgScribbles`, reusing the existing
+`VectorLine` polyline struct purely for convenience -- these have nothing to do with the
+vector guide lines) plus `-segmentBoundaryFromScribblesWithError:`, which rasterizes
+each stored stroke into pixel-coordinate scribble sets (stamping a filled radius-4 disc
+around every stored point so a drag reads as a solid band rather than a dotted line to
+the graph cut), runs `segmentForeground` against the raw sRGB image (segmentation is a
+pre-mesh-building step, so `useCIELUVColorSpace` doesn't apply here), traces the largest
+resulting component with `traceOuterContour`, simplifies it with `simplifyClosedPolygon`
+(epsilon 2.0px), and feeds the result into the EXACT SAME `-setBoundaryPolygonPoints:`
+entry point manual click-tracing already produces -- so corner-picking and Bezier
+fitting needed zero changes, exactly as planned in part 1.
+
+`CanvasView` gained two new `GMToolMode` cases, `GMToolModeScribbleForeground`/
+`GMToolModeScribbleBackground` -- click-drag (or a single click, for a one-pixel "dab")
+paints a stroke in green (foreground) or pink (background), denser-sampled (3px) than
+the existing vector-line tool's 4px since consecutive scribble points need to overlap
+once rasterized into discs. `MainWindowController`'s tool-mode segmented control grew
+from 4 to 6 segments (`1. Trace Boundary / 1. Scribble FG / 1. Scribble BG / 2. Pick 4
+Corners / 3. Vector Line / 4. Edit Mesh` -- the "1." prefix repeats deliberately: manual
+tracing and scribbling are two alternative ways to do the same step 1), with a new
+"Segment"/"Clear Scribbles" button row underneath the tool selector.
+
+**A real, pre-existing bug this surfaced (found and fixed before it ever reached the
+UI in a working state):** `CanvasView`'s `-drawBoundary` method, and separately its
+corner-pick-dot-rendering loop, both referenced `_boundaryDraft` (the array manual
+click-tracing appends to as the user clicks) unconditionally. `GMToolModeCorners`'s own
+`mouseDown:` handler already fell back to `dm.boundaryPolygonPoints` when
+`_boundaryDraft` was empty (for finding which point was clicked), but the two *drawing*
+code paths didn't -- meaning a segmentation-produced polygon, which only ever populates
+`dm.boundaryPolygonPoints` directly and never touches `_boundaryDraft`, would have been
+completely invisible on screen, and picked corner markers would never have rendered
+either. This was latent and harmless before scribbles existed (nothing previously set
+`boundaryPolygonPoints` without also driving `_boundaryDraft` through the same
+click-tracing flow), but would have been a real, confusing failure the first time
+someone tried Lazy Snapping. Fixed by giving both drawing code paths the same
+`_boundaryDraft.count > 0 ? _boundaryDraft : dm.boundaryPolygonPoints` fallback the
+mouse handler already used.
+
+**Verification.** No Xcode/AppKit compiler is available in this sandbox, so this
+`.mm`-only UI work could not be compiled or run end-to-end here -- verification was
+limited to careful brace/paren/bracket-balance checks, targeted greps for consistency
+(no leftover references to the old 4-segment tool-mode numbering, every `forSegment:`
+call site updated), and re-running `gmcore_tests` (`core/` itself is untouched by this
+change, so this is cheap insurance, not a real test of the new UI code -- 17/17 test
+cases, 3349/3349 checks still pass). The user's own Xcode build/run is the only way to
+truly confirm the new tool modes and "Segment" button work end-to-end; that hasn't
+happened yet as of this write-up.
 
 ## Optional CIELUV colour space (colour interpolation, not geometry)
 

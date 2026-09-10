@@ -310,6 +310,33 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 - (void)clearVectorLines;
 - (NSArray<NSArray<NSValue*>*>*)vectorLinesPoints;
 
+// --- Scribble-based segmentation (Lazy Snapping, see Li/Sun/Shum 2004 as
+// cited by the Sun et al. 2007 gradient-mesh paper for its cutout tool) ---
+// Foreground/background scribble strokes, image pixel coordinates -- one
+// entry per mouse drag, mirroring the vector-line strokes above. Unlike
+// vector lines, a single-point "dab" (points.count == 1) is accepted: a
+// tap is a valid scribble, not just a drag.
+- (void)addForegroundScribbleWithPoints:(NSArray<NSValue*>*)points;
+- (void)addBackgroundScribbleWithPoints:(NSArray<NSValue*>*)points;
+- (void)removeLastForegroundScribble;
+- (void)removeLastBackgroundScribble;
+- (void)clearScribbles;
+- (NSArray<NSArray<NSValue*>*>*)foregroundScribblePoints;
+- (NSArray<NSArray<NSValue*>*>*)backgroundScribblePoints;
+- (BOOL)hasForegroundScribbles;
+- (BOOL)hasBackgroundScribbles;
+// Runs the graph-cut segmentation (gmcore::segmentForeground) against the
+// raw sRGB image (segmentation is a pre-mesh-building step, independent of
+// useCIELUVColorSpace), traces the outer contour of the largest resulting
+// foreground component (gmcore::traceOuterContour), simplifies it
+// (gmcore::simplifyClosedPolygon), and -- on success -- feeds the result
+// into the EXACT SAME -setBoundaryPolygonPoints: entry point manual
+// click-tracing already uses, so corner-picking and boundary fitting work
+// unchanged afterwards. Fails (returns NO, sets *error) if there aren't
+// scribbles of both colors yet, or if the resulting contour is degenerate
+// (fewer than 3 points -- e.g. scribbles that don't separate anything).
+- (BOOL)segmentBoundaryFromScribblesWithError:(NSError**)error;
+
 // --- Optimization ---
 // progress/completion blocks are always invoked on the main queue.
 - (void)optimizeWithPyramidLevels:(NSInteger)levels
