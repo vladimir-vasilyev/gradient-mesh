@@ -66,4 +66,59 @@ CubicBezier fitCubicBezier(const std::vector<Vec2>& pts) {
     return curve;
 }
 
+namespace {
+
+// Point-to-curve squared distance via CubicBezier's own closestT --
+// consistent with how BezierSpline::closestT itself measures distance,
+// so "does this candidate fit within tolerance" and "how do later
+// queries see this curve" never disagree.
+double squaredDeviation(const CubicBezier& curve, const Vec2& pt) {
+    return (curve.eval(curve.closestT(pt)) - pt).lengthSq();
+}
+
+// Recursive Graphics-Gems-style split-and-refit. `pts` always has at
+// least 2 points on entry (the depth==0/pts.size()<4 base cases below
+// both return early via fitCubicBezier itself, which already handles
+// n<2 degenerately -- see its own comment). Appends the resulting
+// segment(s), in order, onto `out`.
+void fitRecursive(const std::vector<Vec2>& pts, double maxErrorSq, int depth, std::vector<CubicBezier>& out) {
+    CubicBezier candidate = fitCubicBezier(pts);
+    // Too few points to meaningfully split further, or hit the recursion
+    // cap -- accept whatever fitCubicBezier produced even if it's above
+    // tolerance (a straight 2-3 point run can't be improved by splitting;
+    // see fitBezierSpline's own comment on why the depth cap is purely
+    // defensive and not expected to bind on this project's real inputs).
+    if (depth <= 0 || pts.size() < 4) { out.push_back(candidate); return; }
+
+    size_t worstIdx = 0; double worstD = -1.0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        double d = squaredDeviation(candidate, pts[i]);
+        if (d > worstD) { worstD = d; worstIdx = i; }
+    }
+    if (worstD <= maxErrorSq) { out.push_back(candidate); return; }
+
+    // Split at the worst point, sharing it between both halves so the two
+    // recursively-fitted sub-curves join exactly (no gap). Guard against a
+    // degenerate split (worst point at an end) producing an empty half --
+    // falls back to accepting the single-cubic fit rather than recursing
+    // forever on an unsplittable point set.
+    if (worstIdx < 2 || worstIdx > pts.size() - 3) { out.push_back(candidate); return; }
+    std::vector<Vec2> left(pts.begin(), pts.begin() + worstIdx + 1);
+    std::vector<Vec2> right(pts.begin() + worstIdx, pts.end());
+    fitRecursive(left, maxErrorSq, depth - 1, out);
+    fitRecursive(right, maxErrorSq, depth - 1, out);
+}
+
+} // namespace
+
+BezierSpline fitBezierSpline(const std::vector<Vec2>& pts, double maxErrorPixels, int maxDepth) {
+    BezierSpline spline;
+    if (pts.size() < 2) {
+        if (!pts.empty()) { CubicBezier c; c.p0 = c.p1 = c.p2 = c.p3 = pts[0]; spline.segments.push_back(c); }
+        return spline;
+    }
+    fitRecursive(pts, maxErrorPixels * maxErrorPixels, std::max(0, maxDepth), spline.segments);
+    return spline;
+}
+
 } // namespace gmcore

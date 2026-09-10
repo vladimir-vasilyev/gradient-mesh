@@ -120,6 +120,100 @@ static void test_bezier_fit_straight_line() {
     CHECK_NEAR(mid.y, expectedMid.y, 1e-6);
 }
 
+// fitBezierSpline: a straight, evenly-spaced polyline already fits a
+// single cubic essentially exactly (see test_bezier_fit_straight_line
+// above), so the adaptive splitter should NOT split it further -- this is
+// the "already good enough" fast path fitBezierSpline's own header
+// comment describes, and it matters in practice: most manually-traced or
+// segmented sides are reasonably smooth, and needlessly splitting them
+// would just add mesh-irrelevant extra curve segments for no benefit.
+static void test_bezier_spline_no_split_for_smooth_input() {
+    std::vector<Vec2> pts;
+    for (int i = 0; i <= 20; ++i) pts.push_back(Vec2{double(i) * 5.0, double(i) * 5.0});
+    BezierSpline sp = fitBezierSpline(pts, /*maxErrorPixels=*/3.0, /*maxDepth=*/6);
+    CHECK(sp.segments.size() == 1);
+    CHECK_NEAR(sp.eval(0.0).x, pts.front().x, 1e-9);
+    CHECK_NEAR(sp.eval(0.0).y, pts.front().y, 1e-9);
+    CHECK_NEAR(sp.eval(1.0).x, pts.back().x, 1e-9);
+    CHECK_NEAR(sp.eval(1.0).y, pts.back().y, 1e-9);
+}
+
+// fitBezierSpline: a sharp zigzag ("W" shape, 5 straight legs meeting at
+// hard corners) is exactly the case a SINGLE cubic Bezier structurally
+// cannot track (a cubic has at most one inflection point) -- this is the
+// direct stand-in for a real, non-convex object silhouette from
+// LazySnapping-based segmentation. The adaptive splitter should (a) split
+// into multiple segments, (b) keep every input point within
+// maxErrorPixels of the fitted spline, (c) still pin the true start/end
+// endpoints exactly, and (d) stay perfectly continuous across every
+// internal segment joint (consecutive segments must share their
+// endpoint exactly, by construction -- a visible gap in the rendered
+// boundary would be a much worse regression than the single-cubic
+// approximation error this feature exists to fix).
+static void test_bezier_spline_splits_for_sharp_zigzag() {
+    std::vector<Vec2> verts = {{0, 0}, {20, 40}, {40, 0}, {60, 40}, {80, 0}, {100, 40}};
+    std::vector<Vec2> pts;
+    for (size_t seg = 0; seg + 1 < verts.size(); ++seg) {
+        for (int i = 0; i < 20; ++i) {
+            double t = double(i) / 20.0;
+            pts.push_back(verts[seg] + (verts[seg + 1] - verts[seg]) * t);
+        }
+    }
+    pts.push_back(verts.back());
+
+    const double maxErrorPixels = 3.0;
+    BezierSpline sp = fitBezierSpline(pts, maxErrorPixels, /*maxDepth=*/6);
+    CHECK(sp.segments.size() > 1);
+
+    CHECK_NEAR(sp.eval(0.0).x, pts.front().x, 1e-9);
+    CHECK_NEAR(sp.eval(0.0).y, pts.front().y, 1e-9);
+    CHECK_NEAR(sp.eval(1.0).x, pts.back().x, 1e-9);
+    CHECK_NEAR(sp.eval(1.0).y, pts.back().y, 1e-9);
+
+    double maxDeviation = 0.0;
+    for (auto& p : pts) {
+        Vec2 nearest = sp.closestPoint(p);
+        maxDeviation = std::max(maxDeviation, (nearest - p).length());
+    }
+    CHECK(maxDeviation <= maxErrorPixels + 1e-6);
+
+    for (size_t i = 0; i + 1 < sp.segments.size(); ++i) {
+        CHECK_NEAR(sp.segments[i].p3.x, sp.segments[i + 1].p0.x, 1e-9);
+        CHECK_NEAR(sp.segments[i].p3.y, sp.segments[i + 1].p0.y, 1e-9);
+    }
+}
+
+// BezierSpline::closestT: for a point genuinely ON the curve (sampled via
+// eval at a handful of global t values spanning multiple segments),
+// closestT should recover a t whose eval() lands back on that same
+// point -- i.e. round-tripping through closestT doesn't drift to some
+// OTHER segment's closer-looking-but-wrong point near a joint, which is
+// exactly the kind of bug that would silently corrupt boundary-vertex
+// re-projection during optimization (see MeshOptimizer.cpp/
+// MeshOptimizerCeres.cpp's `v.boundaryT = mesh.boundary[...].closestT(v.P)`
+// use of this same method).
+static void test_bezier_spline_closest_t_roundtrip() {
+    std::vector<Vec2> verts = {{0, 0}, {20, 40}, {40, 0}, {60, 40}, {80, 0}, {100, 40}};
+    std::vector<Vec2> pts;
+    for (size_t seg = 0; seg + 1 < verts.size(); ++seg) {
+        for (int i = 0; i < 20; ++i) {
+            double t = double(i) / 20.0;
+            pts.push_back(verts[seg] + (verts[seg + 1] - verts[seg]) * t);
+        }
+    }
+    pts.push_back(verts.back());
+    BezierSpline sp = fitBezierSpline(pts, 3.0, 6);
+    CHECK(sp.segments.size() > 1); // sanity: this test only means something if it actually split
+
+    for (double t : {0.0, 0.1, 0.25, 0.37, 0.5, 0.63, 0.75, 0.9, 1.0}) {
+        Vec2 onCurve = sp.eval(t);
+        double foundT = sp.closestT(onCurve);
+        Vec2 roundTripped = sp.eval(foundT);
+        CHECK_NEAR(roundTripped.x, onCurve.x, 1e-2);
+        CHECK_NEAR(roundTripped.y, onCurve.y, 1e-2);
+    }
+}
+
 // ColorSpace.h's cieluvToSRGB doc comment used to claim srgbToCIELUV/
 // cieluvToSRGB round-trip "to within floating-point precision" for ANY
 // input, including out-of-[0,1]/out-of-gamut values (the signed-extension
@@ -730,6 +824,9 @@ int main() {
     const std::vector<TestCase> tests = {
         {"bezier_endpoints_and_closest", test_bezier_endpoints_and_closest},
         {"bezier_fit_straight_line", test_bezier_fit_straight_line},
+        {"bezier_spline_no_split_for_smooth_input", test_bezier_spline_no_split_for_smooth_input},
+        {"bezier_spline_splits_for_sharp_zigzag", test_bezier_spline_splits_for_sharp_zigzag},
+        {"bezier_spline_closest_t_roundtrip", test_bezier_spline_closest_t_roundtrip},
         {"cieluv_roundtrip", test_cieluv_roundtrip},
         {"mesh_hermite_corner_exactness", test_mesh_hermite_corner_exactness},
         {"geometry_twist_stays_fixed_zero", test_geometry_twist_stays_fixed_zero},
