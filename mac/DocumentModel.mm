@@ -19,6 +19,7 @@
 using gmcore::Vec2;
 using gmcore::Color;
 using gmcore::CubicBezier;
+using gmcore::BezierSpline;
 using gmcore::GradientMesh;
 using gmcore::Image;
 using gmcore::VectorLine;
@@ -91,7 +92,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     gmcore::Image _targetLUV;
     BOOL _hasImage;
     std::vector<Vec2> _boundaryPolygon;
-    std::array<CubicBezier, 4> _boundary;
+    std::array<BezierSpline, 4> _boundary; // each side: one or more cubic segments (see BezierSpline.h/fitBezierSpline)
     BOOL _hasBoundary;
     std::unique_ptr<GradientMesh> _mesh;
     // Post-outer-iteration snapshot copy for livePreviewDuringOptimize (see
@@ -380,7 +381,14 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
             if (i == b) break;
             i = (i + 1) % n;
         }
-        _boundary[side] = gmcore::fitCubicBezier(pts);
+        // Adaptive multi-segment fit (was a single fitCubicBezier) --
+        // see BezierSpline.h: a single cubic structurally cannot track a
+        // non-convex silhouette (e.g. one produced by LazySnapping's
+        // segmentation), so this now subdivides wherever the fit exceeds
+        // maxErrorPixels rather than forcing the whole side through one
+        // curve. A already-smooth side (the common case for a hand-picked,
+        // roughly-convex boundary) still comes back as exactly one segment.
+        _boundary[side] = gmcore::fitBezierSpline(pts, /*maxErrorPixels=*/3.0);
     }
     _hasBoundary = YES;
     return YES;
@@ -390,10 +398,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     if (!_hasImage) return;
     double x0 = marginPixels, y0 = marginPixels;
     double x1 = _target.width - marginPixels, y1 = _target.height - marginPixels;
-    _boundary[0] = {Vec2(x0, y0), Vec2(x0 + (x1 - x0) / 3, y0), Vec2(x0 + 2 * (x1 - x0) / 3, y0), Vec2(x1, y0)};
-    _boundary[1] = {Vec2(x1, y0), Vec2(x1, y0 + (y1 - y0) / 3), Vec2(x1, y0 + 2 * (y1 - y0) / 3), Vec2(x1, y1)};
-    _boundary[2] = {Vec2(x1, y1), Vec2(x0 + 2 * (x1 - x0) / 3, y1), Vec2(x0 + (x1 - x0) / 3, y1), Vec2(x0, y1)};
-    _boundary[3] = {Vec2(x0, y1), Vec2(x0, y0 + 2 * (y1 - y0) / 3), Vec2(x0, y0 + (y1 - y0) / 3), Vec2(x0, y0)};
+    // A perfect rectangle's sides are already exactly straight -- always
+    // exactly one segment, never split (fitBezierSpline would agree, but
+    // there's no polyline to fit here in the first place, just the 4
+    // literal corner points, so build the single-segment BezierSpline
+    // directly).
+    _boundary[0].segments = {CubicBezier{Vec2(x0, y0), Vec2(x0 + (x1 - x0) / 3, y0), Vec2(x0 + 2 * (x1 - x0) / 3, y0), Vec2(x1, y0)}};
+    _boundary[1].segments = {CubicBezier{Vec2(x1, y0), Vec2(x1, y0 + (y1 - y0) / 3), Vec2(x1, y0 + 2 * (y1 - y0) / 3), Vec2(x1, y1)}};
+    _boundary[2].segments = {CubicBezier{Vec2(x1, y1), Vec2(x0 + 2 * (x1 - x0) / 3, y1), Vec2(x0 + (x1 - x0) / 3, y1), Vec2(x0, y1)}};
+    _boundary[3].segments = {CubicBezier{Vec2(x0, y1), Vec2(x0, y0 + 2 * (y1 - y0) / 3), Vec2(x0, y0 + (y1 - y0) / 3), Vec2(x0, y0)}};
     _hasBoundary = YES;
     _boundaryPolygon = {Vec2(x0, y0), Vec2(x1, y0), Vec2(x1, y1), Vec2(x0, y1)};
 }
@@ -504,16 +517,26 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 }
 
 - (NSArray<NSArray<NSValue*>*>*)fittedBoundaryCurves {
+    // Each of the 4 sides may now be MULTIPLE cubic segments (see
+    // BezierSpline.h/fitBezierSpline) -- this flattens all of them, in
+    // order (side 0's segments, then side 1's, ...), into one list of
+    // [p0,p1,p2,p3] arrays. CanvasView's -drawBoundary doesn't need to
+    // know or care how many came from which side: it just chains a
+    // curveToPoint: for every array it's handed, in order, which already
+    // produces the correct continuous closed path whether a side is one
+    // segment or several (consecutive segments share their endpoint
+    // exactly -- see fitBezierSpline's continuity guarantee).
     if (!_hasBoundary) return @[];
-    NSMutableArray<NSArray<NSValue*>*>* out = [NSMutableArray arrayWithCapacity:4];
+    NSMutableArray<NSArray<NSValue*>*>* out = [NSMutableArray array];
     for (int i = 0; i < 4; ++i) {
-        const CubicBezier& b = _boundary[i];
-        [out addObject:@[
-            [NSValue valueWithPoint:NSMakePoint(b.p0.x, b.p0.y)],
-            [NSValue valueWithPoint:NSMakePoint(b.p1.x, b.p1.y)],
-            [NSValue valueWithPoint:NSMakePoint(b.p2.x, b.p2.y)],
-            [NSValue valueWithPoint:NSMakePoint(b.p3.x, b.p3.y)],
-        ]];
+        for (const CubicBezier& b : _boundary[i].segments) {
+            [out addObject:@[
+                [NSValue valueWithPoint:NSMakePoint(b.p0.x, b.p0.y)],
+                [NSValue valueWithPoint:NSMakePoint(b.p1.x, b.p1.y)],
+                [NSValue valueWithPoint:NSMakePoint(b.p2.x, b.p2.y)],
+                [NSValue valueWithPoint:NSMakePoint(b.p3.x, b.p3.y)],
+            ]];
+        }
     }
     return out;
 }
@@ -1104,14 +1127,21 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     NSMutableArray<NSArray*>* boundaryJSON = [NSMutableArray arrayWithCapacity:4];
     if (_hasBoundary) {
         for (int i = 0; i < 4; ++i) {
-            const CubicBezier& b = _boundary[i];
-            [boundaryJSON addObject:@[
-                @[@(b.p0.x), @(b.p0.y)], @[@(b.p1.x), @(b.p1.y)],
-                @[@(b.p2.x), @(b.p2.y)], @[@(b.p3.x), @(b.p3.y)],
-            ]];
+            NSMutableArray<NSArray*>* segmentsJSON = [NSMutableArray arrayWithCapacity:_boundary[i].segments.size()];
+            for (const CubicBezier& b : _boundary[i].segments) {
+                [segmentsJSON addObject:@[
+                    @[@(b.p0.x), @(b.p0.y)], @[@(b.p1.x), @(b.p1.y)],
+                    @[@(b.p2.x), @(b.p2.y)], @[@(b.p3.x), @(b.p3.y)],
+                ]];
+            }
+            [boundaryJSON addObject:segmentsJSON];
         }
     }
-    root[@"boundary"] = boundaryJSON; // [top,right,bottom,left], each [p0,p1,p2,p3]
+    // [top,right,bottom,left], each now a LIST of one-or-more [p0,p1,p2,p3]
+    // segments (see BezierSpline.h/fitBezierSpline) rather than exactly
+    // one -- a schema change from before this side could be more than a
+    // single cubic; nothing else in this repo parses this field back in.
+    root[@"boundary"] = boundaryJSON;
 
     NSMutableArray<NSArray*>* linesJSON = [NSMutableArray arrayWithCapacity:_vectorLines.size()];
     for (const auto& line : _vectorLines) {

@@ -142,9 +142,13 @@
 - (void)drawBoundary {
     DocumentModel* dm = self.documentModel;
     if (dm.hasBoundary) {
-        // Once fitted, draw the REAL 4 cubic Bezier boundary splines (Sec.
-        // 4: "each boundary consists of one or more cubic Bezier splines"),
-        // not a straight approximation of the originally-traced polygon.
+        // Once fitted, draw the REAL fitted boundary splines (Sec. 4: "each
+        // boundary consists of one or more cubic Bezier splines" -- as of
+        // BezierSpline.h/fitBezierSpline, this is now literally true: each
+        // of the 4 sides can be more than one segment, and
+        // -fittedBoundaryCurves already flattens them all into one
+        // in-order list, so this loop doesn't need to know or care), not a
+        // straight approximation of the originally-traced polygon.
         NSBezierPath* path = [NSBezierPath bezierPath];
         path.lineWidth = 1.5;
         BOOL first = YES;

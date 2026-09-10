@@ -256,8 +256,11 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // Raw polygon points the user clicked (image pixel coordinates), open or closed.
 - (void)setBoundaryPolygonPoints:(NSArray<NSValue*>*)points; // NSValue(NSPoint)
 - (NSArray<NSValue*>*)boundaryPolygonPoints;
-// Fits the 4 CubicBezier sides given 4 corner indices into the (closed) polygon,
-// in order: top-left, top-right, bottom-right, bottom-left.
+// Fits the 4 boundary sides given 4 corner indices into the (closed)
+// polygon, in order: top-left, top-right, bottom-right, bottom-left. Each
+// side is fit as an ADAPTIVE chain of one or more cubic Bezier segments
+// (see BezierSpline.h/fitBezierSpline), not a single cubic -- Sun et al.
+// Sec. 4: "each boundary consists of one or more cubic Bezier splines".
 - (BOOL)fitBoundaryWithCornerIndices:(NSArray<NSNumber*>*)fourIndices;
 // Convenience for the "automatic, no manual markup" mode: an inset rectangle.
 - (void)useRectangularBoundaryWithMargin:(double)marginPixels;
@@ -290,8 +293,14 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 - (NSArray<NSValue*>*)meshEdgeBezierFromRow:(NSInteger)r0 col:(NSInteger)c0
                                        toRow:(NSInteger)r1 col:(NSInteger)c1;
 
-// The 4 fitted boundary CubicBezier splines (top/right/bottom/left), each
-// as [p0,p1,p2,p3] control points in image pixel coords. Empty if
+// The fitted boundary curve segments (top/right/bottom/left, in that
+// order, each side's one-or-more segments in order), each as
+// [p0,p1,p2,p3] control points in image pixel coords -- a FLAT list, not
+// grouped by side (a side may now be more than one cubic segment; see
+// -fitBoundaryWithCornerIndices:'s comment). Consecutive segments always
+// share their endpoint exactly, so drawing them back-to-back (as
+// CanvasView's -drawBoundary does) produces one continuous closed curve
+// regardless of how many segments came from which side. Empty if
 // hasBoundary is NO (i.e. only the raw traced polygon exists so far).
 - (NSArray<NSArray<NSValue*>*>*)fittedBoundaryCurves;
 
