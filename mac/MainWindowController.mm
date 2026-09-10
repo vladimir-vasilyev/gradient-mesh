@@ -428,7 +428,19 @@
 - (void)wireCanvasCallbacks {
     __weak typeof(self) weakSelf = self;
     self.canvasView.onBoundaryChanged = ^{
+        // A fresh boundary just replaced whatever was there before (if
+        // anything) -- clear any corner picks and in-progress trace state
+        // left over from a PREVIOUS boundary, so they don't linger stuck
+        // against the new one (a previous set of 4 picked corners would
+        // otherwise still show, at the wrong positions, and further clicks
+        // would silently do nothing since the picker already thinks it has
+        // its 4 points). DocumentModel's own stale mesh (if any) is
+        // dropped inside -setBoundaryPolygonPoints: itself, which already
+        // ran by the time this callback fires.
+        [weakSelf.canvasView resetBoundaryDrawing];
+        [weakSelf.canvasView resetCornerPicking];
         weakSelf.statusLabel.stringValue = @"Boundary traced. Switch to “Pick 4 Corners” and click the 4 corner points (in order).";
+        [weakSelf.canvasView setNeedsDisplay:YES];
     };
     self.canvasView.onCornersPicked = ^(NSArray<NSNumber*>* indices) {
         BOOL ok = [weakSelf.documentModel fitBoundaryWithCornerIndices:indices];
@@ -510,10 +522,16 @@
         [self presentError:error];
         return;
     }
-    // Mirrors -wireCanvasCallbacks' onBoundaryChanged status message --
-    // segmentBoundaryFromScribblesWithError: feeds the exact same
-    // -setBoundaryPolygonPoints: entry point manual click-tracing does, so
-    // the next step (corner-picking) is identical either way.
+    // Same reset as -wireCanvasCallbacks' onBoundaryChanged does for the
+    // manual-trace path -- segmentBoundaryFromScribblesWithError: feeds
+    // the exact same -setBoundaryPolygonPoints: entry point, so it needs
+    // the exact same cleanup: drop CanvasView's leftover corner picks (and
+    // any stale in-progress trace draft) from before, so re-running
+    // Segment doesn't get stuck showing 4 old corner markers and refusing
+    // new clicks. DocumentModel's stale mesh (if any) was already dropped
+    // inside -setBoundaryPolygonPoints: itself.
+    [self.canvasView resetBoundaryDrawing];
+    [self.canvasView resetCornerPicking];
     self.statusLabel.stringValue = @"Boundary segmented from scribbles. Switch to “Pick 4 Corners” and click the 4 corner points (in order).";
     [self.canvasView setNeedsDisplay:YES];
 }

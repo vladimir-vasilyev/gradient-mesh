@@ -342,6 +342,22 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         _boundaryPolygon.push_back(Vec2(p.x, p.y));
     }
     _hasBoundary = NO;
+    // A brand new polygon just replaced whatever boundary (if any) the
+    // current mesh was built against -- that mesh (and any in-flight
+    // preview snapshot of it) no longer corresponds to anything real, so
+    // drop it rather than leaving a stale mesh grid rendered on screen
+    // against the new boundary. Both callers of this method (manual
+    // click-tracing's double-click-to-close, and
+    // -segmentBoundaryFromScribblesWithError:) go through here, so this
+    // one spot covers "retrace/re-segment while a mesh already exists" for
+    // both paths. Harmless no-op the first time a boundary is ever set
+    // (nothing built yet). CanvasView's own leftover UI state from the
+    // previous boundary (_boundaryDraft, picked corner indices) is a
+    // separate concern -- see MainWindowController's onBoundaryChanged/
+    // -segmentBoundary: callers, which reset those via
+    // -resetBoundaryDrawing/-resetCornerPicking right after calling this.
+    _mesh.reset();
+    _previewMesh.reset();
 }
 
 - (NSArray<NSValue*>*)boundaryPolygonPoints {
