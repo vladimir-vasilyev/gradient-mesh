@@ -136,187 +136,6 @@ VectorLineMatch nearestVectorLineField(const std::vector<VectorLine>& lines, con
     return result;
 }
 
-// Direct transcription of MeshOptimizer.cpp's computeGeometryEnergy (same
-// function name there, anonymous-namespace/file-local so not shared
-// directly): the TRUE geometry energy, with every weight/target
-// (area weight, edge-relax factor, tangent-prior tu/tv, vector-line
-// direction) evaluated FRESH from whatever mesh is passed in -- no
-// freezing at all here, unlike ceresSolveOnce's residuals. This exists
-// for exactly the reason MeshOptimizer.cpp's version does (see its own
-// header comment): a step must be judged against the real energy it's
-// supposed to be decreasing, not a cheaper/frozen proxy, or a genuinely
-// energy-increasing step can look like an improvement. Needed here
-// because ceresSolveOnce has no equivalent of the hand-rolled path's
-// backtracking-against-fresh-weights safety net -- Ceres's own trust
-// region only ever checks its *frozen*-weight cost function, so nothing
-// stops it from happily walking uphill in the true energy while still
-// reducing its own frozen approximation of it. Found on the 25x25
-// gradient.png regression: even after re-freezing every GN sub-iteration
-// (see ceresSolveOnce), reconstruction RMSE still climbed steadily after
-// the first sub-step -- refreezing more often slowed the drift but this
-// verify-and-revert gate is what actually stops it.
-double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
-                                  const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
-    int n = std::max(2, opts.samplesPerPatchEdge);
-    double duv = 1.0 / (n * n);
-    double energy = 0.0;
-    bool hasLines = !vectorLines.empty();
-
-    for (int pr = 0; pr < mesh.rows - 1; ++pr) {
-        for (int pc = 0; pc < mesh.cols - 1; ++pc) {
-            for (int i = 0; i <= n; ++i) {
-                double v = double(i) / n;
-                for (int j = 0; j <= n; ++j) {
-                    double u = double(j) / n;
-                    Vec2 dU, dV;
-                    Vec2 pos = mesh.evalPos(pr, pc, u, v, &dU, &dV);
-                    Color cmesh = mesh.evalColor(pr, pc, u, v);
-                    Color ctarget = target.sampleBilinear(pos.x, pos.y);
-                    double w = areaWeightAt(mesh, pr, pc, u, v, duv);
-                    Color d = cmesh - ctarget;
-                    energy += w * d.lengthSq();
-
-                    // Vector-line guided term (Sec 4.2) -- must mirror
-                    // MeshOptimizer.cpp's computeGeometryEnergy exactly
-                    // (same dense per-sample grid, same nearestVectorLineField
-                    // formula), for the same line-search-consistency reason
-                    // as the rest of this function.
-                    if (hasLines) {
-                        VectorLineMatch match = nearestVectorLineField(vectorLines, pos);
-                        if (match.found) {
-                            double ru = dU.cross(match.dir);
-                            double rv = dV.cross(match.dir);
-                            energy += opts.vectorLineWeight * match.weight * (ru * ru + rv * rv);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    std::vector<Vec2> P(mesh.vertices.size());
-    for (size_t i = 0; i < P.size(); ++i) P[i] = mesh.vertices[i].P;
-
-    for (int r = 0; r < mesh.rows; ++r) {
-        for (int c = 1; c < mesh.cols - 1; ++c) {
-            int i1 = mesh.idx(r, c);
-            double w = opts.smoothWeightGeom *
-                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
-            Vec2 d = P[mesh.idx(r, c - 1)] - P[i1] * 2.0 + P[mesh.idx(r, c + 1)];
-            energy += w * (d.x * d.x + d.y * d.y);
-        }
-    }
-    for (int c = 0; c < mesh.cols; ++c) {
-        for (int r = 1; r < mesh.rows - 1; ++r) {
-            int i1 = mesh.idx(r, c);
-            double w = opts.smoothWeightGeom *
-                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
-            Vec2 d = P[mesh.idx(r - 1, c)] - P[i1] * 2.0 + P[mesh.idx(r + 1, c)];
-            energy += w * (d.x * d.x + d.y * d.y);
-        }
-    }
-
-    // Puv is NOT included here -- fixed at {0,0} per the paper's Sec 3, not
-    // free/derived -- see GradientMesh.h and MeshOptimizer.cpp's
-    // addTangentPriorTerms comment.
-    for (int r = 0; r < mesh.rows; ++r) {
-        for (int c = 0; c < mesh.cols; ++c) {
-            const MeshVertex& mv = mesh.at(r, c);
-            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
-            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
-            energy += opts.geomTangentPriorWeight *
-                (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
-        }
-    }
-
-    // Normal-only soft constraint -- see MeshOptimizer.cpp's
-    // computeGeometryEnergy for why (must mirror it exactly): boundary
-    // vertices should be free to slide ALONG their spline (Sec 4), so only
-    // the off-curve (normal) displacement component is penalized.
-    for (const auto& mv : mesh.vertices) {
-        if (!mv.isBoundary) continue;
-        const BezierSpline& spline = mesh.boundary[mv.boundarySide];
-        Vec2 t = spline.eval(mv.boundaryT);
-        Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
-        double d = (mv.P - t).dot(normal);
-        energy += opts.boundaryWeight * (d * d);
-    }
-
-    // (Vector-line term already folded into the main sample loop above,
-    // matching MeshOptimizer.cpp's computeGeometryEnergy -- no separate
-    // discrete-edge pass any more.)
-
-    return energy;
-}
-
-// Extends computeTrueGeometryEnergy with the two color-side energy terms
-// the closed-form color solve minimizes (color smoothness, color ridge on
-// Cu/Cv/Cuv) -- see MeshOptimizer.cpp's color-solve step 2 for the
-// original. The data term above already uses mesh.evalColor(...) on
-// whatever `mesh` is passed in, so it already reflects the CURRENT
-// (live, not frozen) color -- no separate accounting needed for that
-// part; only the two purely-color-side regularizers need adding. Used
-// only by optimizeJointCeres's verify-and-shrink gate, for the same
-// reason computeTrueGeometryEnergy exists: Ceres's own trust region only
-// ever checks its frozen-weight cost function, so a step that looks good
-// there can still be bad against the true, freshly-evaluated energy.
-//
-// `geomStepReference`, when non-null, must be the mesh vertex state
-// jointSolveOnce's Ceres problem was linearized against for the call
-// being checked (i.e. optimizeJointCeres's own `before`) -- when given,
-// this ALSO folds in JointGeomStepDampingCostFunction's penalty term, so
-// the accept/reject energy here matches EXACTLY what that call's Ceres
-// problem actually minimized (same line-search-consistency reason every
-// other term in this function already follows -- an energy that omits a
-// term the solver was actually minimizing against can reject a step that
-// genuinely reduced the real objective, or accept one that didn't).
-// Passing nullptr skips that term entirely (e.g. if ever called somewhere
-// with no meaningful "step start" to reference).
-double computeTrueJointEnergy(const GradientMesh& mesh, const Image& target,
-                               const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts,
-                               const std::vector<MeshVertex>* geomStepReference) {
-    double energy = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
-
-    for (int r = 0; r < mesh.rows; ++r) {
-        for (int c = 1; c < mesh.cols - 1; ++c) {
-            const Color& c0 = mesh.at(r, c - 1).C;
-            const Color& c1 = mesh.at(r, c).C;
-            const Color& c2 = mesh.at(r, c + 1).C;
-            Color d = c0 - c1 * 2.0 + c2;
-            energy += opts.smoothWeightColor * d.lengthSq();
-        }
-    }
-    for (int c = 0; c < mesh.cols; ++c) {
-        for (int r = 1; r < mesh.rows - 1; ++r) {
-            const Color& c0 = mesh.at(r - 1, c).C;
-            const Color& c1 = mesh.at(r, c).C;
-            const Color& c2 = mesh.at(r + 1, c).C;
-            Color d = c0 - c1 * 2.0 + c2;
-            energy += opts.smoothWeightColor * d.lengthSq();
-        }
-    }
-    for (const auto& mv : mesh.vertices) {
-        energy += opts.colorDerivRidge * (mv.Cu.lengthSq() + mv.Cv.lengthSq() + mv.Cuv.lengthSq());
-    }
-
-    // Step-damping term (see this function's own comment on
-    // `geomStepReference` and JointGeomStepDampingCostFunction) -- must
-    // mirror that CostFunction's residuals exactly (same weight, same
-    // per-vertex P/Pu/Pv deviation) for line-search consistency.
-    if (geomStepReference) {
-        const std::vector<MeshVertex>& ref = *geomStepReference;
-        for (size_t i = 0; i < mesh.vertices.size(); ++i) {
-            const MeshVertex& mv = mesh.vertices[i];
-            const MeshVertex& r0 = ref[i];
-            Vec2 dP = mv.P - r0.P, dPu = mv.Pu - r0.Pu, dPv = mv.Pv - r0.Pv;
-            energy += opts.jointGeomStepDampingWeight *
-                (dP.x * dP.x + dP.y * dP.y + dPu.x * dPu.x + dPu.y * dPu.y + dPv.x * dPv.x + dPv.y * dPv.y);
-        }
-    }
-
-    return energy;
-}
-
 // ---- Data term: one residual block per patch (see spike/ceres_geom_spike.cpp) ----
 class PatchDataCostFunction : public ceres::CostFunction {
 public:
@@ -892,6 +711,203 @@ void fixCornerPositions(ceres::Problem& problem, const GradientMesh& mesh,
 }
 
 } // namespace
+
+// NOTE: computeTrueGeometryEnergy/computeTrueJointEnergy (below) are
+// defined here at gmcore namespace scope -- OUTSIDE the anonymous
+// namespace above -- specifically so they have external linkage and
+// can be called from outside this translation unit. They still see
+// this file's other (internal-linkage) helpers fine (areaWeightAt,
+// edgeRelaxFactor, nearestVectorLineField, VectorLineMatch), since an
+// anonymous namespace's members stay visible for the rest of its
+// enclosing scope even after the namespace itself closes. External
+// linkage is needed by spike/ceres_joint_drift_probe.cpp, which
+// forward-declares both (they are not declared in any header) to read
+// this exact energy off a live mesh -- diagnosing useCeresJoint's
+// repeated-run drift. (Previously both were accidentally left inside
+// the anonymous namespace above, silently giving them internal
+// linkage despite lacking `static` -- caught only when that spike
+// file's forward declarations failed to link.)
+
+// Direct transcription of MeshOptimizer.cpp's computeGeometryEnergy (same
+// function name there, anonymous-namespace/file-local so not shared
+// directly): the TRUE geometry energy, with every weight/target
+// (area weight, edge-relax factor, tangent-prior tu/tv, vector-line
+// direction) evaluated FRESH from whatever mesh is passed in -- no
+// freezing at all here, unlike ceresSolveOnce's residuals. This exists
+// for exactly the reason MeshOptimizer.cpp's version does (see its own
+// header comment): a step must be judged against the real energy it's
+// supposed to be decreasing, not a cheaper/frozen proxy, or a genuinely
+// energy-increasing step can look like an improvement. Needed here
+// because ceresSolveOnce has no equivalent of the hand-rolled path's
+// backtracking-against-fresh-weights safety net -- Ceres's own trust
+// region only ever checks its *frozen*-weight cost function, so nothing
+// stops it from happily walking uphill in the true energy while still
+// reducing its own frozen approximation of it. Found on the 25x25
+// gradient.png regression: even after re-freezing every GN sub-iteration
+// (see ceresSolveOnce), reconstruction RMSE still climbed steadily after
+// the first sub-step -- refreezing more often slowed the drift but this
+// verify-and-revert gate is what actually stops it.
+double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
+                                  const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts) {
+    int n = std::max(2, opts.samplesPerPatchEdge);
+    double duv = 1.0 / (n * n);
+    double energy = 0.0;
+    bool hasLines = !vectorLines.empty();
+
+    for (int pr = 0; pr < mesh.rows - 1; ++pr) {
+        for (int pc = 0; pc < mesh.cols - 1; ++pc) {
+            for (int i = 0; i <= n; ++i) {
+                double v = double(i) / n;
+                for (int j = 0; j <= n; ++j) {
+                    double u = double(j) / n;
+                    Vec2 dU, dV;
+                    Vec2 pos = mesh.evalPos(pr, pc, u, v, &dU, &dV);
+                    Color cmesh = mesh.evalColor(pr, pc, u, v);
+                    Color ctarget = target.sampleBilinear(pos.x, pos.y);
+                    double w = areaWeightAt(mesh, pr, pc, u, v, duv);
+                    Color d = cmesh - ctarget;
+                    energy += w * d.lengthSq();
+
+                    // Vector-line guided term (Sec 4.2) -- must mirror
+                    // MeshOptimizer.cpp's computeGeometryEnergy exactly
+                    // (same dense per-sample grid, same nearestVectorLineField
+                    // formula), for the same line-search-consistency reason
+                    // as the rest of this function.
+                    if (hasLines) {
+                        VectorLineMatch match = nearestVectorLineField(vectorLines, pos);
+                        if (match.found) {
+                            double ru = dU.cross(match.dir);
+                            double rv = dV.cross(match.dir);
+                            energy += opts.vectorLineWeight * match.weight * (ru * ru + rv * rv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<Vec2> P(mesh.vertices.size());
+    for (size_t i = 0; i < P.size(); ++i) P[i] = mesh.vertices[i].P;
+
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 1; c < mesh.cols - 1; ++c) {
+            int i1 = mesh.idx(r, c);
+            double w = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
+            Vec2 d = P[mesh.idx(r, c - 1)] - P[i1] * 2.0 + P[mesh.idx(r, c + 1)];
+            energy += w * (d.x * d.x + d.y * d.y);
+        }
+    }
+    for (int c = 0; c < mesh.cols; ++c) {
+        for (int r = 1; r < mesh.rows - 1; ++r) {
+            int i1 = mesh.idx(r, c);
+            double w = opts.smoothWeightGeom *
+                edgeRelaxFactor(target, P[i1], opts.smoothGeomEdgeGain, opts.smoothGeomMinFactor);
+            Vec2 d = P[mesh.idx(r - 1, c)] - P[i1] * 2.0 + P[mesh.idx(r + 1, c)];
+            energy += w * (d.x * d.x + d.y * d.y);
+        }
+    }
+
+    // Puv is NOT included here -- fixed at {0,0} per the paper's Sec 3, not
+    // free/derived -- see GradientMesh.h and MeshOptimizer.cpp's
+    // addTangentPriorTerms comment.
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 0; c < mesh.cols; ++c) {
+            const MeshVertex& mv = mesh.at(r, c);
+            Vec2 tu = mesh.tangentU(r, c), tv = mesh.tangentV(r, c);
+            Vec2 du = mv.Pu - tu, dv = mv.Pv - tv;
+            energy += opts.geomTangentPriorWeight *
+                (du.x * du.x + du.y * du.y + dv.x * dv.x + dv.y * dv.y);
+        }
+    }
+
+    // Normal-only soft constraint -- see MeshOptimizer.cpp's
+    // computeGeometryEnergy for why (must mirror it exactly): boundary
+    // vertices should be free to slide ALONG their spline (Sec 4), so only
+    // the off-curve (normal) displacement component is penalized.
+    for (const auto& mv : mesh.vertices) {
+        if (!mv.isBoundary) continue;
+        const BezierSpline& spline = mesh.boundary[mv.boundarySide];
+        Vec2 t = spline.eval(mv.boundaryT);
+        Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
+        double d = (mv.P - t).dot(normal);
+        energy += opts.boundaryWeight * (d * d);
+    }
+
+    // (Vector-line term already folded into the main sample loop above,
+    // matching MeshOptimizer.cpp's computeGeometryEnergy -- no separate
+    // discrete-edge pass any more.)
+
+    return energy;
+}
+
+// Extends computeTrueGeometryEnergy with the two color-side energy terms
+// the closed-form color solve minimizes (color smoothness, color ridge on
+// Cu/Cv/Cuv) -- see MeshOptimizer.cpp's color-solve step 2 for the
+// original. The data term above already uses mesh.evalColor(...) on
+// whatever `mesh` is passed in, so it already reflects the CURRENT
+// (live, not frozen) color -- no separate accounting needed for that
+// part; only the two purely-color-side regularizers need adding. Used
+// only by optimizeJointCeres's verify-and-shrink gate, for the same
+// reason computeTrueGeometryEnergy exists: Ceres's own trust region only
+// ever checks its frozen-weight cost function, so a step that looks good
+// there can still be bad against the true, freshly-evaluated energy.
+//
+// `geomStepReference`, when non-null, must be the mesh vertex state
+// jointSolveOnce's Ceres problem was linearized against for the call
+// being checked (i.e. optimizeJointCeres's own `before`) -- when given,
+// this ALSO folds in JointGeomStepDampingCostFunction's penalty term, so
+// the accept/reject energy here matches EXACTLY what that call's Ceres
+// problem actually minimized (same line-search-consistency reason every
+// other term in this function already follows -- an energy that omits a
+// term the solver was actually minimizing against can reject a step that
+// genuinely reduced the real objective, or accept one that didn't).
+// Passing nullptr skips that term entirely (e.g. if ever called somewhere
+// with no meaningful "step start" to reference).
+double computeTrueJointEnergy(const GradientMesh& mesh, const Image& target,
+                               const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts,
+                               const std::vector<MeshVertex>* geomStepReference) {
+    double energy = computeTrueGeometryEnergy(mesh, target, vectorLines, opts);
+
+    for (int r = 0; r < mesh.rows; ++r) {
+        for (int c = 1; c < mesh.cols - 1; ++c) {
+            const Color& c0 = mesh.at(r, c - 1).C;
+            const Color& c1 = mesh.at(r, c).C;
+            const Color& c2 = mesh.at(r, c + 1).C;
+            Color d = c0 - c1 * 2.0 + c2;
+            energy += opts.smoothWeightColor * d.lengthSq();
+        }
+    }
+    for (int c = 0; c < mesh.cols; ++c) {
+        for (int r = 1; r < mesh.rows - 1; ++r) {
+            const Color& c0 = mesh.at(r - 1, c).C;
+            const Color& c1 = mesh.at(r, c).C;
+            const Color& c2 = mesh.at(r + 1, c).C;
+            Color d = c0 - c1 * 2.0 + c2;
+            energy += opts.smoothWeightColor * d.lengthSq();
+        }
+    }
+    for (const auto& mv : mesh.vertices) {
+        energy += opts.colorDerivRidge * (mv.Cu.lengthSq() + mv.Cv.lengthSq() + mv.Cuv.lengthSq());
+    }
+
+    // Step-damping term (see this function's own comment on
+    // `geomStepReference` and JointGeomStepDampingCostFunction) -- must
+    // mirror that CostFunction's residuals exactly (same weight, same
+    // per-vertex P/Pu/Pv deviation) for line-search consistency.
+    if (geomStepReference) {
+        const std::vector<MeshVertex>& ref = *geomStepReference;
+        for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+            const MeshVertex& mv = mesh.vertices[i];
+            const MeshVertex& r0 = ref[i];
+            Vec2 dP = mv.P - r0.P, dPu = mv.Pu - r0.Pu, dPv = mv.Pv - r0.Pv;
+            energy += opts.jointGeomStepDampingWeight *
+                (dP.x * dP.x + dP.y * dP.y + dPu.x * dPu.x + dPu.y * dPu.y + dPv.x * dPv.x + dPv.y * dPv.y);
+        }
+    }
+
+    return energy;
+}
 
 // Runs ONE Ceres solve using weights/targets frozen from `snapshot`
 // (the current mesh state), for at most `maxIters` of Ceres's own

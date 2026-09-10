@@ -20,9 +20,39 @@
 // two under the identical repeated-call pattern, and reports RMSE plus
 // mean/max control-point displacement after each repeat.
 //
+// UPDATED with a second diagnosis attempt after the first confirmed run
+// (see README): every optimizer path (hand-rolled included) actually
+// minimizes an AREA-WEIGHTED data term internally (areaWeightAt: the true
+// image-space area each parametric quadrature sample covers, |dU x dV| *
+// duv -- see MeshOptimizer.cpp/MeshOptimizerCeres.cpp), not the plain
+// per-parametric-sample average that reconstructionRMSE (the number
+// actually reported to the user and printed by this probe) computes.
+// Those two measures can legitimately disagree if the mesh becomes very
+// non-uniform in image-space area (some patches tiny, others huge): the
+// area-weighted internal energy under-counts a poorly-fit but tiny-area
+// patch and over-counts a poorly-fit huge-area one relative to
+// reconstructionRMSE's flat per-sample average, which weighs every
+// parametric sample equally regardless of the area it actually covers.
+// useCeresJoint's fully-coupled 18-unknowns-per-vertex step (documented
+// in JointGeomStepDampingCostFunction's own header comment as able to
+// trade position accuracy for a locally-better color fit) is a plausible
+// candidate for exploiting exactly this gap far more than the other two
+// paths' decoupled position/color updates ever get the chance to. This
+// revision adds a `energy` column (computeTrueJointEnergy -- the same
+// composite, area-weighted objective optimizeJointCeres's own
+// verify-and-shrink gate already checks every sub-step, called here with
+// no step-damping reference since this is a plain post-hoc readout, not a
+// gated comparison) alongside RMSE for all three modes, specifically to
+// see whether `energy` keeps decreasing (or holds flat) while `RMSE`
+// creeps up -- which would confirm this second hypothesis -- or whether
+// `energy` ALSO increases (which would mean this hypothesis is wrong and
+// something else is going on).
+//
 // Standalone, throwaway (see spike/CMakeLists.txt's own header comment) --
 // not wired into the root build, does not touch MeshOptimizer.cpp/
-// MeshOptimizerCeres.cpp, just calls their existing public API.
+// MeshOptimizerCeres.cpp (only reads two of its already non-static, just
+// not header-declared, functions via the extern forward declarations
+// below), just calls their existing public API otherwise.
 
 #include "gmcore/GradientMesh.h"
 #include "gmcore/Image.h"
@@ -37,15 +67,35 @@
 
 using namespace gmcore;
 
+#ifdef GMCORE_WITH_CERES
+namespace gmcore {
+// Forward declarations of MeshOptimizerCeres.cpp internals -- defined
+// there (external linkage, just not declared in any header since they
+// were never meant to be called from outside that file until now). Exact
+// signatures copied verbatim; see that file for the real definitions and
+// full documentation of what each term means.
+double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
+                                  const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts);
+double computeTrueJointEnergy(const GradientMesh& mesh, const Image& target,
+                               const std::vector<VectorLine>& vectorLines, const OptimizerOptions& opts,
+                               const std::vector<MeshVertex>* geomStepReference);
+} // namespace gmcore
+#endif
+
 namespace {
 
 GradientMesh buildRectMesh(int rows, int cols, int margin, const Image& target) {
     double x0 = margin, y0 = margin, x1 = target.width - margin, y1 = target.height - margin;
-    std::array<CubicBezier, 4> boundary;
-    boundary[0] = {Vec2{x0, y0}, Vec2{x0 + (x1 - x0) / 3, y0}, Vec2{x0 + 2 * (x1 - x0) / 3, y0}, Vec2{x1, y0}};
-    boundary[1] = {Vec2{x1, y0}, Vec2{x1, y0 + (y1 - y0) / 3}, Vec2{x1, y0 + 2 * (y1 - y0) / 3}, Vec2{x1, y1}};
-    boundary[2] = {Vec2{x1, y1}, Vec2{x0 + 2 * (x1 - x0) / 3, y1}, Vec2{x0 + (x1 - x0) / 3, y1}, Vec2{x0, y1}};
-    boundary[3] = {Vec2{x0, y1}, Vec2{x0, y0 + 2 * (y1 - y0) / 3}, Vec2{x0, y0 + (y1 - y0) / 3}, Vec2{x0, y0}};
+    // BezierSpline (one-or-more cubic segments per side) replaced plain
+    // CubicBezier for GradientMesh::boundary since this spike was last
+    // touched (see README's "Adaptive multi-segment boundary fitting") --
+    // a rectangle's sides are already exactly straight, so each is just
+    // wrapped as a single-segment spline, identical geometry as before.
+    std::array<BezierSpline, 4> boundary;
+    boundary[0].segments = {CubicBezier{Vec2{x0, y0}, Vec2{x0 + (x1 - x0) / 3, y0}, Vec2{x0 + 2 * (x1 - x0) / 3, y0}, Vec2{x1, y0}}};
+    boundary[1].segments = {CubicBezier{Vec2{x1, y0}, Vec2{x1, y0 + (y1 - y0) / 3}, Vec2{x1, y0 + 2 * (y1 - y0) / 3}, Vec2{x1, y1}}};
+    boundary[2].segments = {CubicBezier{Vec2{x1, y1}, Vec2{x0 + 2 * (x1 - x0) / 3, y1}, Vec2{x0 + (x1 - x0) / 3, y1}, Vec2{x0, y1}}};
+    boundary[3].segments = {CubicBezier{Vec2{x0, y1}, Vec2{x0, y0 + 2 * (y1 - y0) / 3}, Vec2{x0, y0 + (y1 - y0) / 3}, Vec2{x0, y0}}};
     return GradientMesh::buildInitial(rows, cols, boundary, target);
 }
 
@@ -82,8 +132,18 @@ void runMode(const char* label, const Image& target, int rows, int cols, int mar
     GradientMesh mesh = buildRectMesh(rows, cols, margin, target);
     GradientMesh prev = mesh;
     double rmse0 = mesh.reconstructionRMSE(target, 6);
+#ifdef GMCORE_WITH_CERES
+    // No step-damping reference here (nullptr) -- this is a plain post-hoc
+    // readout of the same composite objective optimizeJointCeres's gate
+    // checks every sub-step, not a gated before/after comparison, so there
+    // is no "step start" to reference. See file header comment.
+    double energy0 = computeTrueJointEnergy(mesh, target, {}, opts, nullptr);
+    std::printf("repeat   RMSE       energy         meanDisp   maxDisp\n");
+    std::printf("initial  %.6f   %.6f     --         --\n", rmse0, energy0);
+#else
     std::printf("repeat   RMSE       meanDisp   maxDisp\n");
     std::printf("initial  %.6f   --         --\n", rmse0);
+#endif
 
     for (int r = 1; r <= repeats; ++r) {
         prev = mesh; // snapshot BEFORE this repeat's optimize call
@@ -91,7 +151,12 @@ void runMode(const char* label, const Image& target, int rows, int cols, int mar
         double rmse = mesh.reconstructionRMSE(target, 6);
         double meanDisp, maxDisp;
         meshDisplacement(mesh, prev, &meanDisp, &maxDisp);
+#ifdef GMCORE_WITH_CERES
+        double energy = computeTrueJointEnergy(mesh, target, {}, opts, nullptr);
+        std::printf("%-8d %.6f   %.6f     %.6f   %.6f\n", r, rmse, energy, meanDisp, maxDisp);
+#else
         std::printf("%-8d %.6f   %.6f   %.6f\n", r, rmse, meanDisp, maxDisp);
+#endif
     }
 }
 
@@ -129,10 +194,29 @@ int main(int argc, char** argv) {
     runMode("useCeresGeometry", target, rows, cols, margin, pyramidLevels, repeats, true, false);
     runMode("useCeresJoint", target, rows, cols, margin, pyramidLevels, repeats, false, true);
 
+#ifdef GMCORE_WITH_CERES
+    std::printf("\nWhat to look for (updated -- see file header for the full second-hypothesis\n"
+                "writeup): first, does useCeresJoint's RMSE drift the way the original probe\n"
+                "found (stops improving / gets WORSE across repeats while meanDisp/maxDisp\n"
+                "stays large)? If so, look at ITS OWN energy column: does `energy` keep\n"
+                "decreasing or hold flat while `RMSE` climbs? That would confirm the\n"
+                "area-weighted-internal-energy-vs-naive-RMSE divergence hypothesis -- the\n"
+                "optimizer is legitimately doing its job by its own (area-weighted) yardstick,\n"
+                "the yardstick just doesn't match what reconstructionRMSE reports. If `energy`\n"
+                "ALSO climbs alongside RMSE, that hypothesis is wrong and something else is\n"
+                "causing the drift (e.g. the gate/damping mechanics themselves). Also sanity-\n"
+                "check hand-rolled/useCeresGeometry: their `energy` and `RMSE` columns should\n"
+                "move together (both down) every repeat, since those paths don't have joint's\n"
+                "coupled 18-unknowns-per-vertex step -- if they don't, something is off with\n"
+                "the energy readout itself, not with useCeresJoint.\n");
+#else
     std::printf("\nWhat to look for: does useCeresJoint's RMSE keep improving and its\n"
                 "meanDisp/maxDisp keep shrinking across repeats (converging, like the other\n"
                 "two modes should), or does RMSE stop improving / get WORSE while\n"
                 "meanDisp/maxDisp stays large (still moving a lot without actually improving\n"
-                "-- i.e. drifting) even after several repeats?\n");
+                "-- i.e. drifting) even after several repeats? (Built without Ceres -- rerun\n"
+                "on a Mac with Ceres to also get the `energy` column and test the second,\n"
+                "more specific hypothesis; see file header.)\n");
+#endif
     return 0;
 }
