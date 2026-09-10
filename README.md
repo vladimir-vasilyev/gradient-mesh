@@ -1785,6 +1785,61 @@ cases, 3349/3349 checks still pass). The user's own Xcode build/run is the only 
 truly confirm the new tool modes and "Segment" button work end-to-end; that hasn't
 happened yet as of this write-up.
 
+## Adaptive multi-segment boundary fitting
+
+A real bug the user found by actually using Lazy Snapping in Xcode: after segmenting a
+non-rectangular object and picking its 4 corners, the fitted boundary visibly diverged
+from the accurate segmentation contour. First instinct -- "let the boundary points move
+freely" -- turned out to be the wrong fix: boundary mesh vertices are deliberately
+constrained to slide ALONG their assigned boundary spline during optimization, never off
+it (`computeGeometryEnergy`'s normal-only residual, both hand-rolled and Ceres; see
+`boundary_vertices_stay_on_spline_after_optimize`), which is correct per the paper and
+already regression-tested -- loosening it would let image-gradient forces pull boundary
+vertices off the true silhouette. The actual bug was upstream: each of the mesh's 4
+boundary sides was fit as a SINGLE cubic Bezier (`fitCubicBezier`), which has at most one
+inflection point -- nowhere near enough to track a non-convex silhouette. `CanvasView.mm`
+already quoted the paper on this (Sec. 4: *"each boundary consists of one or more cubic
+Bezier splines"*) without ever implementing the "or more" case.
+
+Added `BezierSpline` (`BezierSpline.h`) -- a chain of one-or-more `CubicBezier` segments
+sharing one global `t` in `[0,1]`, exposing the identical `eval`/`evalDeriv`/`closestT`
+interface `CubicBezier` already had -- and `fitBezierSpline`: a Graphics-Gems-style
+recursive splitter that starts from the existing single-cubic fit and only subdivides (at
+the point of largest deviation, sharing that point so segments always join exactly) when
+the fit exceeds `maxErrorPixels` (default 3.0px, chosen relative to `ContourTracing.h`'s
+own 2.0px simplification epsilon -- not yet verified against real photos). An
+already-smooth input still fits as exactly one segment, so this is a strict superset of
+the old behavior, not a separate code path.
+
+Wired through in 3 commits, one per layer: (1) `BezierSpline`/`fitBezierSpline` in
+`core/`, with 3 new dedicated regression tests -- a straight line doesn't get needlessly
+split; a sharp 5-leg zigzag (a synthetic stand-in for a real non-convex silhouette, since
+a single cubic structurally cannot track it) does split, stays within `maxErrorPixels`,
+keeps exact endpoints, and every segment joint is exactly continuous; `closestT`
+round-trips correctly across segment joints, since that's exactly what
+`MeshOptimizer`/`MeshOptimizerCeres` call every outer iteration to re-project boundary
+vertices. (2) `GradientMesh::boundary` changed from `std::array<CubicBezier,4>` to
+`std::array<BezierSpline,4>`, with `MeshOptimizer.cpp`/`MeshOptimizerCeres.cpp` needing
+only a type substitution at their 8 total call sites (same 3-method interface, so no
+logic changed) -- `gmcore_tests` confirms the hand-rolled optimizer path runs correctly
+end to end against the new type, not just compiles; the Ceres path could only be verified
+by manual review against the identical, actually-tested hand-rolled pattern, since this
+sandbox has no Ceres to compile that `#ifdef GMCORE_WITH_CERES` body. (3)
+`DocumentModel`/`CanvasView`: `-fitBoundaryWithCornerIndices:` now calls
+`fitBezierSpline` instead of `fitCubicBezier` (this is the actual fix -- both the manual
+click-tracing path and Lazy Snapping's `-segmentBoundaryFromScribblesWithError:` go
+through it); `-useRectangularBoundaryWithMargin:` (the "Auto, no markup" path) is
+unaffected in behavior, since a rectangle's sides are already exactly straight and are
+built as single-segment splines directly; `-fittedBoundaryCurves` flattens every side's
+one-or-more segments into one in-order list, and `CanvasView`'s `-drawBoundary` needed
+ZERO changes since it already just chains `curveToPoint:` for whatever it's handed.
+
+20/20 `gmcore_tests` cases, 3387/3387 checks pass after all 3 steps. As with all `.mm`
+work this session, there is no Xcode compiler available to verify the UI layer actually
+builds and runs -- this needs the user's own Xcode build, and ideally a re-test of the
+exact scenario that surfaced the original bug (segment a genuinely non-convex object,
+pick corners, compare the fitted boundary against the segmentation contour visually).
+
 ## Optional CIELUV colour space (colour interpolation, not geometry)
 
 Added after reading Hogervorst (2017), *"Colour Interpolation in Gradient Meshes"*
