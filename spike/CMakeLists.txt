@@ -19,6 +19,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Ceres REQUIRED)
 
+# ceres_joint_drift_probe loads gradient.png -- needs libpng the same way
+# the root CMakeLists.txt's gmcore/gmesh_cli do (see that file's comment);
+# without this, Image::load silently falls back to the PPM-only path and
+# aborts on a .png input.
+find_package(PNG QUIET)
+
 add_executable(ceres_geom_spike
     ceres_geom_spike.cpp
     ../core/src/GradientMesh.cpp
@@ -37,3 +43,25 @@ add_executable(ceres_joint_spike
 )
 target_include_directories(ceres_joint_spike PRIVATE ../core/include)
 target_link_libraries(ceres_joint_spike PRIVATE Ceres::ceres)
+
+# Repeated-call drift probe for the README's "useCeresJoint repeated-run
+# drift" diagnosis (see ceres_joint_drift_probe.cpp's header comment) --
+# needs the FULL gmcore (MeshOptimizer's coarse-to-fine driver, both the
+# hand-rolled and Ceres geometry/joint paths), unlike the two spikes above
+# which only need GradientMesh/Image directly.
+add_executable(ceres_joint_drift_probe
+    ceres_joint_drift_probe.cpp
+    ../core/src/GradientMesh.cpp
+    ../core/src/Image.cpp
+    ../core/src/MeshOptimizer.cpp
+    ../core/src/MeshOptimizerCeres.cpp
+    ../core/src/ColorSpace.cpp
+    ../core/src/BezierSpline.cpp
+)
+target_include_directories(ceres_joint_drift_probe PRIVATE ../core/include)
+target_compile_definitions(ceres_joint_drift_probe PRIVATE GMCORE_WITH_CERES)
+target_link_libraries(ceres_joint_drift_probe PRIVATE Ceres::ceres)
+if(PNG_FOUND)
+  target_link_libraries(ceres_joint_drift_probe PRIVATE PNG::PNG)
+  target_compile_definitions(ceres_joint_drift_probe PRIVATE GMCORE_USE_LIBPNG)
+endif()

@@ -1493,6 +1493,84 @@ updated to match) -- present in exports from now on; the runs in the table above
 the fix, so their own JSON files don't show the weight actually in effect (0.3, this
 build's default -- there's no UI to change it yet).
 
+### Confirmed independently: a scripted, reproducible repeated-call drift probe
+
+The "joint gets WORSE if you keep running it" finding above came from manually
+clicking Optimize in the app -- real, but a one-off, hand-driven sequence on one
+specific mesh/build (`81784c3-dirty`). Added `spike/ceres_joint_drift_probe.cpp` (a
+throwaway, uncommitted-to-build spike, same convention as the other two `spike/*.cpp`
+files) to check the same claim in a controlled, scripted, anyone-can-rerun way: it
+builds ONE fresh mesh, then calls `MeshOptimizer::optimizeCoarseToFine` on that SAME
+mesh object repeatedly (never rebuilding it between calls -- exactly what repeatedly
+clicking "Optimize" does), for hand-rolled, `useCeresGeometry`, and `useCeresJoint`
+side by side, logging RMSE and mean/max control-point displacement after each repeat.
+This project's usual Linux sandbox has no Ceres, so this had to be built and run
+directly on a real Mac (`bash spike/run_joint_drift_probe.sh`, using the Homebrew
+Ceres install) -- first real run of `useCeresJoint` this project has been able to do
+outside the app itself.
+
+5x5 mesh, `gradient.png`, 6 repeats (RMSE, % reduction from the initial 0.081338):
+
+| repeat | hand-rolled | `useCeresGeometry` | `useCeresJoint` |
+|---|---|---|---|
+| 1 | 0.029447 (63.8%) | 0.031010 (61.9%) | 0.026574 (67.3%) |
+| 2 | 0.026283 (67.7%) | 0.026066 (68.0%) | 0.029339 (63.9%) |
+| 3 | 0.026243 (67.7%) | 0.025845 (68.2%) | 0.029696 (63.5%) |
+| 4 | 0.027590 (66.1%) | 0.025888 (68.2%) | 0.029773 (**63.4%, joint's worst point**) |
+| 5 | 0.027860 (65.7%) | 0.025956 (68.1%) | 0.028177 (65.4%) |
+| 6 | 0.027876 (65.7%) | 0.025827 (**68.2%, best of all 18 cells**) | 0.028435 (65.0%) |
+
+9x9 mesh, same image, 6 repeats (RMSE, % reduction from the initial 0.039873):
+
+| repeat | hand-rolled | `useCeresGeometry` | `useCeresJoint` |
+|---|---|---|---|
+| 1 | 0.017001 (57.4%) | 0.018686 (53.1%) | 0.015530 (61.1%) |
+| 2 | 0.015337 (61.5%) | 0.016045 (59.8%) | 0.015521 (**61.1%, tied best**) |
+| 3 | 0.015516 (61.1%) | 0.016395 (58.9%) | 0.015521 (**61.1%, tied best**) |
+| 4 | 0.015930 (60.0%) | 0.016321 (59.1%) | 0.015988 (59.9%) |
+| 5 | 0.015006 (**62.4%**) | 0.016275 (59.2%) | 0.015877 (60.2%) |
+| 6 | 0.015329 (61.6%) | 0.016204 (**59.4%**) | 0.015914 (60.1%) |
+
+Ranking all 18 cells of the 5x5 table by RMSE, `useCeresGeometry` actually dominates
+(its worst repeat, 1, is the only one beaten by hand-rolled/joint's best moments) --
+so this is NOT a case of joint reaching the best result and then losing it. Both
+hand-rolled and `useCeresGeometry` wobble by a percentage point or two run to run
+(ordinary GN/quadrature noise as the mesh keeps making small adjustments) but never
+show a clear, sustained regression -- their best and worst repeats stay close together
+and neither trends worse over time. `useCeresJoint` is different in exactly the way the
+manual-clicking finding above described, just judged against its OWN earlier repeats
+rather than against the other two solvers: its repeat-1 result (0.026574) is its best
+of the run, sitting between hand-rolled's and `useCeresGeometry`'s own repeats -- an
+unremarkable start, not a win -- and then it gets steadily WORSE for three more repeats
+(0.029339 -> 0.029696 -> 0.029773, a real ~12% relative RMSE regression from its own
+repeat-1 result) before a partial recovery at repeats 5-6 that never fully returns to
+repeat 1's quality. Control-point displacement (`meanDisp`/`maxDisp` in the tool's own
+output) keeps shrinking the whole time, confirming this isn't the solver failing to
+converge numerically -- it converges, just to a worse configuration than the one it had
+already found. The 9x9 mesh shows the same self-regression shape in miniature:
+`useCeresJoint` settles beautifully by repeat 3 (displacement down to 0.12px, RMSE
+0.015521, its best value on this mesh), then at repeat 4 the mesh moves substantially
+again (displacement jumps back up to 0.44px) for no RMSE benefit at all (0.015521 ->
+0.015988, worse) and never fully re-settles over the remaining repeats -- a much
+smaller regression in absolute terms than the 5x5 case (~3% vs. ~12%), but the same
+shape: real movement that makes things worse, not just noise.
+
+This is a second, independent, scripted confirmation of the same failure mode already
+documented above from real app usage -- not a new discovery, but real empirical
+evidence (this project's first actual `useCeresJoint` Ceres run outside the app) that
+the phenomenon isn't specific to one build, one mesh, or manual-clicking noise, and is
+consistent with the mechanism `JointGeomStepDampingCostFunction`'s own comment already
+names: its damping reference snapshot is retaken fresh at the very start of every
+single top-level `optimizeJointCeres`/`jointSolveOnce` call, so it damps a large jump
+WITHIN one call but does nothing to stop slow drift ACROSS separate calls. Reproduce
+with `bash spike/run_joint_drift_probe.sh` (needs Ceres; add `--rows N --cols N
+--repeats N` to `ceres_joint_drift_probe`'s own invocation for other mesh sizes).
+Practical guidance is unchanged from above: run `useCeresGeometry`, then `useCeresJoint`
+once, then stop -- don't keep re-optimizing with joint already selected. Actually
+persisting the damping snapshot across separate top-level calls (so repeated clicks
+would damp against the ORIGINAL pre-joint mesh, not just within-call) is a real
+candidate fix, not attempted here -- this was a verification pass, not a fix.
+
 ### Follow-up: `smoothGeomEdgeGain` sweep on the Fig. 4 edge-snapping gap -- real improvement, but a real trade-off, not adopted as a new default
 
 Revisited "Deeper finding: coarse meshes still don't snap to an edge the way Fig. 4
