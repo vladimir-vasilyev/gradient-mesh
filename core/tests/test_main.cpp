@@ -35,6 +35,9 @@
 #include "gmcore/SparseBlockSolver.h"
 #include "gmcore/SVGExporter.h"
 #include "gmcore/Image.h"
+#include "gmcore/MaxFlowGraph.h"
+#include "gmcore/LazySnapping.h"
+#include "gmcore/ContourTracing.h"
 
 #include <cstdio>
 #include <cmath>
@@ -578,6 +581,147 @@ static void test_svg_export_smoke() {
     CHECK(svgLUV.find("nan") == std::string::npos && svgLUV.find("NaN") == std::string::npos && svgLUV.find("inf") == std::string::npos);
 }
 
+// Regression for Task 3's Lazy-Snapping-style segmentation tool (see
+// README's "Known simplifications" -- this replaces plain click-tracing
+// as the cutout tool). Three pieces, tested independently plus one
+// integration test chaining them the way the real UI will: MaxFlowGraph
+// (generic Dinic's max-flow/min-cut), segmentForeground (the graph-cut
+// itself), and traceOuterContour/simplifyClosedPolygon (mask -> the same
+// ordered polygon the existing corner-picking + per-side Bezier fit
+// already consumes).
+//
+// MaxFlowGraph's own textbook case below caught nothing (it was correct
+// on the first try), but segmentForeground's fg/bg cluster distances were
+// initially swapped (an easy mistake: "cost of label L" must be
+// proportional to distance from L's OWN cluster set, not the opposite
+// one -- see LazySnapping.cpp's comment at the fix site) and
+// traceOuterContour's stopping criterion was initially wrong (compared
+// backtrack DIRECTION to an arbitrary initial guess instead of detecting
+// the actual repeated s0->s1 transition -- see ContourTracing.cpp's
+// comment). Both were caught by these tests before ever reaching the UI.
+static void test_maxflow_textbook_graph() {
+    // Classic max-flow textbook graph (CLRS-style), known max flow = 23.
+    MaxFlowGraph g(6); // 0=s, 5=t
+    g.addEdge(0, 1, 16); g.addEdge(0, 2, 13);
+    g.addEdge(1, 3, 12);
+    g.addEdge(2, 1, 4);
+    g.addEdge(3, 2, 9);
+    g.addEdge(2, 4, 14);
+    g.addEdge(4, 3, 7);
+    g.addEdge(3, 5, 20);
+    g.addEdge(4, 5, 4);
+    double flow = g.maxFlow(0, 5);
+    CHECK_NEAR(flow, 23.0, 1e-9);
+    CHECK(g.isSourceSide(0));
+    CHECK(!g.isSourceSide(5));
+}
+
+static void test_maxflow_simple_cut() {
+    // s->a(5)->t(3), s->b(2)->t(10): the a->t(3) and s->b(2) edges are the
+    // bottleneck, so max flow should be exactly 3+2=5.
+    MaxFlowGraph g(4); // 0=s,1=a,2=b,3=t
+    g.addEdge(0, 1, 5);
+    g.addEdge(1, 3, 3);
+    g.addEdge(0, 2, 2);
+    g.addEdge(2, 3, 10);
+    CHECK_NEAR(g.maxFlow(0, 3), 5.0, 1e-9);
+}
+
+static Image makeTwoColorBlockImage(int w, int h, int splitX) {
+    Image img(w, h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            img.set(x, y, x < splitX ? Color{0.9, 0.1, 0.1} : Color{0.1, 0.1, 0.9});
+    return img;
+}
+
+// A pixel-perfect two-color-block image with a handful of scribbles deep
+// in each block should segment essentially exactly, given the huge color
+// contrast and zero texture noise -- this is as easy a case as graph-cut
+// segmentation ever sees, so ANY misclassification here (beyond a couple
+// of boundary-column pixels) means something structural is wrong, not
+// just "the algorithm did its honest best on a hard case."
+static void test_segmentation_separates_two_color_blocks() {
+    const int w = 40, h = 20, splitX = 20;
+    Image img = makeTwoColorBlockImage(w, h, splitX);
+    SegmentationScribbles scribbles;
+    for (int y = 5; y < 15; y += 2) scribbles.foreground.push_back({5, y});
+    for (int y = 5; y < 15; y += 2) scribbles.background.push_back({35, y});
+
+    std::vector<uint8_t> mask = segmentForeground(img, scribbles);
+    CHECK(mask.size() == (size_t)(w * h));
+
+    int correctLeft = 0, totalLeft = 0, correctRight = 0, totalRight = 0;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            bool isFg = mask[y * w + x] != 0;
+            if (x < splitX) { ++totalLeft; if (isFg) ++correctLeft; }
+            else { ++totalRight; if (!isFg) ++correctRight; }
+        }
+    }
+    CHECK(correctLeft >= totalLeft - 2);
+    CHECK(correctRight >= totalRight - 2);
+}
+
+// No scribbles of one colour yet -> documented "not enough information"
+// behavior (an all-background mask), not a crash or a guess.
+static void test_segmentation_returns_empty_mask_without_both_scribble_colors() {
+    Image img = makeTwoColorBlockImage(10, 10, 5);
+    SegmentationScribbles onlyFg;
+    onlyFg.foreground.push_back({2, 2});
+    std::vector<uint8_t> mask = segmentForeground(img, onlyFg);
+    CHECK(mask.size() == 100);
+    for (uint8_t m : mask) CHECK(m == 0);
+}
+
+static void test_contour_tracing_filled_square() {
+    const int w = 10, h = 10;
+    std::vector<uint8_t> mask(w * h, 0);
+    for (int y = 2; y <= 6; ++y)
+        for (int x = 2; x <= 6; ++x)
+            mask[y * w + x] = 1;
+
+    std::vector<Vec2> contour = traceOuterContour(mask, w, h);
+    CHECK(!contour.empty());
+    // A 5x5 block's 8-connected outer boundary should be on the order of
+    // 16-20 points, not e.g. the ~866 an earlier, buggy stopping
+    // criterion produced by looping around the perimeter dozens of times
+    // without ever detecting closure.
+    CHECK(contour.size() >= 12 && contour.size() <= 32);
+    for (const Vec2& p : contour) {
+        CHECK(p.x >= 2 && p.x <= 6 && p.y >= 2 && p.y <= 6);
+        CHECK(p.x == 2 || p.x == 6 || p.y == 2 || p.y == 6); // every point IS on the block's edge
+    }
+
+    std::vector<Vec2> simplified = simplifyClosedPolygon(contour, 0.5);
+    CHECK(simplified.size() >= 4 && simplified.size() <= 6); // should collapse close to the 4 true corners
+}
+
+// Chains segmentForeground -> traceOuterContour -> simplifyClosedPolygon
+// exactly the way the real UI will (see DocumentModel's planned
+// -segmentBoundaryWithScribbles: -- the result feeds the SAME
+// -setBoundaryPolygonPoints:/-fitBoundaryWithCornerIndices: pipeline the
+// old click-tracing tool already used).
+static void test_segmentation_to_contour_integration() {
+    const int w = 40, h = 20, splitX = 20;
+    Image img = makeTwoColorBlockImage(w, h, splitX);
+    SegmentationScribbles scribbles;
+    for (int y = 5; y < 15; y += 2) scribbles.foreground.push_back({5, y});
+    for (int y = 5; y < 15; y += 2) scribbles.background.push_back({35, y});
+
+    std::vector<uint8_t> mask = segmentForeground(img, scribbles);
+    std::vector<Vec2> contour = traceOuterContour(mask, w, h);
+    CHECK(contour.size() >= 4);
+
+    double minX = 1e9, maxX = -1e9;
+    for (const Vec2& p : contour) { minX = std::min(minX, p.x); maxX = std::max(maxX, p.x); }
+    CHECK(minX <= 1.0);
+    CHECK(maxX >= splitX - 2 && maxX <= splitX + 2);
+
+    std::vector<Vec2> simplified = simplifyClosedPolygon(contour, 1.0);
+    CHECK(simplified.size() >= 4 && simplified.size() <= 10);
+}
+
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
@@ -595,6 +739,12 @@ int main() {
         {"optimizer_reduces_rmse_and_keeps_corners_fixed", test_optimizer_reduces_rmse_and_keeps_corners_fixed},
         {"boundary_vertices_stay_on_spline_after_optimize", test_boundary_vertices_stay_on_spline_after_optimize},
         {"svg_export_smoke", test_svg_export_smoke},
+        {"maxflow_textbook_graph", test_maxflow_textbook_graph},
+        {"maxflow_simple_cut", test_maxflow_simple_cut},
+        {"segmentation_separates_two_color_blocks", test_segmentation_separates_two_color_blocks},
+        {"segmentation_returns_empty_mask_without_both_scribble_colors", test_segmentation_returns_empty_mask_without_both_scribble_colors},
+        {"contour_tracing_filled_square", test_contour_tracing_filled_square},
+        {"segmentation_to_contour_integration", test_segmentation_to_contour_integration},
     };
 
     int passed = 0, failed = 0;

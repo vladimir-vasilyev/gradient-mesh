@@ -252,10 +252,14 @@ comments at the relevant spot too:
   block-sparse Conjugate Gradient solver (`SparseBlockSolver.h`) with Jacobi
   preconditioning, instead of e.g. Eigen -- this sandbox has no network access to vendor
   a third-party library, and it keeps the Xcode project dependency-free too.
-* **The "cutout tool" is plain click-tracing.** The paper cites a separate
-  Lazy-Snapping-style interactive segmentation tool for isolating the object; this
-  project's boundary tool is just click-to-add-a-point polygon tracing, fitted with cubic
-  Beziers per side afterward.
+* **The "cutout tool" is plain click-tracing (algorithm now exists, UI wiring
+  pending).** The paper cites a separate Lazy-Snapping-style interactive segmentation
+  tool for isolating the object; this project's boundary tool was originally just
+  click-to-add-a-point polygon tracing, fitted with cubic Beziers per side afterward.
+  See "A real cutout tool, part 1" below -- the graph-cut segmentation algorithm itself
+  (`MaxFlowGraph`/`LazySnapping`/`ContourTracing`) is now implemented and tested, but not
+  yet wired into `CanvasView`/`MainWindowController`, so manual click-tracing is still
+  the only option in the app today.
 * **SVG mesh-gradient export uses one `<meshgradient>` per patch** rather than one mesh
   object with SVG2's inter-patch implicit-shared-edge stop omission encoding. A mesh
   gradient only paints inside its own patch boundary, so adjacent patches still tile
@@ -1644,6 +1648,98 @@ best setting found) still points at the same conclusion the original finding rea
 an annealed `smoothWeightGeom` schedule (or some other mechanism that isn't just "turn
 one existing knob up") is probably still needed to close this fully -- not attempted
 yet, flagged here as the next real candidate.
+
+## A real cutout tool, part 1: Lazy-Snapping-style graph-cut segmentation (core algorithm)
+
+Task 3 in this project's current priority order (regression tests, then paper-fidelity
+accuracy work, then a real selection tool -- both earlier items are done, see "Regression
+tests" above and the Ceres/`smoothGeomEdgeGain` sections). This is the item "Known
+simplifications" already flagged: *"The 'cutout tool' is plain click-tracing... the
+paper cites a separate Lazy-Snapping-style interactive segmentation tool."* This first
+piece adds the actual segmentation ALGORITHM as pure, tested `core/` C++ -- no UI yet
+(that's part 2); the goal here was getting the algorithm itself right and verified
+before touching `CanvasView`/`MainWindowController` at all.
+
+**Design.** Three new, independent, dependency-free `core/` modules:
+
+* `MaxFlowGraph.h/.cpp` -- a generic Dinic's maximum-flow algorithm over a directed
+  graph with real-valued capacities. Segmentation-agnostic (knows nothing about pixels
+  or colour); by max-flow/min-cut duality, the nodes still reachable from the source in
+  the final residual graph after `maxFlow()` runs ARE one minimum s-t cut. Chose Dinic's
+  over the closely-related Boykov-Kolmogorov algorithm (the other standard choice for
+  interactive segmentation) deliberately: BK's main edge over Dinic's is warm-starting a
+  new solve from a previous one's search trees when only a few terminal weights change
+  (useful for truly-live scribble editing); this tool instead re-solves once per
+  "Segment" click on a complete, fixed scribble set, so that advantage doesn't apply,
+  and Dinic's textbook level-graph + blocking-flow structure is meaningfully simpler to
+  implement and verify correctly from scratch.
+* `LazySnapping.h/.cpp` -- `segmentForeground(image, scribbles)`: builds a small k-means
+  colour-cluster model (8 clusters, deterministic seeding) from each of the
+  foreground/background scribbles, then a graph over the image's pixels with the
+  standard Boykov & Jolly (2001) *"Interactive Graph Cuts"* energy -- implemented from
+  that general graph-cuts formulation (which Lazy Snapping's own graph-cut step is built
+  on), not re-derived from the original Lazy Snapping paper's exact text, an honest
+  distinction worth flagging given this project's paper-fidelity focus: a unary data
+  term (cost of a label proportional to colour distance from THAT label's own cluster
+  set -- i.e. a -log-likelihood-style term) plus a contrast-sensitive 8-connected
+  pairwise smoothness term (`smoothnessWeight * exp(-colourDistSq / (2*sigma^2))`,
+  `sigma^2` auto-estimated as the image's own mean squared neighbour-pixel colour
+  distance, the standard Boykov-Jolly auto-tuning trick) that pulls the cut boundary
+  toward real image edges. Scribbled pixels get a hard terminal constraint instead of
+  the soft cluster-based cost.
+* `ContourTracing.h/.cpp` -- `traceOuterContour` (Moore-neighbor tracing with Gonzalez &
+  Woods' stopping criterion, over the LARGEST 8-connected component of the resulting
+  mask) turns the binary mask into an ordered pixel-boundary polygon, and
+  `simplifyClosedPolygon` (Ramer-Douglas-Peucker, adapted to a closed loop by splitting
+  it into two open chains at two anchor points) reduces that from thousands of
+  one-per-pixel points down to a small, clickable number -- so that the output plugs
+  directly into the EXISTING `-setBoundaryPolygonPoints:`/`-fitBoundaryWithCornerIndices:`
+  pipeline `CanvasView`'s corner-picking + per-side Bezier fit already implements. Lazy
+  Snapping only replaces how this polygon is OBTAINED; everything downstream (corner
+  picking, Bezier fitting, mesh building) is untouched and already paper-faithful.
+
+**Two real bugs found and fixed by the new tests** (`core/tests/test_main.cpp`'s
+`maxflow_*`/`segmentation_*`/`contour_tracing_*` cases, 6 new test functions):
+
+1. `segmentForeground`'s fg/bg cluster distances were initially swapped -- an easy
+   polarity mistake (cost of a label must be proportional to distance from THAT SAME
+   label's own cluster set, not the opposite one). With the bug,
+   `test_segmentation_separates_two_color_blocks` (a trivial, huge-contrast synthetic
+   case: solid red left half, solid blue right half, a handful of scribbles deep in
+   each) returned only the literal scribbled pixels as foreground -- 5 out of 400 pixels
+   on the correct side, instead of ~400/400 -- because with the swap, every pixel's
+   "cost of being background" came out near zero deep inside the TRUE foreground region,
+   making it cheap for the graph cut to sever almost every non-scribbled pixel to
+   background. Fixed; the same test now gets 400/400 and 400/400.
+2. `traceOuterContour`'s stopping criterion compared the current backtrack DIRECTION to
+   an arbitrary initial guess (the pixel's west neighbor), which only accidentally
+   matches when a shape happens to be re-entered from the west -- for a plain 5x5 filled
+   square, the trace naturally returns to its start corner from the NORTH instead, so
+   the direction comparison never matched and the loop spun around the same ~20-pixel
+   perimeter until hitting a safety cap, producing 866 points instead of ~17.
+   Corrected to Gonzalez & Woods' actual textbook criterion: remember s1 (the second
+   boundary point ever found), and stop when the trace is back at s0 and about to
+   re-find s1 next -- regardless of which direction it re-arrived at s0 from.
+
+**Verified performance** (this device, real Ceres/cmake unrelated -- this is plain
+`g++`, no external dependency): segmenting the project's own 213x213 `gradient.png`
+test image with ~40 scribble pixels of each colour took 119ms; a synthetic 500x500
+two-colour-block image took 44ms, and 1000x1000 took 227ms. All comfortably interactive
+for this project's typical image sizes -- though these are all high-colour-contrast,
+low-texture cases (the easiest kind for a graph cut to converge quickly on); a real
+photo with more texture/noise will need more augmenting paths and take longer, not
+measured here since part 2 (the actual UI, and real user photos to test with) doesn't
+exist yet.
+
+**Not yet done (part 2, next):** wiring this into the UI -- new `CanvasView` scribble
+tool modes (foreground/background brush strokes), a "Segment" action in
+`MainWindowController`, and a `DocumentModel` method that runs `segmentForeground` +
+`traceOuterContour` + `simplifyClosedPolygon` and feeds the result into the existing
+`-setBoundaryPolygonPoints:` the manual click-tracing tool already produces (so corner-
+picking and Bezier fitting need zero changes). The manual click-tracing tool stays
+available alongside it -- Lazy Snapping is a faster alternative for a clean
+foreground/background split, not a strict replacement for e.g. a boundary that's easier
+to just click by hand.
 
 ## Optional CIELUV colour space (colour interpolation, not geometry)
 
