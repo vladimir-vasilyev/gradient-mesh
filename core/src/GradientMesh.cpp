@@ -65,18 +65,21 @@ Color GradientMesh::evalColor(int patchRow, int patchCol, double u, double v) co
     return evalHermitePatch<Color>(corners, u, v);
 }
 
-GradientMesh GradientMesh::buildInitial(int rows, int cols, const std::array<CubicBezier, 4>& boundary,
+GradientMesh GradientMesh::buildInitial(int rows, int cols, const std::array<BezierSpline, 4>& boundary,
                                          const Image& target) {
     GradientMesh mesh;
     mesh.rows = rows; mesh.cols = cols; mesh.boundary = boundary;
     mesh.vertices.resize(size_t(rows) * cols);
 
-    const CubicBezier& top = boundary[0];
-    const CubicBezier& right = boundary[1];
-    const CubicBezier& bottom = boundary[2];
-    const CubicBezier& left = boundary[3];
+    const BezierSpline& top = boundary[0];
+    const BezierSpline& right = boundary[1];
+    const BezierSpline& bottom = boundary[2];
+    const BezierSpline& left = boundary[3];
 
-    Vec2 P00 = top.p0, P10 = top.p3, P11 = right.p3, P01 = bottom.p3;
+    // BezierSpline has no single p0/p3 field any more (it may be several
+    // segments) -- eval(0.0)/eval(1.0) are the equivalent corner points,
+    // and match exactly what a single-segment spline's p0/p3 used to give.
+    Vec2 P00 = top.eval(0.0), P10 = top.eval(1.0), P11 = right.eval(1.0), P01 = bottom.eval(1.0);
 
     for (int r = 0; r < rows; ++r) {
         double v = double(r) / (rows - 1);
@@ -142,9 +145,13 @@ void GradientMesh::scalePositions(double sx, double sy) {
         v.Pu.x *= sx; v.Pu.y *= sy;
         v.Pv.x *= sx; v.Pv.y *= sy;
     }
-    for (auto& b : boundary) {
-        b.p0.x *= sx; b.p0.y *= sy; b.p1.x *= sx; b.p1.y *= sy;
-        b.p2.x *= sx; b.p2.y *= sy; b.p3.x *= sx; b.p3.y *= sy;
+    // boundary is now a BezierSpline (one or more segments) per side, not
+    // a single CubicBezier -- scale every control point of every segment.
+    for (auto& spline : boundary) {
+        for (auto& b : spline.segments) {
+            b.p0.x *= sx; b.p0.y *= sy; b.p1.x *= sx; b.p1.y *= sy;
+            b.p2.x *= sx; b.p2.y *= sy; b.p3.x *= sx; b.p3.y *= sy;
+        }
     }
 }
 

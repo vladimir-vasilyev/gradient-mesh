@@ -360,7 +360,7 @@ double computeGeometryEnergy(const GradientMesh& mesh, const Image& target,
     // paper intends. Must mirror the GN boundary term below exactly.
     for (const auto& mv : mesh.vertices) {
         if (!mv.isBoundary) continue;
-        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        const BezierSpline& spline = mesh.boundary[mv.boundarySide];
         Vec2 t = spline.eval(mv.boundaryT);
         Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
         double d = (mv.P - t).dot(normal);
@@ -786,7 +786,7 @@ void MeshOptimizer::optimizeAtCurrentResolution(GradientMesh& mesh, const Image&
             for (int i = 0; i < numV; ++i) {
                 const MeshVertex& mv = mesh.vertices[i];
                 if (!mv.isBoundary) continue;
-                const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+                const BezierSpline& spline = mesh.boundary[mv.boundarySide];
                 Vec2 target_ = spline.eval(mv.boundaryT);
                 Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
                 double r0 = (mv.P - target_).dot(normal);

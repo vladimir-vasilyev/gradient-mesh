@@ -41,7 +41,7 @@ struct MeshVertex {
     Vec2 Pu, Pv, Puv;
     Color C, Cu, Cv, Cuv;
     bool isBoundary = false;
-    int boundarySide = -1;   // which of the 4 CubicBezier boundary segments, or -1
+    int boundarySide = -1;   // which of the 4 boundary sides (each a BezierSpline -- one or more cubic segments), or -1
     double boundaryT = 0.0;  // parameter along that segment (kept up to date by the optimizer)
 };
 
@@ -49,7 +49,7 @@ class GradientMesh {
 public:
     int rows = 0, cols = 0; // control-point grid is rows x cols; patches are (rows-1) x (cols-1)
     std::vector<MeshVertex> vertices;
-    std::array<CubicBezier, 4> boundary; // 0=top(u,0..1 at v=0) 1=right 2=bottom 3=left -- see buildInitial
+    std::array<BezierSpline, 4> boundary; // 0=top(u,0..1 at v=0) 1=right 2=bottom 3=left -- see buildInitial. Each side is one-or-more cubic segments (see BezierSpline.h), not a single CubicBezier any more -- Sun et al. Sec. 4: "each boundary consists of one or more cubic Bezier splines".
 
     int idx(int row, int col) const { return row * cols + col; }
     MeshVertex& at(int row, int col) { return vertices[idx(row, col)]; }
@@ -58,7 +58,7 @@ public:
     // Builds an initial mesh of the given resolution by transfinite
     // (Coons) interpolation between the 4 boundary curves, with initial
     // colors bilinearly sampled from `target` at each control point.
-    static GradientMesh buildInitial(int rows, int cols, const std::array<CubicBezier, 4>& boundary,
+    static GradientMesh buildInitial(int rows, int cols, const std::array<BezierSpline, 4>& boundary,
                                       const Image& target);
 
     // Position-implied tangent/twist estimate (centered finite difference

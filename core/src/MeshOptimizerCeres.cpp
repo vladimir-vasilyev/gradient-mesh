@@ -235,7 +235,7 @@ double computeTrueGeometryEnergy(const GradientMesh& mesh, const Image& target,
     // the off-curve (normal) displacement component is penalized.
     for (const auto& mv : mesh.vertices) {
         if (!mv.isBoundary) continue;
-        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        const BezierSpline& spline = mesh.boundary[mv.boundarySide];
         Vec2 t = spline.eval(mv.boundaryT);
         Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
         double d = (mv.P - t).dot(normal);
@@ -993,7 +993,7 @@ static void ceresSolveOnce(GradientMesh& mesh, const Image& target,
     for (int i = 0; i < numV; ++i) {
         const MeshVertex& mv = mesh.vertices[i];
         if (!mv.isBoundary) continue;
-        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        const BezierSpline& spline = mesh.boundary[mv.boundarySide];
         Vec2 targetPos = spline.eval(mv.boundaryT);
         Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
         auto* cost = new BoundaryCostFunction(opts.boundaryWeight, targetPos, normal);
@@ -1162,7 +1162,7 @@ static void jointSolveOnce(GradientMesh& mesh, const Image& target,
     for (int i = 0; i < numV; ++i) {
         const MeshVertex& mv = mesh.vertices[i];
         if (!mv.isBoundary) continue;
-        const CubicBezier& spline = mesh.boundary[mv.boundarySide];
+        const BezierSpline& spline = mesh.boundary[mv.boundarySide];
         Vec2 targetPos = spline.eval(mv.boundaryT);
         Vec2 normal = Vec2{-spline.evalDeriv(mv.boundaryT).y, spline.evalDeriv(mv.boundaryT).x}.normalized();
         auto* cost = new BoundaryCostFunction(opts.boundaryWeight, targetPos, normal);

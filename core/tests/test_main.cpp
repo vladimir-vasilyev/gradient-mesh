@@ -556,11 +556,11 @@ static void test_optimizer_reduces_rmse_and_keeps_corners_fixed() {
         }
     }
 
-    std::array<CubicBezier, 4> boundary;
-    boundary[0] = {Vec2{0, 0}, Vec2{W / 3.0, 0}, Vec2{2 * W / 3.0, 0}, Vec2{double(W), 0}};             // top
-    boundary[1] = {Vec2{double(W), 0}, Vec2{double(W), H / 3.0}, Vec2{double(W), 2 * H / 3.0}, Vec2{double(W), double(H)}}; // right
-    boundary[2] = {Vec2{double(W), double(H)}, Vec2{2 * W / 3.0, double(H)}, Vec2{W / 3.0, double(H)}, Vec2{0, double(H)}}; // bottom
-    boundary[3] = {Vec2{0, double(H)}, Vec2{0, 2 * H / 3.0}, Vec2{0, H / 3.0}, Vec2{0, 0}};              // left
+    std::array<BezierSpline, 4> boundary;
+    boundary[0].segments = {CubicBezier{Vec2{0, 0}, Vec2{W / 3.0, 0}, Vec2{2 * W / 3.0, 0}, Vec2{double(W), 0}}};             // top
+    boundary[1].segments = {CubicBezier{Vec2{double(W), 0}, Vec2{double(W), H / 3.0}, Vec2{double(W), 2 * H / 3.0}, Vec2{double(W), double(H)}}}; // right
+    boundary[2].segments = {CubicBezier{Vec2{double(W), double(H)}, Vec2{2 * W / 3.0, double(H)}, Vec2{W / 3.0, double(H)}, Vec2{0, double(H)}}}; // bottom
+    boundary[3].segments = {CubicBezier{Vec2{0, double(H)}, Vec2{0, 2 * H / 3.0}, Vec2{0, H / 3.0}, Vec2{0, 0}}};              // left
 
     GradientMesh mesh = GradientMesh::buildInitial(5, 5, boundary, target);
 
@@ -609,11 +609,11 @@ static void test_boundary_vertices_stay_on_spline_after_optimize() {
         for (int x = 0; x < W; ++x)
             target.set(x, y, Color{double(x) / W, double(y) / H, 0.5});
 
-    std::array<CubicBezier, 4> boundary;
-    boundary[0] = {Vec2{0, 0}, Vec2{16, 0}, Vec2{32, 0}, Vec2{double(W), 0}};
-    boundary[1] = {Vec2{double(W), 0}, Vec2{double(W), 16}, Vec2{double(W), 32}, Vec2{double(W), double(H)}};
-    boundary[2] = {Vec2{double(W), double(H)}, Vec2{32, double(H)}, Vec2{16, double(H)}, Vec2{0, double(H)}};
-    boundary[3] = {Vec2{0, double(H)}, Vec2{0, 32}, Vec2{0, 16}, Vec2{0, 0}};
+    std::array<BezierSpline, 4> boundary;
+    boundary[0].segments = {CubicBezier{Vec2{0, 0}, Vec2{16, 0}, Vec2{32, 0}, Vec2{double(W), 0}}};
+    boundary[1].segments = {CubicBezier{Vec2{double(W), 0}, Vec2{double(W), 16}, Vec2{double(W), 32}, Vec2{double(W), double(H)}}};
+    boundary[2].segments = {CubicBezier{Vec2{double(W), double(H)}, Vec2{32, double(H)}, Vec2{16, double(H)}, Vec2{0, double(H)}}};
+    boundary[3].segments = {CubicBezier{Vec2{0, double(H)}, Vec2{0, 32}, Vec2{0, 16}, Vec2{0, 0}}};
 
     GradientMesh mesh = GradientMesh::buildInitial(4, 4, boundary, target);
     OptimizerOptions opts;
@@ -652,11 +652,11 @@ static void test_svg_export_smoke() {
         for (int x = 0; x < 16; ++x)
             target.set(x, y, Color{double(x) / 16, double(y) / 16, 0.4});
 
-    std::array<CubicBezier, 4> boundary;
-    boundary[0] = {Vec2{0, 0}, Vec2{5, 0}, Vec2{11, 0}, Vec2{16, 0}};
-    boundary[1] = {Vec2{16, 0}, Vec2{16, 5}, Vec2{16, 11}, Vec2{16, 16}};
-    boundary[2] = {Vec2{16, 16}, Vec2{11, 16}, Vec2{5, 16}, Vec2{0, 16}};
-    boundary[3] = {Vec2{0, 16}, Vec2{0, 11}, Vec2{0, 5}, Vec2{0, 0}};
+    std::array<BezierSpline, 4> boundary;
+    boundary[0].segments = {CubicBezier{Vec2{0, 0}, Vec2{5, 0}, Vec2{11, 0}, Vec2{16, 0}}};
+    boundary[1].segments = {CubicBezier{Vec2{16, 0}, Vec2{16, 5}, Vec2{16, 11}, Vec2{16, 16}}};
+    boundary[2].segments = {CubicBezier{Vec2{16, 16}, Vec2{11, 16}, Vec2{5, 16}, Vec2{0, 16}}};
+    boundary[3].segments = {CubicBezier{Vec2{0, 16}, Vec2{0, 11}, Vec2{0, 5}, Vec2{0, 0}}};
     GradientMesh mesh = GradientMesh::buildInitial(3, 3, boundary, target);
 
     std::string svg = exportGradientMeshSVG(mesh, 16, 16, /*sourceIsCIELUV=*/false);
