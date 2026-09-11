@@ -138,6 +138,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     std::vector<OptimizerProgress> _lastRunHistory;
     BOOL _hasRunOptimize;
     double _lastRunWallClockSeconds;
+    // Whether the CURRENT _mesh object has completed at least one full
+    // coarse-to-fine pyramid pass -- reset to NO whenever a new _mesh is
+    // (re)built (-buildInitialMeshRows:cols:) or dropped (-loadImageAtURL:
+    // error:, -setBoundaryPolygonPoints:), set to YES at the end of any
+    // -optimizeWithPyramidLevels:progress:completion: run. See that
+    // method's use of this: a repeat "Optimize" click on a mesh that's
+    // already had a full pass refines at full resolution ONLY, skipping
+    // the coarse levels -- see that method's comment for why.
+    BOOL _meshHasHadFullPyramidPass;
     // URL of the currently loaded image (set in -loadImageAtURL:error:) --
     // used only to locate the "DebugOut" folder for -autoExportDebugData
     // (see DocumentModel.h), sibling to wherever the image actually lives.
@@ -326,6 +335,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     _hasImage = YES;
     _hasBoundary = NO;
     _mesh.reset();
+    _meshHasHadFullPyramidPass = NO;
     _vectorLines.clear();
     _fgScribbles.clear();
     _bgScribbles.clear();
@@ -359,6 +369,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // -resetBoundaryDrawing/-resetCornerPicking right after calling this.
     _mesh.reset();
     _previewMesh.reset();
+    _meshHasHadFullPyramidPass = NO;
 }
 
 - (NSArray<NSValue*>*)boundaryPolygonPoints {
@@ -428,6 +439,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     _meshColorSpaceIsCIELUV = self.useCIELUVColorSpace;
     const gmcore::Image& target = [self workingTargetImage];
     _mesh = std::make_unique<GradientMesh>(GradientMesh::buildInitial((int)rows, (int)cols, _boundary, target));
+    _meshHasHadFullPyramidPass = NO;
     _lastRMSE = _mesh->reconstructionRMSE(target, 6);
     _lastMAE = _mesh->reconstructionMAE(target, 6);
 }
@@ -754,51 +766,75 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // progress lambda below -- see its use just below scalePositions'
     // comment for why the live-preview snapshot needs this.
     int fullResW = targetCopy.width, fullResH = targetCopy.height;
+    // See _meshHasHadFullPyramidPass's declaration: only the FIRST
+    // "Optimize" click on a given mesh (or the first one after it's been
+    // rebuilt/dropped) does the full coarse-to-fine sweep; every later
+    // click on the SAME already-fitted mesh refines directly at full
+    // resolution instead, skipping the coarse-level detour that measurably
+    // degrades full-res fit before climbing back (see
+    // spike/ceres_joint_drift_probe.cpp's per-pyramid-level trace and the
+    // README -- confirmed worse for useCeresJoint's fully-coupled step than
+    // for the other two solver paths, but present in all three). Read here
+    // (main thread), same reasoning as opts/livePreview above.
+    BOOL needsFullPyramidPass = !_meshHasHadFullPyramidPass;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts,
-            [progress, self, meshPtr, livePreview, fullResW, fullResH](const OptimizerProgress& p) {
-                // Snapshot HERE, still on the background thread, still
-                // inside the synchronous callback optimizeAtCurrentResolution
-                // invokes between one outer iteration's writes finishing and
-                // the next one's starting (see MeshOptimizer.cpp) -- so this
-                // copy can never race a concurrent write to *meshPtr. Cheap
-                // (a std::vector<MeshVertex> copy, no allocation-heavy
-                // fields) but still only paid when the toggle is on.
-                std::shared_ptr<GradientMesh> snap;
-                if (livePreview) {
-                    snap = std::make_shared<GradientMesh>(*meshPtr);
-                    // *meshPtr lives in pyramid level p.pyramidLevel's OWN
-                    // downsampled coordinate space for the whole duration of
-                    // that level (see OptimizerProgress::levelWidth/Height's
-                    // comment) -- only the FINEST level (0) happens to
-                    // already be full-res. CanvasView always draws against
-                    // full-res image pixel coordinates, so without this the
-                    // live mesh grid would render shrunk into a corner of
-                    // the canvas at every level except the last one. Scaling
-                    // up front here (background thread, on the already-
-                    // independent copy) means CanvasView/DocumentModel's
-                    // read accessors don't need to know or care which
-                    // pyramid level produced the snapshot they're reading.
-                    if (p.levelWidth > 0 && p.levelHeight > 0) {
-                        snap->scalePositions(double(fullResW) / p.levelWidth, double(fullResH) / p.levelHeight);
-                    }
+        auto progressCb = [progress, self, meshPtr, livePreview, fullResW, fullResH](const OptimizerProgress& p) {
+            // Snapshot HERE, still on the background thread, still
+            // inside the synchronous callback optimizeAtCurrentResolution
+            // invokes between one outer iteration's writes finishing and
+            // the next one's starting (see MeshOptimizer.cpp) -- so this
+            // copy can never race a concurrent write to *meshPtr. Cheap
+            // (a std::vector<MeshVertex> copy, no allocation-heavy
+            // fields) but still only paid when the toggle is on.
+            std::shared_ptr<GradientMesh> snap;
+            if (livePreview) {
+                snap = std::make_shared<GradientMesh>(*meshPtr);
+                // *meshPtr lives in pyramid level p.pyramidLevel's OWN
+                // downsampled coordinate space for the whole duration of
+                // that level (see OptimizerProgress::levelWidth/Height's
+                // comment) -- only the FINEST level (0) happens to
+                // already be full-res. CanvasView always draws against
+                // full-res image pixel coordinates, so without this the
+                // live mesh grid would render shrunk into a corner of
+                // the canvas at every level except the last one. Scaling
+                // up front here (background thread, on the already-
+                // independent copy) means CanvasView/DocumentModel's
+                // read accessors don't need to know or care which
+                // pyramid level produced the snapshot they're reading.
+                if (p.levelWidth > 0 && p.levelHeight > 0) {
+                    snap->scalePositions(double(fullResW) / p.levelWidth, double(fullResH) / p.levelHeight);
                 }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    // Recorded unconditionally, even if the caller passed a
-                    // nil UI progress block -- this is the history
-                    // -exportDebugDataToURL:error: dumps, independent of
-                    // whether anything was listening for live UI updates.
-                    self->_lastRunHistory.push_back(p);
-                    if (snap) self->_previewMesh = std::make_unique<GradientMesh>(*snap);
-                    if (progress) progress(p.rmse, p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.totalOuterIterations);
-                });
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // Recorded unconditionally, even if the caller passed a
+                // nil UI progress block -- this is the history
+                // -exportDebugDataToURL:error: dumps, independent of
+                // whether anything was listening for live UI updates.
+                self->_lastRunHistory.push_back(p);
+                if (snap) self->_previewMesh = std::make_unique<GradientMesh>(*snap);
+                if (progress) progress(p.rmse, p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.totalOuterIterations);
             });
+        };
+        if (needsFullPyramidPass) {
+            gmcore::MeshOptimizer::optimizeCoarseToFine(*meshPtr, targetCopy, linesCopy, (int)levels, opts, progressCb);
+        } else {
+            // Full resolution IS pyramid level 0 -- same function
+            // optimizeCoarseToFine itself calls for its finest level, just
+            // invoked directly with no coarser levels before it. `mesh` is
+            // already sized for targetCopy's full resolution (a full
+            // pyramid pass always ends at level 0, and this branch only
+            // runs once one has happened), so no scalePositions is needed
+            // here the way optimizeCoarseToFine needs it between levels.
+            gmcore::MeshOptimizer::optimizeAtCurrentResolution(*meshPtr, targetCopy, linesCopy, opts, progressCb,
+                                                                /*level=*/0, /*totalLevels=*/1);
+        }
         double finalRmse = meshPtr->reconstructionRMSE(targetCopy, 6);
         double finalMae = meshPtr->reconstructionMAE(targetCopy, 6);
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_isOptimizing = NO;
             self->_previewMesh.reset(); // run over -- CanvasView goes back to reading the live (now-settled) _mesh
+            self->_meshHasHadFullPyramidPass = YES; // true whether THIS run did the full sweep or just refined at full-res
             self->_lastRMSE = finalRmse;
             self->_lastMAE = finalMae;
             self->_lastRunWallClockSeconds = -[runStart timeIntervalSinceNow];

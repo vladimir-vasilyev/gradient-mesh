@@ -596,8 +596,18 @@
             // sRGB run's -- flagged here so it's never mistaken for a huge
             // regression/improvement at a glance.
             NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @"";
-            weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Optimizing… pyramid level %ld/%ld, iteration %ld/%ld, RMSE=%.4f%@",
-                                                 (long)level, (long)(totalLevels - 1), (long)iter, (long)(totalIters - 1), rmse, unitTag];
+            // totalLevels==1 means this run skipped the coarse pyramid
+            // levels entirely -- see DocumentModel.mm's
+            // _meshHasHadFullPyramidPass: only the FIRST "Optimize" click on
+            // a given mesh does the full coarse-to-fine sweep, every later
+            // click refines at full resolution only. "pyramid level 0/0"
+            // would read as if nothing were happening, so phrase that case
+            // as a plain refinement pass instead.
+            NSString* stageDesc = (totalLevels > 1)
+                ? [NSString stringWithFormat:@"pyramid level %ld/%ld", (long)level, (long)(totalLevels - 1)]
+                : @"refining at full resolution";
+            weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Optimizing… %@, iteration %ld/%ld, RMSE=%.4f%@",
+                                                 stageDesc, (long)iter, (long)(totalIters - 1), rmse, unitTag];
             // Live mesh preview: when DocumentModel.livePreviewDuringOptimize
             // is on, a fresh snapshot lands in -hasLivePreviewMesh right before
             // this block runs (see -optimizeWithPyramidLevels:progress:completion:),
