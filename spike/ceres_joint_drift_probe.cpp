@@ -48,6 +48,32 @@
 // `energy` ALSO increases (which would mean this hypothesis is wrong and
 // something else is going on).
 //
+// UPDATED AGAIN after the energy-column run (see README): `energy` moved
+// WITH `RMSE`, not against it, on both mesh sizes tested -- refuting the
+// H2 (area-weighted-vs-naive-RMSE) hypothesis above. energy is computed
+// fresh every time against the SAME full-resolution target/opts, so an
+// increase in it is a genuine regression in the true composite objective,
+// not a metric-mismatch artifact. Reading optimizeCoarseToFine(): each
+// repeat first scales the mesh DOWN to the COARSEST pyramid level and
+// re-optimizes there against a blurred/downsampled target, then climbs
+// back up through progressively sharper levels to level 0 (full-res).
+// On a mesh that's already well-fit to the SHARP full-res image, that
+// initial coarse-level re-fit can move geometry toward whatever is
+// optimal for the BLURRY image -- which need not be what's optimal for
+// the sharp one -- and the climb back up has no guarantee of fully
+// undoing that. This (H3) would explain the data better: it's not
+// Ceres/joint-specific (the coarse-to-fine mechanism is shared by all
+// three modes, and hand-rolled did show a smaller version of the same
+// drift), just apparently worse for useCeresJoint's fully-coupled step.
+// This revision adds a per-pyramid-level trace (piggybacking on the
+// EXISTING OptimizerProgressCallback -- no changes to MeshOptimizer.cpp/
+// MeshOptimizerCeres.cpp needed) that snapshots the mesh once per level,
+// rescales that snapshot to full resolution (per OptimizerProgress's own
+// documented recipe), and reports ITS RMSE/energy against the real
+// full-res target -- to see directly whether full-res quality dips when
+// the sweep is down at a coarse level and how much of that dip survives
+// the climb back to level 0.
+//
 // Standalone, throwaway (see spike/CMakeLists.txt's own header comment) --
 // not wired into the root build, does not touch MeshOptimizer.cpp/
 // MeshOptimizerCeres.cpp (only reads two of its already non-static, just
@@ -145,9 +171,45 @@ void runMode(const char* label, const Image& target, int rows, int cols, int mar
     std::printf("initial  %.6f   --         --\n", rmse0);
 #endif
 
+    // H3 diagnostic (see file header): fires once per OUTER GN iteration
+    // during optimizeCoarseToFine (existing hook, MeshOptimizer.cpp/
+    // MeshOptimizer.h -- no core changes needed), but only PRINTS the
+    // first firing seen for each NEW pyramidLevel value, i.e. one row per
+    // pyramid level per repeat, right after that level's first outer
+    // iteration -- enough to see the trajectory across levels without
+    // flooding the log with every one of up to outerIterationsPerLevel=40
+    // iterations. `mesh` is captured by reference and read at whatever
+    // state it's in at that instant (the callback fires synchronously,
+    // after that iteration's update -- see MeshOptimizer.cpp) -- a COPY is
+    // taken immediately so rescaling it to full-res doesn't disturb the
+    // live optimization. Rescale recipe is exactly what OptimizerProgress's
+    // own doc comment prescribes: level pixel dims -> full-res pixel dims.
+    int lastLevelSeen = -1;
+    auto traceProgress = [&](const OptimizerProgress& p) {
+        if (p.pyramidLevel == lastLevelSeen) return;
+        lastLevelSeen = p.pyramidLevel;
+        if (p.levelWidth <= 0 || p.levelHeight <= 0) return; // shouldn't happen inside a real callback
+        GradientMesh snapshot = mesh;
+        double sx = double(target.width) / double(p.levelWidth);
+        double sy = double(target.height) / double(p.levelHeight);
+        snapshot.scalePositions(sx, sy);
+        double fullResRmse = snapshot.reconstructionRMSE(target, 6);
+#ifdef GMCORE_WITH_CERES
+        double fullResEnergy = computeTrueJointEnergy(snapshot, target, {}, opts, nullptr);
+        std::printf("    [level %d/%d outer %2d @ %4dx%-4d] levelRMSE=%.6f  fullResRMSE=%.6f  fullResEnergy=%.6f\n",
+                    p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.levelWidth, p.levelHeight,
+                    p.rmse, fullResRmse, fullResEnergy);
+#else
+        std::printf("    [level %d/%d outer %2d @ %4dx%-4d] levelRMSE=%.6f  fullResRMSE=%.6f\n",
+                    p.pyramidLevel, p.totalPyramidLevels, p.outerIteration, p.levelWidth, p.levelHeight,
+                    p.rmse, fullResRmse);
+#endif
+    };
+
     for (int r = 1; r <= repeats; ++r) {
         prev = mesh; // snapshot BEFORE this repeat's optimize call
-        MeshOptimizer::optimizeCoarseToFine(mesh, target, {}, pyramidLevels, opts, nullptr);
+        lastLevelSeen = -1; // reset so this repeat's coarsest level prints its own row
+        MeshOptimizer::optimizeCoarseToFine(mesh, target, {}, pyramidLevels, opts, traceProgress);
         double rmse = mesh.reconstructionRMSE(target, 6);
         double meanDisp, maxDisp;
         meshDisplacement(mesh, prev, &meanDisp, &maxDisp);
