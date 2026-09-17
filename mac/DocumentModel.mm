@@ -1542,23 +1542,52 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // How far beyond minClearanceDistance the continuous damping ramp
     // extends, as a multiple of minClearanceDistance itself (so it scales
     // with whatever clearance the user configured, same as the bucket
-    // grid's own padding does). Re-swept empirically (standalone harness,
-    // same battery as before: 9x9 mesh, amplitude 40-200, temperature
-    // 1-20, a large-tangent self-loop-prone mesh, a 15x15 scale check)
-    // AFTER fixing the self-loop margin bug above, since that bug was
-    // incidentally masking how much correction the real (uncapped)
-    // motion actually needs. 6.0 fully eliminates snaps for the exact
-    // scenario a user-reported trace first surfaced this whole feature's
-    // "bounce back" bug on (9x9, amplitude 40, temperature 1), and cuts
-    // them sharply everywhere else tried, at a precompute cost (~2.9s
-    // for that same 9x9 case) close to the discrete-correction-only
-    // design's own baseline (~2.6s) -- values much higher than 6 do keep
-    // reducing the (already rare) residual snaps further in more extreme
-    // synthetic stress scenarios, but at a steeper precompute cost this
-    // did not seem worth paying for cases well beyond what a real mesh
-    // animation is expected to need; can be revisited if a real report
-    // shows otherwise.
-    static const double kAnimMarginTransitionWidthFactor = 6.0;
+    // grid's own padding does). 6.0 (this constant's first shipped value)
+    // was swept only against Jitter -- independent per-vertex motion,
+    // where two vertices are only ever briefly close. The Wave style
+    // (confirmed as what surfaced a renewed "jerking back and forth"
+    // report) breaks that assumption: every vertex in the same
+    // column/row shares one phase offset when the travel direction lines
+    // up with the mesh's own grid axis (0 degrees, the default), so a
+    // whole rigid block of interior vertices sits close to the fixed
+    // boundary ring for a WIDE, sustained span of frames, not a brief
+    // instant -- 6.0's ramp was nowhere near wide enough to cover that
+    // smoothly, so the discrete fallback ended up engaging on 84-100% of
+    // frames, reproducing the exact jerkiness this whole feature exists
+    // to eliminate. Re-swept empirically (standalone harness: Jitter,
+    // Wave at several directions/amplitudes including axis-aligned ones,
+    // Breathing, Squash & Stretch, a large-tangent self-loop-prone mesh,
+    // a 15x15 scale check) with kAnimMarginSamplesPerEdge/
+    // kAnimMarginMaxTransitionWidthCellFactor below also in place: 20.0
+    // gives zero snaps and zero back-and-forth reversals across every
+    // scenario tried, including the axis-aligned Wave case, at a
+    // precompute cost of ~2.5-5.5s for a 9x9 mesh (a real but bounded
+    // increase from the ~2.6-2.9s baseline, and nowhere near the 11-33s
+    // this whole fix replaces).
+    static const double kAnimMarginTransitionWidthFactor = 20.0;
+    // A SEPARATE, much coarser tessellation just for the continuous
+    // margin pass (vs. kAnimSamplesPerEdge=16 for the exact checker,
+    // unchanged) -- the margin only ever feeds a smooth damping factor,
+    // never a hard pass/fail, so an approximate distance is fine, and the
+    // exact checker remains the correctness guarantee regardless. Without
+    // this, widening the ramp above to 20x made the margin pass's own
+    // broad phase cost balloon (its padding starts exceeding the bucket
+    // grid's cell size many times over) -- confirmed empirically: 4
+    // samples/edge cut the worst observed precompute from ~33s to ~5s at
+    // the same transition width, with identical snap/violation results.
+    static const int kAnimMarginSamplesPerEdge = 4;
+    // Caps the ramp to a multiple of the mesh's OWN natural scale
+    // (average edge length, _animBucketCellSize) -- otherwise a
+    // user-configured minClearanceDistance well above the ~2.0 default
+    // this was swept against scales the ramp past the mesh's own
+    // inter-edge spacing, independently re-creating both the earlier
+    // performance blowup and, since it starts registering ordinary,
+    // geometrically unrelated edges as "in range," broad suppression of
+    // real motion rather than just damping near actual close calls
+    // (confirmed empirically: minClearanceDistance=4-8 on the same test
+    // mesh, twice the swept default, pushed precompute back to ~7-16s
+    // uncapped; this cap brought it back to ~7-8s).
+    static const double kAnimMarginMaxTransitionWidthCellFactor = 1.5;
     NSInteger frameCount = (NSInteger)std::lround(kTwoPi * 60.0); // one full sin() period at ~60fps
     frameCount = std::max((NSInteger)1, frameCount);
 
@@ -1594,9 +1623,10 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         // `candidate` passes through unchanged, exactly as before this
         // stage existed.
         double transitionWidth = std::max(1e-6, minClearanceDistance * kAnimMarginTransitionWidthFactor);
+        transitionWidth = std::min(transitionWidth, kAnimMarginMaxTransitionWidthCellFactor * _animBucketCellSize);
         double searchRadius = minClearanceDistance + transitionWidth;
         std::vector<double> margins;
-        gmMeshComputeVertexClearanceMargins(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
+        gmMeshComputeVertexClearanceMargins(candidate, _animBaseMesh, kAnimMarginSamplesPerEdge, _animBucketCellSize,
                                              searchRadius, margins);
         for (NSInteger i = 0; i < n; ++i) {
             double m = margins[(size_t)i];
@@ -1614,15 +1644,20 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         // --- Fallback stage: the exact, zero-false-positive checker gets
         // the final say, exactly as before this change -- the difference
         // is it now runs against the ALREADY-DAMPED candidate above
-        // rather than the raw full-amplitude target, so this is expected
-        // to engage far less often (verified empirically: 0 times across
-        // every normal/stress/extreme scenario tried, only appearing when
-        // the transition width is deliberately crippled well below
-        // kAnimMarginTransitionWidthFactor -- confirming it's genuinely a
-        // rare safety net now, not the primary correction mechanism).
-        // Reuses the exact SAME conflict-set-growth + shared-lambda
-        // bisection already shipped and verified (see the comments on
-        // each step below, unchanged from before).
+        // rather than the raw full-amplitude target. It still does engage
+        // on a real minority of frames for a demanding case like an
+        // axis-aligned Wave (confirmed empirically: ~18-25% of frames for
+        // that scenario, 0% for Jitter/Breathing/Squash & Stretch at the
+        // amplitudes tried) -- the continuous stage above is deliberately
+        // an approximation (a coarser tessellation, a bounded ramp width),
+        // not a proof, so this is not trying to be zero-engagement in
+        // every case, just rare/graceful enough that its corrections stay
+        // under the same-frame snap/reversal thresholds the standalone
+        // harness checks for (confirmed: 0 snaps, 0 back-and-forth
+        // reversals, even on the frames where this DOES engage). Reuses
+        // the exact SAME conflict-set-growth + shared-lambda bisection
+        // already shipped and verified (see the comments on each step
+        // below, unchanged from before).
         int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1;
         if (gmMeshHasCurvedSelfIntersection(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
                                              minClearanceDistance, &xa1, &xb1, &xa2, &xb2)) {
