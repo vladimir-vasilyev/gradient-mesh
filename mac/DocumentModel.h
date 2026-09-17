@@ -375,6 +375,27 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // boundary-lies-on-the-fitted-spline invariant CanvasView's boundary
 // overlay and the SVG/PNG exporters both assume, and would make the
 // silhouette itself flicker, which reads as broken rather than lively.
+//
+// Collision handling: P_i(t) above is only the UNOBSTRUCTED target --
+// each tick checks whether moving vertex i in a straight line from its
+// current (possibly already-obstructed) position to that target would
+// cross any OTHER mesh edge (a straight segment between two grid-adjacent
+// vertices' CURRENT positions, the same connectivity CanvasView's
+// -drawMesh/-meshEdgeBezierFromRow:col:toRow:col: draw -- edges incident
+// to vertex i itself are never checked, since they share an endpoint with
+// it and always "touch" trivially). On a crossing, vertex i does not stop
+// dead: it keeps only the component of that tick's motion running ALONG
+// the obstructing edge (a "slide"), dropping the component that would
+// have crossed it, so it visibly slides along the obstacle instead of
+// clipping through it. Once the obstacle (itself possibly also animating)
+// moves clear, the vertex resumes tracking sin(t) directly. See
+// -animationTick: for the exact per-tick algorithm; this is a real-time
+// cosmetic effect, not a physically exact contact solver -- it does not
+// resolve simultaneous multi-edge contact (e.g. a vertex pinned into a
+// corner) beyond picking the single nearest crossing each tick, and a
+// very large amplitude/temperature relative to the mesh's own cell size
+// can still visibly distort the grid around a contact point rather than
+// producing a perfectly rigid-looking bounce.
 @property (nonatomic, readonly) BOOL isAnimatingMesh;
 
 // Upper bound (image pixel units, same units as mesh vertex positions) on

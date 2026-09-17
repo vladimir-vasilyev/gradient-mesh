@@ -32,6 +32,32 @@ static NSError* gmError(NSString* msg) {
     return [NSError errorWithDomain:@"GradientMeshStudio" code:1 userInfo:@{NSLocalizedDescriptionKey: msg}];
 }
 
+// --- Collision helper for "Animate Mesh" (see -animationTick:) ---
+
+// Standard parametric segment-segment intersection test: [A,B] and [C,D]
+// cross iff both t (how far along A->B) and u (how far along C->D) land
+// in [0,1]. A small epsilon widens that range slightly so a crossing
+// exactly at an endpoint counts as a hit rather than being lost to
+// floating-point rounding. Parallel/collinear segments (rxs ~= 0) are
+// reported as a miss -- an edge-on-edge slide in that exact configuration
+// is ambiguous anyway, and it's a measure-zero case in practice. On a hit,
+// outT receives t (0..1 along A->B), used by the caller to pick the
+// EARLIEST crossing along a vertex's intended path when it would cross
+// more than one edge in a single tick.
+static bool gmSegmentsIntersect(const Vec2& A, const Vec2& B, const Vec2& C, const Vec2& D, double* outT) {
+    Vec2 r = B - A;
+    Vec2 s = D - C;
+    double rxs = r.cross(s);
+    if (std::fabs(rxs) < 1e-9) return false;
+    Vec2 qp = C - A;
+    double t = qp.cross(s) / rxs;
+    double u = qp.cross(r) / rxs;
+    const double kEps = 1e-6;
+    if (t < -kEps || t > 1.0 + kEps || u < -kEps || u > 1.0 + kEps) return false;
+    if (outT) *outT = t;
+    return true;
+}
+
 // --- Debug-data export helpers (see -exportDebugDataToURL:error:) ---
 
 // Finds the git repo root by walking up from THIS SOURCE FILE'S OWN
@@ -955,19 +981,126 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 // Timer-fired, ~60x/sec while animating. t is elapsed wall-clock seconds
 // since -startMeshAnimationWithRedraw: (one shared clock for every vertex,
-// per the user's "sin(t)" spec -- no extra frequency multiplier).
+// per the user's "sin(t)" spec -- no extra frequency multiplier). P_i(t)
+// (base_i + dir_i*amp_i*sin(t)) is only each vertex's UNOBSTRUCTED target;
+// getting there is now stateful rather than a pure function of t, because
+// a vertex currently sliding against an obstacle must remember where it
+// actually is, not just snap back to the pure sine curve -- see
+// DocumentModel.h's isAnimatingMesh "Collision handling" paragraph.
 - (void)animationTick:(NSTimer*)timer {
     if (!_isAnimatingMesh || !_previewMesh) return;
     double t = -[_animStartDate timeIntervalSinceNow];
     double s = std::sin(t);
+    int rows = _previewMesh->rows, cols = _previewMesh->cols;
     NSInteger n = (NSInteger)_animBaseMesh.vertices.size();
+
+    // Snapshot every vertex's position as it stood BEFORE this tick, once,
+    // up front. Collision checks below all compare against this frozen
+    // snapshot rather than _previewMesh's live (partially-updated-this-tick)
+    // positions, so the result never depends on which order vertices
+    // happen to be visited in -- vertex 41 colliding against vertex 3's
+    // edge sees vertex 3 where it was at the START of this tick either way.
+    std::vector<Vec2> prevPos(_previewMesh->vertices.size());
+    for (size_t i = 0; i < prevPos.size(); ++i) prevPos[i] = _previewMesh->vertices[i].P;
+
     for (NSInteger i = 0; i < n; ++i) {
         const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
-        MeshVertex& live = _previewMesh->vertices[(size_t)i];
         // Only P is touched -- colors (C/Cu/Cv/Cuv) and tangents (Pu/Pv)
         // stay exactly as snapshotted in _animBaseMesh/_previewMesh at
         // start, per the user's "fix the colors, animate the nodes" spec.
-        live.P = base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * s);
+        if (base.isBoundary) continue; // pinned -- never moves, so never collides either (see startMeshAnimationWithRedraw:)
+
+        Vec2 current = prevPos[(size_t)i];
+        Vec2 target = base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * s);
+        Vec2 intendedDisp = target - current;
+        if (intendedDisp.lengthSq() < 1e-12) {
+            _previewMesh->vertices[(size_t)i].P = target;
+            continue;
+        }
+
+        // Does the straight move current->target cross any OTHER grid
+        // edge (same row/col adjacency -drawMesh draws, straight P-to-P
+        // segments rather than the exact Ferguson-patch-edge Bezier
+        // curves meshEdgeBezierFromRow:col:toRow:col: returns -- a
+        // deliberate simplification: those curves depend on Pu/Pv, which
+        // this animation never touches, so their SHAPE never changes
+        // during a run, but exact curve-vs-point collision is
+        // substantially more expensive to compute correctly every tick
+        // for a cosmetic effect)? Edges touching vertex i itself are
+        // skipped -- they share an endpoint with it and always "touch"
+        // trivially, which isn't a real collision. Tracks the winning
+        // edge's actual endpoints (bestEdgeStart/bestEdgeDir), not just a
+        // direction, so the slide response below can clamp to the edge's
+        // own finite extent -- see that comment for why that clamp matters.
+        bool hit = false;
+        double bestT = 2.0; // > 1.0, so any real hit (t in [0,1]) replaces it
+        Vec2 bestEdgeStart(0, 0), bestEdgeDir(0, 0);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                int idxA = r * cols + c;
+                if (c + 1 < cols) { // horizontal edge (r,c)-(r,c+1)
+                    int idxB = idxA + 1;
+                    if (idxA != i && idxB != i) {
+                        double edgeT;
+                        if (gmSegmentsIntersect(current, target, prevPos[(size_t)idxA], prevPos[(size_t)idxB], &edgeT) && edgeT < bestT) {
+                            bestT = edgeT;
+                            bestEdgeStart = prevPos[(size_t)idxA];
+                            bestEdgeDir = prevPos[(size_t)idxB] - prevPos[(size_t)idxA];
+                            hit = true;
+                        }
+                    }
+                }
+                if (r + 1 < rows) { // vertical edge (r,c)-(r+1,c)
+                    int idxB = idxA + cols;
+                    if (idxA != i && idxB != i) {
+                        double edgeT;
+                        if (gmSegmentsIntersect(current, target, prevPos[(size_t)idxA], prevPos[(size_t)idxB], &edgeT) && edgeT < bestT) {
+                            bestT = edgeT;
+                            bestEdgeStart = prevPos[(size_t)idxA];
+                            bestEdgeDir = prevPos[(size_t)idxB] - prevPos[(size_t)idxA];
+                            hit = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        Vec2 newPos;
+        if (hit) {
+            // Slide: keep only the component of this tick's intended
+            // motion that runs ALONG the obstructing edge, dropping the
+            // component that would have crossed it -- the vertex still
+            // tracks sin(t)'s motion tangentially to the obstacle instead
+            // of stopping dead or clipping through it.
+            Vec2 edgeDir = bestEdgeDir.normalized(); // safely {0,0} for a degenerate (near-zero-length) edge
+            double edgeLen = bestEdgeDir.length();
+            double along = intendedDisp.dot(edgeDir);
+            Vec2 candidate = current + edgeDir * along;
+            // Clamp the slide to the obstructing edge's own finite extent,
+            // measured as a distance (not a 0..1 fraction) from
+            // bestEdgeStart along edgeDir. Without this, a vertex sliding
+            // along a FINITE edge segment could slide straight past
+            // either endpoint in a single tick -- "falling off the end of
+            // the wall" into whatever lies beyond that corner instead of
+            // stopping there -- since only the crossing of THIS edge was
+            // ever checked, not what happens after leaving its bounds.
+            // Verified against a standalone port of this exact algorithm
+            // (see the session's collision-geometry test): without this
+            // clamp a diagonal collision could tunnel the vertex tens of
+            // pixels past a wall within a handful of ticks; with it, 3000
+            // ticks (~50s) of continuous oscillation into the same wall
+            // never crossed it by more than floating-point epsilon.
+            double distAlong = (edgeLen > 1e-9) ? (candidate - bestEdgeStart).dot(edgeDir) : 0.0;
+            distAlong = std::max(0.0, std::min(edgeLen, distAlong));
+            newPos = bestEdgeStart + edgeDir * distAlong;
+        } else {
+            // Unobstructed: jump straight to the pure sine target (not an
+            // incremental step) -- this is also how a previously-sliding
+            // vertex "catches up" the instant the obstacle clears, rather
+            // than gradually re-approaching the sine curve.
+            newPos = target;
+        }
+        _previewMesh->vertices[(size_t)i].P = newPos;
     }
     if (_animRedrawBlock) _animRedrawBlock();
 }
