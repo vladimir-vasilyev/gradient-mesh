@@ -353,6 +353,72 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
                                                        NSInteger iter, NSInteger totalIters))progress
                         completion:(nullable void (^)(void))completion;
 
+// --- Mesh animation ("Animate Mesh") ---
+// A lightweight, PURELY COSMETIC wiggle of the CURRENT mesh's vertex
+// positions, driven by a real-time timer -- entirely separate from
+// -optimizeWithPyramidLevels:progress:completion: and gmcore::MeshOptimizer
+// (no core/ code is involved at all: this is UI-only, mac/DocumentModel.mm
+// state). Colors (C/Cu/Cv/Cuv) are never touched, only positions (P) --
+// implemented as a frozen base-mesh snapshot plus a live preview copy whose
+// vertices are displaced each timer tick, so the underlying _mesh itself
+// is NEVER mutated and -stopMeshAnimation always restores the exact
+// pre-animation state with no risk of drift or accumulated error.
+//
+// Motion law, per interior vertex i: P_i(t) = base_i + dir_i * amp_i *
+// sin(t), t = seconds since -startMeshAnimationWithRedraw: was called
+// (one shared clock, not per-vertex), dir_i a random unit vector chosen
+// once at animation start (fixed for the whole animation, not
+// re-randomized per frame), amp_i sampled once at start from
+// meshAnimationMaxAmplitude and meshAnimationTemperature (see those
+// properties below). Boundary vertices (gmcore::MeshVertex::isBoundary)
+// are always pinned to amp_i == 0 -- letting them wiggle would break the
+// boundary-lies-on-the-fitted-spline invariant CanvasView's boundary
+// overlay and the SVG/PNG exporters both assume, and would make the
+// silhouette itself flicker, which reads as broken rather than lively.
+@property (nonatomic, readonly) BOOL isAnimatingMesh;
+
+// Upper bound (image pixel units, same units as mesh vertex positions) on
+// how far any single interior vertex can be displaced from its base
+// position -- see isAnimatingMesh's comment for the exact motion law. Read
+// once, at -startMeshAnimationWithRedraw: time, same "typed value takes
+// effect on next start, not retroactively" convention as the optimizer
+// weight properties. Clamped to >= 0 by the caller (MainWindowController);
+// 0 means every vertex stays put (temperature becomes moot).
+@property (nonatomic, assign) double meshAnimationMaxAmplitude;
+
+// Controls how each interior vertex's OWN amplitude (see isAnimatingMesh's
+// comment) is drawn from [0, meshAnimationMaxAmplitude], via
+// amp_i = meshAnimationMaxAmplitude * pow(uniformRandom01(), 1.0/temperature)
+// -- the same inverse-CDF power-law shape a softmax/simulated-annealing
+// "temperature" produces: temperature == 1.0 is a plain uniform draw;
+// temperature -> 0 ("cold") concentrates amplitudes near 0, so only a few
+// vertices move much and the rest barely wiggle (a calm mesh with the
+// occasional twitch); temperature >> 1.0 ("hot") pushes most amplitudes
+// toward the max, so nearly every vertex swings close to full amplitude
+// (a chaotic, energetic mesh). Read once at -startMeshAnimationWithRedraw:
+// time, same convention as meshAnimationMaxAmplitude above. Must be > 0
+// (division); the caller (MainWindowController) clamps it away from 0
+// before passing it down.
+@property (nonatomic, assign) double meshAnimationTemperature;
+
+// Starts animating: snapshots the current mesh, samples a random
+// direction+amplitude per interior vertex (see isAnimatingMesh's comment),
+// and starts a ~60fps real-time timer that calls `redraw` every tick after
+// updating the preview mesh -- `redraw` is expected to trigger a CanvasView
+// -setNeedsDisplay: (kept as a caller-supplied block instead of this class
+// reaching into AppKit directly, same separation DocumentModel already
+// keeps everywhere else). No-op if !hasMesh, isOptimizing (don't animate
+// while a background optimize is mutating the mesh), or isAnimatingMesh
+// already (call -stopMeshAnimation first to restart with new
+// amplitude/temperature values).
+- (void)startMeshAnimationWithRedraw:(void (^)(void))redraw;
+
+// Stops animating and discards the preview mesh -- -meshForReading (and so
+// every mesh-reading accessor above) goes back to reading the real _mesh,
+// which was never touched, so this is always a clean, exact revert to
+// exactly the pre-animation state. No-op if not currently animating.
+- (void)stopMeshAnimation;
+
 // --- Output ---
 - (nullable NSImage*)renderReconstructionPreview;
 // GPU (OpenGL) counterpart to -renderReconstructionPreview -- builds the

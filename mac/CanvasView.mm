@@ -126,15 +126,25 @@
     [self drawBoundary];
     // -drawMesh reads -meshVertexPositionAtRow:col:/-meshVertexColorAtRow:col:,
     // which read the LIVE mesh while !dm.isOptimizing (safe, nothing else
-    // touches it then) and the livePreviewDuringOptimize snapshot while
+    // touches it then), the livePreviewDuringOptimize snapshot while
     // dm.isOptimizing && dm.hasLivePreviewMesh (also safe -- see that
-    // property's comment in DocumentModel.h). Either way this call never
-    // reads the live mesh concurrently with the background optimizer thread
-    // mutating it -- there is no third case where drawing here would race.
+    // property's comment in DocumentModel.h), and the animated preview
+    // while dm.isAnimatingMesh (also safe by construction -- see
+    // DocumentModel.h's isAnimatingMesh comment: _mesh itself is never
+    // touched during an animation, only the separate _previewMesh copy,
+    // and dm.isOptimizing is NO the whole time an animation runs, so this
+    // condition already passes unchanged in that case). Either way this
+    // call never reads the live mesh concurrently with the background
+    // optimizer thread mutating it -- there is no other case where drawing
+    // here would race.
     if (self.showMeshOverlay && dm.hasMesh && (!dm.isOptimizing || dm.hasLivePreviewMesh)) [self drawMesh];
-    // Tangent-arrow overlay stays optimize-only-when-idle -- it isn't part
-    // of this request and doesn't need the preview snapshot to stay safe.
-    if (self.showTangents && dm.hasMesh && !dm.isOptimizing) [self drawTangents];
+    // Tangent-arrow overlay stays optimize-only-when-idle and is also
+    // suppressed during an animation: -animationTick: only ever moves P,
+    // never Pu/Pv, so drawing tangent handles anchored to each vertex's
+    // FROZEN (pre-animation) tangents while the vertex itself visibly
+    // wiggles away from them would look like a rendering bug rather than
+    // the intentional "colors/tangents fixed, only positions move" design.
+    if (self.showTangents && dm.hasMesh && !dm.isOptimizing && !dm.isAnimatingMesh) [self drawTangents];
     [self drawVectorLines];
     [self drawScribbles];
 }

@@ -68,6 +68,16 @@
 // -savePreset:/-presetsPopupWillOpen:/-presetSelected:.
 @property (nonatomic, strong) NSButton* savePresetButton;
 @property (nonatomic, strong) NSPopUpButton* presetsPopup;
+// "Animate Mesh" -- see DocumentModel.h's isAnimatingMesh/
+// startMeshAnimationWithRedraw:/stopMeshAnimation and -toggleAnimateMesh:.
+// animateMeshButton's title toggles between "Animate Mesh"/"Stop
+// Animation"; the two fields mirror DocumentModel.meshAnimationMaxAmplitude/
+// meshAnimationTemperature, read (and clamped) into the model each time
+// animation is (re)started, same "typed value takes effect on next start"
+// convention as the geometry/colour weight fields above.
+@property (nonatomic, strong) NSButton* animateMeshButton;
+@property (nonatomic, strong) NSTextField* animAmplitudeField;
+@property (nonatomic, strong) NSTextField* animTemperatureField;
 @end
 
 @implementation MainWindowController
@@ -108,6 +118,7 @@
     NSView* controlsRow3 = [self makeRow];
     NSView* controlsRow4 = [self makeRow];
     NSView* controlsRow5 = [self makeRow];
+    NSView* controlsRow6 = [self makeRow];
 
     // --- Row 1: file + tool selection ---
     NSButton* openBtn = [self buttonTitled:@"Open Image…" action:@selector(openImage:)];
@@ -279,6 +290,27 @@
                          self.colorDerivRidgeField, resetWeightsBtn])
         [controlsRow5 addSubview:v];
 
+    // --- Row 6: "Animate Mesh" -- a purely cosmetic, non-destructive
+    // real-time wiggle of the current mesh's vertex positions, entirely
+    // separate from "Optimize" (see DocumentModel.h's isAnimatingMesh
+    // comment for the full design). Amplitude/temperature fields seeded
+    // from documentModel's own -init defaults, same convention as Row 4/5's
+    // weight fields.
+    self.animateMeshButton = [self buttonTitled:@"Animate Mesh" action:@selector(toggleAnimateMesh:)];
+    NSTextField* animAmplitudeLabel = [self makeLabel:@"Amplitude:"];
+    self.animAmplitudeField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationMaxAmplitude]];
+    NSTextField* animTemperatureLabel = [self makeLabel:@"Temperature:"];
+    self.animTemperatureField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationTemperature]];
+    NSTextField* animHintLabel = [self makeLabel:@"(colors fixed; low temperature = calm, high = chaotic)"];
+    animHintLabel.textColor = [NSColor secondaryLabelColor];
+    animHintLabel.font = [NSFont systemFontOfSize:11];
+
+    for (NSView* v in @[self.animateMeshButton, animAmplitudeLabel, self.animAmplitudeField,
+                         animTemperatureLabel, self.animTemperatureField, animHintLabel])
+        [controlsRow6 addSubview:v];
+
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
     self.canvasView.documentModel = self.documentModel;
@@ -350,22 +382,24 @@
     [content addSubview:controlsRow3];
     [content addSubview:controlsRow4];
     [content addSubview:controlsRow5];
+    [content addSubview:controlsRow6];
     [content addSubview:canvasRow];
     [content addSubview:self.statusLabel];
 
     NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow1b, controlsRow2, controlsRow3, controlsRow4,
-                                                           controlsRow5, canvasRow, _statusLabel);
+                                                           controlsRow5, controlsRow6, canvasRow, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1b]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow3]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow4]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow5]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow6]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[canvasRow]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
         @"V:|-8-[controlsRow1(28)]-6-[controlsRow1b(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
-        "-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
+        "-6-[controlsRow6(28)]-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
@@ -374,6 +408,7 @@
     [self layoutRowChildren:controlsRow3];
     [self layoutRowChildren:controlsRow4];
     [self layoutRowChildren:controlsRow5];
+    [self layoutRowChildren:controlsRow6];
 }
 
 - (NSView*)makeRow {
@@ -486,6 +521,15 @@
         }
         [weakSelf.canvasView resetBoundaryDrawing];
         [weakSelf.canvasView resetCornerPicking];
+        // A new image drops the old mesh, which -loadImageAtURL:error:
+        // already stops any running animation of (see DocumentModel.mm's
+        // -stopMeshAnimation callers) -- reset this button's own title/
+        // enabled state to match, since "Open Image…" isn't disabled while
+        // animating the way Optimize/Build Mesh are (see -toggleAnimateMesh:).
+        weakSelf.animateMeshButton.title = @"Animate Mesh";
+        weakSelf.animateMeshButton.enabled = YES;
+        weakSelf.optimizeButton.enabled = YES;
+        weakSelf.buildMeshButton.enabled = YES;
         weakSelf.canvasView.showReconstructionPreview = NO;
         weakSelf.canvasView.hidden = NO;
         weakSelf.previewCheckbox.state = NSControlStateValueOff;
@@ -587,6 +631,7 @@
     self.documentModel.colorDerivRidge = self.colorDerivRidgeField.doubleValue;
     self.optimizeButton.enabled = NO;
     self.buildMeshButton.enabled = NO;
+    self.animateMeshButton.enabled = NO; // DocumentModel also stops any running animation itself -- see -stopMeshAnimation's callers
     [self.progressSpinner startAnimation:nil];
     __weak typeof(self) weakSelf = self;
     [self.documentModel optimizeWithPyramidLevels:4
@@ -619,6 +664,7 @@
             [weakSelf.progressSpinner stopAnimation:nil];
             weakSelf.optimizeButton.enabled = YES;
             weakSelf.buildMeshButton.enabled = YES;
+            weakSelf.animateMeshButton.enabled = YES;
             NSString* unitTag = weakSelf.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units -- not comparable to sRGB-mode RMSE)" : @"";
             NSString* msg = [NSString stringWithFormat:@"Done in %.2fs. Final RMSE=%.4f  MAE=%.4f%@.",
                               weakSelf.documentModel.lastRunWallClockSeconds, weakSelf.documentModel.currentRMSE, weakSelf.documentModel.currentMAE, unitTag];
@@ -631,6 +677,41 @@
             weakSelf.statusLabel.stringValue = msg;
             [weakSelf refreshActivePreview];
         }];
+}
+
+// Toggles "Animate Mesh" on/off -- see DocumentModel.h's isAnimatingMesh/
+// startMeshAnimationWithRedraw:/stopMeshAnimation for the actual mechanics
+// (temperature-controlled per-vertex amplitude, sin(t) motion, boundary
+// vertices pinned). This method only owns the UI side: reading+clamping
+// the two fields, flipping the button title, and disabling Optimize/Build
+// Mesh while an animation is running (mirroring how -optimize: disables
+// them for an in-flight run) so the two features can't stack confusingly.
+- (void)toggleAnimateMesh:(id)sender {
+    if (self.documentModel.isAnimatingMesh) {
+        [self.documentModel stopMeshAnimation];
+        self.animateMeshButton.title = @"Animate Mesh";
+        self.optimizeButton.enabled = YES;
+        self.buildMeshButton.enabled = YES;
+        self.statusLabel.stringValue = @"Animation stopped.";
+        [self.canvasView setNeedsDisplay:YES];
+        return;
+    }
+    if (!self.documentModel.hasMesh) { self.statusLabel.stringValue = @"Build a mesh first."; return; }
+    // MAX(0, ...) for amplitude (0 is a valid "don't move" value); MAX with
+    // a small positive floor for temperature since it divides an exponent
+    // (see meshAnimationTemperature's doc comment in DocumentModel.h) --
+    // same clamp DocumentModel.mm's -startMeshAnimationWithRedraw: itself
+    // applies again defensively, so a stray 0 typed here can never crash.
+    self.documentModel.meshAnimationMaxAmplitude = MAX(0.0, self.animAmplitudeField.doubleValue);
+    self.documentModel.meshAnimationTemperature = MAX(0.01, self.animTemperatureField.doubleValue);
+    __weak typeof(self) weakSelf = self;
+    [self.documentModel startMeshAnimationWithRedraw:^{
+        [weakSelf.canvasView setNeedsDisplay:YES];
+    }];
+    self.animateMeshButton.title = @"Stop Animation";
+    self.optimizeButton.enabled = NO;
+    self.buildMeshButton.enabled = NO;
+    self.statusLabel.stringValue = @"Animating mesh… click “Stop Animation” to return to the fitted mesh.";
 }
 
 - (void)togglePreview:(id)sender {

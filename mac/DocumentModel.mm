@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <random>
 
 using gmcore::Vec2;
 using gmcore::Color;
@@ -147,6 +148,26 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // already had a full pass refines at full resolution ONLY, skipping
     // the coarse levels -- see that method's comment for why.
     BOOL _meshHasHadFullPyramidPass;
+    // --- "Animate Mesh" state (see DocumentModel.h's isAnimatingMesh/
+    // startMeshAnimationWithRedraw:/stopMeshAnimation) -- a purely
+    // cosmetic, UI-side wiggle, entirely separate from how _mesh/
+    // _previewMesh are used during -optimizeWithPyramidLevels:... above.
+    // Reuses _previewMesh as the live animated copy (see -meshForReading)
+    // but owns its OWN frozen base snapshot here, since _previewMesh
+    // during an optimize run means something different (a post-iteration
+    // snapshot of the mesh MID-OPTIMIZATION) than it does here (a copy
+    // whose vertex positions get displaced sinusoidally every timer tick,
+    // while _mesh itself is never touched).
+    GradientMesh _animBaseMesh;
+    std::vector<Vec2> _animDirections;   // per-vertex, fixed for the whole animation
+    std::vector<double> _animAmplitudes; // per-vertex, sampled once at start -- see meshAnimationTemperature
+    NSDate* _animStartDate;
+    NSTimer* _animTimer;
+    BOOL _isAnimatingMesh;
+    // Caller-supplied redraw callback (see -startMeshAnimationWithRedraw:)
+    // -- invoked once per timer tick, right after that tick's _previewMesh
+    // update, so it's always called with fresh geometry to draw.
+    void (^_animRedrawBlock)(void);
     // URL of the currently loaded image (set in -loadImageAtURL:error:) --
     // used only to locate the "DebugOut" folder for -autoExportDebugData
     // (see DocumentModel.h), sibling to wherever the image actually lives.
@@ -192,6 +213,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         // ceresMultithreaded's comment in DocumentModel.h for the YES/NO <->
         // 0/1 mapping.
         self.ceresMultithreaded = YES;
+        // "Animate Mesh" defaults -- see meshAnimationMaxAmplitude/
+        // meshAnimationTemperature's doc comments in DocumentModel.h. 8px
+        // is a small, clearly-visible wiggle at typical image resolutions
+        // without the mesh grid swamping the underlying image; temperature
+        // 1.0 is a plain uniform amplitude draw (neither "cold" nor "hot").
+        self.meshAnimationMaxAmplitude = 8.0;
+        self.meshAnimationTemperature = 1.0;
     }
     return self;
 }
@@ -226,7 +254,16 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 - (double)lastRunWallClockSeconds { return _lastRunWallClockSeconds; }
 - (BOOL)meshColorSpaceIsCIELUV { return _mesh ? _meshColorSpaceIsCIELUV : NO; }
 - (BOOL)hasLivePreviewMesh { return _isOptimizing && _previewMesh != nullptr; }
-- (const GradientMesh*)meshForReading { return self.hasLivePreviewMesh ? _previewMesh.get() : _mesh.get(); }
+- (BOOL)isAnimatingMesh { return _isAnimatingMesh; }
+- (const GradientMesh*)meshForReading {
+    // See DocumentModel.h's isAnimatingMesh comment: while animating,
+    // _previewMesh holds the live wiggling copy and _mesh itself is never
+    // touched -- checked FIRST and independently of hasLivePreviewMesh,
+    // which is specifically about an in-flight Optimize run and stays NO
+    // for the entire duration of an animation.
+    if (_isAnimatingMesh && _previewMesh) return _previewMesh.get();
+    return self.hasLivePreviewMesh ? _previewMesh.get() : _mesh.get();
+}
 
 #pragma mark - Image loading
 
@@ -331,6 +368,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
               bl.r * 255, bl.g * 255, bl.b * 255, br.r * 255, br.g * 255, br.b * 255);
     }
 
+    [self stopMeshAnimation]; // a new image invalidates any in-progress animation's base mesh
     _imageURL = url; // see -autoExportDebugDataIfEnabled's use of this
     _hasImage = YES;
     _hasBoundary = NO;
@@ -367,6 +405,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // separate concern -- see MainWindowController's onBoundaryChanged/
     // -segmentBoundary: callers, which reset those via
     // -resetBoundaryDrawing/-resetCornerPicking right after calling this.
+    [self stopMeshAnimation]; // the mesh this animation (if any) was based on is about to be dropped
     _mesh.reset();
     _previewMesh.reset();
     _meshHasHadFullPyramidPass = NO;
@@ -430,6 +469,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
 - (void)buildInitialMeshRows:(NSInteger)rows cols:(NSInteger)cols {
     if (!_hasImage || !_hasBoundary) return;
+    [self stopMeshAnimation]; // rebuilding replaces _mesh -- any animation of the previous instance is now stale
     // Snapshot NOW, at build time -- everything downstream (this run's
     // -optimizeWithPyramidLevels:..., -renderReconstructionPreview,
     // -exportSVGToURL:, -exportDebugDataToURL:, the vertex color
@@ -707,6 +747,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
                           progress:(void (^)(double, NSInteger, NSInteger, NSInteger, NSInteger))progress
                         completion:(void (^)(void))completion {
     if (!_mesh || _isOptimizing) { if (completion) completion(); return; }
+    [self stopMeshAnimation]; // an Optimize run mutates _mesh directly -- any running animation's base snapshot would go stale
     _isOptimizing = YES;
     _previewMesh.reset(); // stale snapshot from a previous run, if any -- see hasLivePreviewMesh
 
@@ -856,6 +897,88 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
             if (completion) completion();
         });
     });
+}
+
+#pragma mark - Mesh animation ("Animate Mesh")
+
+// See DocumentModel.h's isAnimatingMesh/meshAnimationMaxAmplitude/
+// meshAnimationTemperature doc comments for the full design (motion law,
+// temperature-controlled amplitude sampling, boundary vertices pinned).
+- (void)startMeshAnimationWithRedraw:(void (^)(void))redraw {
+    if (!_mesh || _isOptimizing || _isAnimatingMesh) return;
+
+    _animBaseMesh = *_mesh; // frozen snapshot -- _mesh itself is never touched while animating
+    NSInteger n = (NSInteger)_animBaseMesh.vertices.size();
+    _animDirections.assign((size_t)n, Vec2(0, 0));
+    _animAmplitudes.assign((size_t)n, 0.0);
+
+    // Read once, here, not live during the animation -- editing the
+    // amplitude/temperature widgets mid-animation has no effect until the
+    // NEXT -startMeshAnimationWithRedraw: call, same "read once at start"
+    // convention as -optimizeWithPyramidLevels:...'s opts.
+    double maxAmplitude = std::max(0.0, self.meshAnimationMaxAmplitude);
+    double temperature = std::max(1e-6, self.meshAnimationTemperature); // guard against div-by-zero
+    const double kTwoPi = 6.283185307179586;
+
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<double> unit01(0.0, 1.0);
+    for (NSInteger i = 0; i < n; ++i) {
+        const MeshVertex& v = _animBaseMesh.vertices[(size_t)i];
+        if (v.isBoundary) continue; // pinned at direction={0,0}/amplitude=0 -- see isAnimatingMesh's comment
+        double angle = unit01(rng) * kTwoPi;
+        // amp = maxAmplitude * uniform01^(1/temperature): temperature==1 is
+        // a plain uniform draw; <1 ("cold") concentrates amplitudes near 0;
+        // >1 ("hot") pushes them toward maxAmplitude. See
+        // meshAnimationTemperature's doc comment in DocumentModel.h.
+        double amp = maxAmplitude * std::pow(unit01(rng), 1.0 / temperature);
+        _animDirections[(size_t)i] = Vec2(std::cos(angle), std::sin(angle));
+        _animAmplitudes[(size_t)i] = amp;
+    }
+
+    _previewMesh = std::make_unique<GradientMesh>(_animBaseMesh);
+    _isAnimatingMesh = YES;
+    _animStartDate = [NSDate date];
+    _animRedrawBlock = [redraw copy];
+
+    // NSRunLoopCommonModes (NOT scheduledTimerWithTimeInterval:, which only
+    // fires in NSDefaultRunLoopMode) so the animation keeps running while
+    // the user drags/resizes the window or interacts with a control --
+    // standard real-time-Cocoa-UI-timer pattern.
+    _animTimer = [NSTimer timerWithTimeInterval:1.0 / 60.0
+                                          target:self
+                                        selector:@selector(animationTick:)
+                                        userInfo:nil
+                                         repeats:YES];
+    [[NSRunLoop currentRunLoop] addTimer:_animTimer forMode:NSRunLoopCommonModes];
+}
+
+// Timer-fired, ~60x/sec while animating. t is elapsed wall-clock seconds
+// since -startMeshAnimationWithRedraw: (one shared clock for every vertex,
+// per the user's "sin(t)" spec -- no extra frequency multiplier).
+- (void)animationTick:(NSTimer*)timer {
+    if (!_isAnimatingMesh || !_previewMesh) return;
+    double t = -[_animStartDate timeIntervalSinceNow];
+    double s = std::sin(t);
+    NSInteger n = (NSInteger)_animBaseMesh.vertices.size();
+    for (NSInteger i = 0; i < n; ++i) {
+        const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+        MeshVertex& live = _previewMesh->vertices[(size_t)i];
+        // Only P is touched -- colors (C/Cu/Cv/Cuv) and tangents (Pu/Pv)
+        // stay exactly as snapshotted in _animBaseMesh/_previewMesh at
+        // start, per the user's "fix the colors, animate the nodes" spec.
+        live.P = base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * s);
+    }
+    if (_animRedrawBlock) _animRedrawBlock();
+}
+
+- (void)stopMeshAnimation {
+    if (!_isAnimatingMesh) return;
+    [_animTimer invalidate];
+    _animTimer = nil;
+    _isAnimatingMesh = NO;
+    _previewMesh.reset(); // -meshForReading goes back to reading the live _mesh, which was never touched
+    _animRedrawBlock = nil;
+    _animStartDate = nil;
 }
 
 #pragma mark - Debug data auto-export
