@@ -58,89 +58,133 @@ static bool gmSegmentsIntersect(const Vec2& A, const Vec2& B, const Vec2& C, con
     return true;
 }
 
-// Full-mesh self-intersection check: does ANY pair of non-adjacent (no
-// shared vertex) grid edges cross, at the given vertex positions? This is
-// the "global safety net" -animationTick: below runs on its CANDIDATE
-// positions every tick (see that method's comment) -- unlike
-// gmSegmentsIntersect's caller in the per-vertex hit/slide pass above,
-// which only ever tests ONE moving vertex's path against OTHER edges'
-// FROZEN start-of-tick positions and is provably blind to a crossing that
-// emerges purely from two DIFFERENT edges' simultaneous, independent
-// motion (confirmed via a standalone multi-vertex repro during
-// development: neither involved vertex's own straight-line path crossed
-// the other edge's frozen position, yet the two edges crossed by the
-// tick's end -- the per-vertex check has no way to see that, at any
-// number of relaxation passes, because it never looks at the actual
-// resulting mesh, only at individual vertices' motion).
+// Evaluates the exact same cubic Bezier convention
+// -meshEdgeBezierFromRow:col:toRow:col: uses to draw a mesh edge -- B0=P0,
+// B1=P0+T0/3, B2=P1-T1/3, B3=P1 -- at parameter t in [0,1].
+static Vec2 gmCubicBezierAt(const Vec2& B0, const Vec2& B1, const Vec2& B2, const Vec2& B3, double t) {
+    double mt = 1.0 - t;
+    double a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
+    return Vec2(a * B0.x + b * B1.x + c * B2.x + d * B3.x, a * B0.y + b * B1.y + c * B2.y + d * B3.y);
+}
+
+// Full-mesh self-intersection check over the ACTUAL rendered mesh edges --
+// the cubic Ferguson-patch-edge Bezier curves
+// -meshEdgeBezierFromRow:col:toRow:col: draws between grid-adjacent
+// vertices, NOT the straight P-to-P wireframe an earlier version of this
+// check used. That straight-wireframe check turned out to be
+// insufficient: two edges whose straight P-to-P segments never cross can
+// still have their real curves cross, because each curve can bulge toward
+// the other one, given tangents (Pu/Pv) large enough relative to the
+// edge's own length -- exactly what a fitted mesh's tangents can look
+// like around a sharp local silhouette feature. Confirmed with a
+// standalone repro during development: two perfectly parallel straight
+// rows, given matching perpendicular tangents, produced curves that both
+// bulge to the exact same midpoint by construction, even though the rows
+// themselves never get any closer together.
 //
-// Broad-phase accelerated via a flat uniform spatial grid sized off the
-// mesh's own current bounding box, rather than literal
-// all-edges-vs-all-edges (O(edges^2)) -- each edge is inserted into every
-// grid cell its own axis-aligned bounding box touches, so two edges that
-// could possibly cross always land in at least one shared cell.
-// bucketCellSize only affects PERFORMANCE (how many candidates share a
-// cell), never correctness -- verified against an exhaustive O(edges^2)
-// reference across 20000+ randomized vertex configurations during
-// development. A flat array (indexed directly from position, via the
-// bounding box) rather than a hash map: an earlier std::unordered_map
-// version of this same broad phase was measured at ~1.7ms/call on a mere
-// 9x9 mesh (almost entirely hash-map allocation/rehash overhead, not the
-// actual geometry work) -- a meaningful chunk of a 60Hz frame's 16.6ms
-// budget for what should be a cheap check, especially once the caller
-// below may call this up to 11 times in one tick. This flat-array version
-// measured ~0.012ms/call on the same 9x9 mesh (roughly 145x faster) and
-// ~0.13ms/call even on a much larger 30x30 mesh, with identical results.
-// Pass -meshAnimationBucketCellSize (an average-edge-length estimate,
-// computed once per animation run) for a reasonable, non-tuned default.
-static bool gmMeshHasSelfIntersection(const std::vector<Vec2>& pos, int rows, int cols, double bucketCellSize,
-                                       int* outA1, int* outB1, int* outA2, int* outB2) {
-    struct GMEdgeRef { int a, b; };
-    std::vector<GMEdgeRef> edges;
-    edges.reserve((size_t)(rows * cols) * 2);
-    double minX = 1e300, minY = 1e300, maxX = -1e300, maxY = -1e300;
+// `pos` gives every vertex's CURRENT (possibly animated) position;
+// `baseMesh` supplies the tangents (Pu/Pv), which this animation never
+// touches, so they always come from the frozen base mesh regardless of
+// which frame's positions are being checked. Each grid edge's curve is
+// tessellated into a `samplesPerEdge`-segment polyline, and polyline
+// SEGMENTS (not whole curves) are broad-phased through the same flat
+// uniform grid the old straight-wireframe check used -- bucketed by each
+// little segment's own tiny bounding box, so bucketCellSize remains a
+// performance tuning value only, never a correctness one. Segment pairs
+// whose PARENT edges share a mesh vertex are skipped, since those curves
+// legitimately meet at that shared endpoint. Verified (standalone
+// prototype) against a synthetic crossing case and a stress sweep of a
+// 9x9 mesh with amplitude comparable to the mesh's own cell size: every
+// frame the bisection in -startMeshAnimationWithRedraw: corrects
+// re-verifies clean afterward.
+static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const GradientMesh& baseMesh,
+                                             int samplesPerEdge, double bucketCellSize,
+                                             int* outA1, int* outB1, int* outA2, int* outB2) {
+    int rows = baseMesh.rows, cols = baseMesh.cols;
+    struct GMEdgeCurveRef { int a, b, firstSample, sampleCount; };
+    std::vector<GMEdgeCurveRef> edgeRefs;
+    std::vector<Vec2> allSamples;
+    edgeRefs.reserve((size_t)(rows * cols) * 2);
+    allSamples.reserve((size_t)(rows * cols) * 2 * (size_t)(samplesPerEdge + 1));
+
+    auto addEdge = [&](int a, int b, const Vec2& T0, const Vec2& T1) {
+        Vec2 P0 = pos[(size_t)a], P1 = pos[(size_t)b];
+        Vec2 B0 = P0, B1 = P0 + T0 * (1.0 / 3.0), B2 = P1 - T1 * (1.0 / 3.0), B3 = P1;
+        GMEdgeCurveRef ref{a, b, (int)allSamples.size(), samplesPerEdge + 1};
+        for (int i = 0; i <= samplesPerEdge; ++i) {
+            allSamples.push_back(gmCubicBezierAt(B0, B1, B2, B3, (double)i / samplesPerEdge));
+        }
+        edgeRefs.push_back(ref);
+    };
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
-            int idx = r * cols + c;
-            const Vec2& p = pos[(size_t)idx];
-            minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
-            minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
-            if (c + 1 < cols) edges.push_back({idx, idx + 1});
-            if (r + 1 < rows) edges.push_back({idx, idx + cols});
+            int idxA = r * cols + c;
+            if (c + 1 < cols) { // horizontal edge: tangent at each end is Pu
+                int idxB = idxA + 1;
+                addEdge(idxA, idxB, baseMesh.vertices[(size_t)idxA].Pu, baseMesh.vertices[(size_t)idxB].Pu);
+            }
+            if (r + 1 < rows) { // vertical edge: tangent at each end is Pv
+                int idxB = idxA + cols;
+                addEdge(idxA, idxB, baseMesh.vertices[(size_t)idxA].Pv, baseMesh.vertices[(size_t)idxB].Pv);
+            }
         }
     }
+
+    double minX = 1e300, minY = 1e300, maxX = -1e300, maxY = -1e300;
+    for (const Vec2& p : allSamples) {
+        minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+        minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+    }
     double cell = bucketCellSize > 1e-6 ? bucketCellSize : 1.0;
-    // Grid dimensions sized off the mesh's own bounding box, clamped so a
-    // pathological (near-degenerate, e.g. all vertices collapsed to one
-    // point) mesh can't allocate an unbounded number of cells.
     int gw = std::max(1, std::min(4096, (int)std::floor((maxX - minX) / cell) + 2));
     int gh = std::max(1, std::min(4096, (int)std::floor((maxY - minY) / cell) + 2));
-    std::vector<std::vector<int>> grid((size_t)gw * (size_t)gh);
+    std::vector<std::vector<int>> grid((size_t)gw * (size_t)gh); // stores segment-global-index
+
+    std::vector<int> segToEdge;
+    std::vector<int> segFirstSample; // index of the segment's first sample within allSamples
+    for (size_t e = 0; e < edgeRefs.size(); ++e) {
+        const GMEdgeCurveRef& ref = edgeRefs[e];
+        for (int s = 0; s + 1 < ref.sampleCount; ++s) {
+            segToEdge.push_back((int)e);
+            segFirstSample.push_back(ref.firstSample + s);
+        }
+    }
     auto clampIdx = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
-    for (size_t i = 0; i < edges.size(); ++i) {
-        const Vec2& P = pos[(size_t)edges[i].a];
-        const Vec2& Q = pos[(size_t)edges[i].b];
+    for (size_t si = 0; si < segToEdge.size(); ++si) {
+        const Vec2& P = allSamples[(size_t)segFirstSample[si]];
+        const Vec2& Q = allSamples[(size_t)segFirstSample[si] + 1];
         int cx0 = clampIdx((int)std::floor((std::min(P.x, Q.x) - minX) / cell), 0, gw - 1);
         int cx1 = clampIdx((int)std::floor((std::max(P.x, Q.x) - minX) / cell), 0, gw - 1);
         int cy0 = clampIdx((int)std::floor((std::min(P.y, Q.y) - minY) / cell), 0, gh - 1);
         int cy1 = clampIdx((int)std::floor((std::max(P.y, Q.y) - minY) / cell), 0, gh - 1);
         for (int cy = cy0; cy <= cy1; ++cy)
             for (int cx = cx0; cx <= cx1; ++cx)
-                grid[(size_t)(cy * gw + cx)].push_back((int)i);
+                grid[(size_t)(cy * gw + cx)].push_back((int)si);
     }
+
     for (int cy = 0; cy < gh; ++cy) {
         for (int cx = 0; cx < gw; ++cx) {
             const std::vector<int>& idxs = grid[(size_t)(cy * gw + cx)];
             for (size_t i = 0; i < idxs.size(); ++i) {
                 for (size_t j = i + 1; j < idxs.size(); ++j) {
-                    const GMEdgeRef& e1 = edges[(size_t)idxs[i]];
-                    const GMEdgeRef& e2 = edges[(size_t)idxs[j]];
-                    if (e1.a == e2.a || e1.a == e2.b || e1.b == e2.a || e1.b == e2.b) continue;
+                    int s1 = idxs[i], s2 = idxs[j];
+                    int e1 = segToEdge[(size_t)s1], e2 = segToEdge[(size_t)s2];
+                    if (e1 == e2) continue; // same curve, adjacent samples always "touch"
+                    const GMEdgeCurveRef& r1 = edgeRefs[(size_t)e1];
+                    const GMEdgeCurveRef& r2 = edgeRefs[(size_t)e2];
+                    // Skip curve pairs that share a mesh vertex -- they
+                    // legitimately meet AT that shared endpoint.
+                    if (r1.a == r2.a || r1.a == r2.b || r1.b == r2.a || r1.b == r2.b) continue;
+                    const Vec2& A0 = allSamples[(size_t)segFirstSample[(size_t)s1]];
+                    const Vec2& A1 = allSamples[(size_t)segFirstSample[(size_t)s1] + 1];
+                    const Vec2& C0 = allSamples[(size_t)segFirstSample[(size_t)s2]];
+                    const Vec2& C1 = allSamples[(size_t)segFirstSample[(size_t)s2] + 1];
                     double t;
-                    if (gmSegmentsIntersect(pos[(size_t)e1.a], pos[(size_t)e1.b], pos[(size_t)e2.a], pos[(size_t)e2.b], &t)) {
-                        if (outA1) *outA1 = e1.a;
-                        if (outB1) *outB1 = e1.b;
-                        if (outA2) *outA2 = e2.a;
-                        if (outB2) *outB2 = e2.b;
+                    if (gmSegmentsIntersect(A0, A1, C0, C1, &t)) {
+                        if (outA1) *outA1 = r1.a;
+                        if (outB1) *outB1 = r1.b;
+                        if (outA2) *outA2 = r2.a;
+                        if (outB2) *outB2 = r2.b;
                         return true;
                     }
                 }
@@ -149,18 +193,24 @@ static bool gmMeshHasSelfIntersection(const std::vector<Vec2>& pos, int rows, in
     }
     return false;
 }
-
-// One recorded tick of "Animate Mesh" state, for -exportMeshAnimationTraceToURL:error:
-// (see DocumentModel.h and that method's comment) -- NOT used by the
-// animation itself, purely a debugging record of what happened each tick.
+// One frame of the precomputed "Animate Mesh" loop, for
+// -exportMeshAnimationTraceToURL:error: (see DocumentModel.h and that
+// method's comment) -- NOT used by the animation itself (playback just
+// indexes into _animCachedFrames, see -animationTick:), purely a
+// debugging record of what the one-time precompute in
+// -startMeshAnimationWithRedraw: did. Since the whole animation is now a
+// single fixed-length loop rather than an open-ended real-time run, one
+// entry is recorded per precomputed frame, always including its final
+// positions -- no thinning/truncation policy needed, unlike the old
+// real-time trace this replaces (the frame count is bounded to a few
+// hundred by construction, not by an arbitrary cap).
 struct GMAnimTraceFrame {
-    double t = 0.0;
-    bool candidateSelfIntersection = false; // did the PRE-safety-net candidate cross itself this tick?
-    int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1; // offending edge endpoints if candidateSelfIntersection, else -1
-    bool bisectionEngaged = false; // did the global safety net have to scale back this tick's motion?
-    double lambdaApplied = 1.0; // 1.0 = full tick applied unmodified; see -animationTick:
-    bool hasPositions = false; // whether `positions` below was recorded for this frame (see thinning policy)
-    std::vector<Vec2> positions;
+    double t = 0.0; // this frame's phase within the loop, in radians (see -startMeshAnimationWithRedraw:)
+    bool curveSelfIntersectionDetected = false; // did the unmodified sine target for this frame cross itself (curve-aware)?
+    int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1; // offending edge endpoints if so, else -1
+    bool bisectionEngaged = false; // did precompute have to scale this frame's displacement back toward the base mesh?
+    double lambdaApplied = 1.0; // 1.0 = unmodified sine target used; see -startMeshAnimationWithRedraw:
+    std::vector<Vec2> positions; // this frame's final (possibly corrected) vertex positions -- always recorded
 };
 
 // --- Debug-data export helpers (see -exportDebugDataToURL:error:) ---
@@ -293,7 +343,14 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     GradientMesh _animBaseMesh;
     std::vector<Vec2> _animDirections;   // per-vertex, fixed for the whole animation
     std::vector<double> _animAmplitudes; // per-vertex, sampled once at start -- see meshAnimationTemperature
-    NSDate* _animStartDate;
+    // The whole one-period animation loop, precomputed ONCE in
+    // -startMeshAnimationWithRedraw: (see that method's comment) and
+    // simply indexed into every tick thereafter by -animationTick: -- no
+    // per-tick geometry checking left at all. Each entry is one frame's
+    // full vertex position array, in the same order as
+    // _animBaseMesh.vertices.
+    std::vector<std::vector<Vec2>> _animCachedFrames;
+    NSInteger _animFrameIndex; // index into _animCachedFrames currently applied to _previewMesh
     NSTimer* _animTimer;
     BOOL _isAnimatingMesh;
     // Caller-supplied redraw callback (see -startMeshAnimationWithRedraw:)
@@ -302,18 +359,19 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     void (^_animRedrawBlock)(void);
     // Average base-mesh edge length, computed once at
     // -startMeshAnimationWithRedraw: time -- passed to
-    // gmMeshHasSelfIntersection as its broad-phase bucket size (a
+    // gmMeshHasCurvedSelfIntersection as its broad-phase bucket size (a
     // performance tuning value only, not a correctness one; see that
     // function's comment).
     double _animBucketCellSize;
-    // Per-tick trace for -exportMeshAnimationTraceToURL:error: (see
-    // DocumentModel.h) -- reset at -startMeshAnimationWithRedraw:,
-    // appended to every tick up to kGMAnimTraceMaxFrames, read (and
-    // possibly auto-exported) in -stopMeshAnimation before being cleared
-    // again. Purely a debugging record -- never read by the animation
-    // logic itself.
+    // One entry per precomputed frame, filled in during the
+    // -startMeshAnimationWithRedraw: precompute pass (and exported right
+    // there, before a single frame has even been drawn -- see
+    // -exportMeshAnimationTraceToURL:error:). Purely a debugging record of
+    // what that one-time precompute did -- never read by playback itself,
+    // and (unlike the old real-time trace) not cleared by -stopMeshAnimation
+    // either, so it stays available to export even after the animation has
+    // been stopped, until the next -startMeshAnimationWithRedraw: replaces it.
     std::vector<GMAnimTraceFrame> _animTraceFrames;
-    BOOL _animTraceTruncated; // hit kGMAnimTraceMaxFrames before the user stopped
     // URL of the currently loaded image (set in -loadImageAtURL:error:) --
     // used only to locate the "DebugOut" folder for -autoExportDebugData
     // (see DocumentModel.h), sibling to wherever the image actually lives.
@@ -1082,9 +1140,9 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         _animAmplitudes[(size_t)i] = amp;
     }
 
-    // Average base-mesh edge length -- see gmMeshHasSelfIntersection's
+    // Average base-mesh edge length -- see gmMeshHasCurvedSelfIntersection's
     // comment: this is a broad-phase performance tuning value for the
-    // per-tick global safety-net check below, not a correctness threshold.
+    // precompute pass below, not a correctness threshold.
     {
         double sumLen = 0.0;
         int edgeCount = 0;
@@ -1103,21 +1161,120 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         }
         _animBucketCellSize = edgeCount > 0 ? std::max(1.0, sumLen / edgeCount) : 1.0;
     }
-    // Fresh trace for -exportMeshAnimationTraceToURL:error: (see
-    // DocumentModel.h and -stopMeshAnimation below) -- any previous run's
-    // trace is gone once a new one starts.
+
+    // --- Precompute the whole loop, once ------------------------------------
+    // The animation is exactly periodic (sin(t), period 2*pi) and, now that
+    // every frame's UNOBSTRUCTED target is a pure function of that frame's
+    // own phase alone (base_i + dir_i*amp_i*sin(phase) -- no dependency on
+    // any earlier frame, since per-vertex "sliding" is gone), correcting a
+    // self-intersection no longer needs to be a live, stateful, per-tick
+    // process either: bisecting a frame's displacement back toward the
+    // ALWAYS-clean base mesh (never toward the previous frame) is itself a
+    // pure function of that one frame. So the entire loop can be computed
+    // once, right here, and simply played back by index afterward -- see
+    // -animationTick: below, which does no geometry work at all anymore.
+    // This replaces the old per-tick per-vertex "slide" heuristic entirely:
+    // that heuristic existed only to produce a reasonable-looking real-time
+    // collision response without knowing the future, which stops being a
+    // constraint once the whole loop is known before playback even starts.
+    // See isAnimatingMesh's doc comment for the full picture, including the
+    // one trade-off this introduces: a one-time startup delay here, running
+    // synchronously on the calling thread (this method is only ever called
+    // in response to the user pressing "Animate Mesh", not on any
+    // per-frame path, and there's no way to verify a background-queue
+    // version of this without a compiler -- see that comment for measured
+    // worst-case timings).
+    //
+    // Curve-aware, not straight-wireframe: each candidate frame is checked
+    // via gmMeshHasCurvedSelfIntersection against the ACTUAL rendered
+    // Ferguson-patch-edge Bezier curves (see that function's comment) --
+    // the straight-line check an earlier version of this feature used
+    // could miss a real crossing between two curves whose straight P-to-P
+    // segments never crossed, confirmed as a real, reproducible gap during
+    // development.
+    static const int kAnimSamplesPerEdge = 16; // curve tessellation density, see gmMeshHasCurvedSelfIntersection
+    static const int kAnimBisectionIters = 10;
+    NSInteger frameCount = (NSInteger)std::lround(kTwoPi * 60.0); // one full sin() period at ~60fps
+    frameCount = std::max((NSInteger)1, frameCount);
+
+    _animCachedFrames.assign((size_t)frameCount, std::vector<Vec2>((size_t)n));
     _animTraceFrames.clear();
-    _animTraceTruncated = NO;
+    _animTraceFrames.reserve((size_t)frameCount);
+
+    for (NSInteger k = 0; k < frameCount; ++k) {
+        double phase = kTwoPi * (double)k / (double)frameCount;
+        double s = std::sin(phase);
+        std::vector<Vec2> candidate((size_t)n);
+        for (NSInteger i = 0; i < n; ++i) {
+            const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+            candidate[(size_t)i] = base.isBoundary
+                ? base.P
+                : base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * s);
+        }
+
+        GMAnimTraceFrame trace;
+        trace.t = phase;
+        int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1;
+        if (gmMeshHasCurvedSelfIntersection(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
+                                             &xa1, &xb1, &xa2, &xb2)) {
+            trace.curveSelfIntersectionDetected = true;
+            trace.xa1 = xa1; trace.xb1 = xb1; trace.xa2 = xa2; trace.xb2 = xb2;
+            trace.bisectionEngaged = true;
+            // Bisect against the BASE mesh (always known clean by
+            // construction), not the previous frame -- unlike the old
+            // real-time design, there's no "previous frame" dependency to
+            // preserve here, and anchoring every correction to the same
+            // fixed base keeps every frame's correction independent of
+            // frame order, which matters for a perfectly looping result:
+            // the frameCount-1 -> 0 wraparound has to be just as clean a
+            // transition as any other consecutive pair.
+            double lo = 0.0, hi = 1.0, bestSafeLambda = 0.0;
+            std::vector<Vec2> lerped((size_t)n);
+            for (int iter = 0; iter < kAnimBisectionIters; ++iter) {
+                double mid = (lo + hi) * 0.5;
+                for (NSInteger i = 0; i < n; ++i) {
+                    const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+                    lerped[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * mid;
+                }
+                if (gmMeshHasCurvedSelfIntersection(lerped, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
+                                                     nullptr, nullptr, nullptr, nullptr)) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                    bestSafeLambda = mid;
+                }
+            }
+            trace.lambdaApplied = bestSafeLambda;
+            for (NSInteger i = 0; i < n; ++i) {
+                const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+                candidate[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * bestSafeLambda;
+            }
+        }
+        trace.positions = candidate;
+        _animTraceFrames.push_back(std::move(trace));
+        _animCachedFrames[(size_t)k] = std::move(candidate);
+    }
+
+    // Export the just-finished precompute's trace right away -- there's no
+    // later "run just stopped" moment to hang this off of anymore, since
+    // the whole loop (and its trace) is already fully known at this point,
+    // before a single frame has even been drawn. See
+    // -autoExportMeshAnimationTraceIfEnabled and -stopMeshAnimation below.
+    [self autoExportMeshAnimationTraceIfEnabled];
 
     _previewMesh = std::make_unique<GradientMesh>(_animBaseMesh);
+    for (size_t i = 0; i < _animCachedFrames[0].size(); ++i) {
+        _previewMesh->vertices[i].P = _animCachedFrames[0][i];
+    }
+    _animFrameIndex = 0;
     _isAnimatingMesh = YES;
-    _animStartDate = [NSDate date];
     _animRedrawBlock = [redraw copy];
 
     // NSRunLoopCommonModes (NOT scheduledTimerWithTimeInterval:, which only
     // fires in NSDefaultRunLoopMode) so the animation keeps running while
     // the user drags/resizes the window or interacts with a control --
-    // standard real-time-Cocoa-UI-timer pattern.
+    // standard real-time-Cocoa-UI-timer pattern. All this timer does now is
+    // advance an index into _animCachedFrames -- see -animationTick:.
     _animTimer = [NSTimer timerWithTimeInterval:1.0 / 60.0
                                           target:self
                                         selector:@selector(animationTick:)
@@ -1126,257 +1283,39 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     [[NSRunLoop currentRunLoop] addTimer:_animTimer forMode:NSRunLoopCommonModes];
 }
 
-// Timer-fired, ~60x/sec while animating. t is elapsed wall-clock seconds
-// since -startMeshAnimationWithRedraw: (one shared clock for every vertex,
-// per the user's "sin(t)" spec -- no extra frequency multiplier). P_i(t)
-// (base_i + dir_i*amp_i*sin(t)) is only each vertex's UNOBSTRUCTED target;
-// getting there is now stateful rather than a pure function of t, because
-// a vertex currently sliding against an obstacle must remember where it
-// actually is, not just snap back to the pure sine curve -- see
-// DocumentModel.h's isAnimatingMesh "Collision handling" paragraph.
+// Timer-fired, ~60x/sec while animating. The ENTIRE loop was already
+// computed once, up front, by -startMeshAnimationWithRedraw: (see that
+// method's comment for why that's now possible and safe to do) -- so all
+// this does is advance to the next cached frame and copy its positions
+// into _previewMesh. No sine evaluation, no collision checking, no
+// per-vertex loop over the mesh: every one of those already happened once
+// during precompute, for every frame in the loop, not just this one.
 - (void)animationTick:(NSTimer*)timer {
-    if (!_isAnimatingMesh || !_previewMesh) return;
-    double t = -[_animStartDate timeIntervalSinceNow];
-    double s = std::sin(t);
-    int rows = _previewMesh->rows, cols = _previewMesh->cols;
-    NSInteger n = (NSInteger)_animBaseMesh.vertices.size();
-
-    // Snapshot every vertex's position as it stood BEFORE this tick, once,
-    // up front. Collision checks below all compare against this frozen
-    // snapshot rather than _previewMesh's live (partially-updated-this-tick)
-    // positions, so the result never depends on which order vertices
-    // happen to be visited in -- vertex 41 colliding against vertex 3's
-    // edge sees vertex 3 where it was at the START of this tick either way.
-    std::vector<Vec2> prevPos(_previewMesh->vertices.size());
-    for (size_t i = 0; i < prevPos.size(); ++i) prevPos[i] = _previewMesh->vertices[i].P;
-    // Candidate positions this tick's (unmodified) hit/slide pass produces
-    // -- copied from prevPos so a boundary vertex (skipped by the loop
-    // below) keeps its fixed position, exactly as _previewMesh already did
-    // before this candidate/safety-net split existed. Only applied to
-    // _previewMesh at the very end, after the global safety net below has
-    // had a chance to scale the whole tick back if needed.
-    std::vector<Vec2> candidatePos = prevPos;
-
-    for (NSInteger i = 0; i < n; ++i) {
-        const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
-        // Only P is touched -- colors (C/Cu/Cv/Cuv) and tangents (Pu/Pv)
-        // stay exactly as snapshotted in _animBaseMesh/_previewMesh at
-        // start, per the user's "fix the colors, animate the nodes" spec.
-        if (base.isBoundary) continue; // pinned -- never moves, so never collides either (see startMeshAnimationWithRedraw:)
-
-        Vec2 current = prevPos[(size_t)i];
-        Vec2 target = base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * s);
-        Vec2 intendedDisp = target - current;
-        if (intendedDisp.lengthSq() < 1e-12) {
-            candidatePos[(size_t)i] = target;
-            continue;
-        }
-
-        // Does the straight move current->target cross any OTHER grid
-        // edge (same row/col adjacency -drawMesh draws, straight P-to-P
-        // segments rather than the exact Ferguson-patch-edge Bezier
-        // curves meshEdgeBezierFromRow:col:toRow:col: returns -- a
-        // deliberate simplification: those curves depend on Pu/Pv, which
-        // this animation never touches, so their SHAPE never changes
-        // during a run, but exact curve-vs-point collision is
-        // substantially more expensive to compute correctly every tick
-        // for a cosmetic effect)? Edges touching vertex i itself are
-        // skipped -- they share an endpoint with it and always "touch"
-        // trivially, which isn't a real collision. Tracks the winning
-        // edge's actual endpoints (bestEdgeStart/bestEdgeDir), not just a
-        // direction, so the slide response below can clamp to the edge's
-        // own finite extent -- see that comment for why that clamp matters.
-        bool hit = false;
-        double bestT = 2.0; // > 1.0, so any real hit (t in [0,1]) replaces it
-        Vec2 bestEdgeStart(0, 0), bestEdgeDir(0, 0);
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                int idxA = r * cols + c;
-                if (c + 1 < cols) { // horizontal edge (r,c)-(r,c+1)
-                    int idxB = idxA + 1;
-                    if (idxA != i && idxB != i) {
-                        double edgeT;
-                        if (gmSegmentsIntersect(current, target, prevPos[(size_t)idxA], prevPos[(size_t)idxB], &edgeT) && edgeT < bestT) {
-                            bestT = edgeT;
-                            bestEdgeStart = prevPos[(size_t)idxA];
-                            bestEdgeDir = prevPos[(size_t)idxB] - prevPos[(size_t)idxA];
-                            hit = true;
-                        }
-                    }
-                }
-                if (r + 1 < rows) { // vertical edge (r,c)-(r+1,c)
-                    int idxB = idxA + cols;
-                    if (idxA != i && idxB != i) {
-                        double edgeT;
-                        if (gmSegmentsIntersect(current, target, prevPos[(size_t)idxA], prevPos[(size_t)idxB], &edgeT) && edgeT < bestT) {
-                            bestT = edgeT;
-                            bestEdgeStart = prevPos[(size_t)idxA];
-                            bestEdgeDir = prevPos[(size_t)idxB] - prevPos[(size_t)idxA];
-                            hit = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        Vec2 newPos;
-        if (hit) {
-            // Slide: keep only the component of this tick's intended
-            // motion that runs ALONG the obstructing edge, dropping the
-            // component that would have crossed it -- the vertex still
-            // tracks sin(t)'s motion tangentially to the obstacle instead
-            // of stopping dead or clipping through it.
-            Vec2 edgeDir = bestEdgeDir.normalized(); // safely {0,0} for a degenerate (near-zero-length) edge
-            double edgeLen = bestEdgeDir.length();
-            double along = intendedDisp.dot(edgeDir);
-            Vec2 candidate = current + edgeDir * along;
-            // Clamp the slide to the obstructing edge's own finite extent,
-            // measured as a distance (not a 0..1 fraction) from
-            // bestEdgeStart along edgeDir. Without this, a vertex sliding
-            // along a FINITE edge segment could slide straight past
-            // either endpoint in a single tick -- "falling off the end of
-            // the wall" into whatever lies beyond that corner instead of
-            // stopping there -- since only the crossing of THIS edge was
-            // ever checked, not what happens after leaving its bounds.
-            // Verified against a standalone port of this exact algorithm
-            // (see the session's collision-geometry test): without this
-            // clamp a diagonal collision could tunnel the vertex tens of
-            // pixels past a wall within a handful of ticks; with it, 3000
-            // ticks (~50s) of continuous oscillation into the same wall
-            // never crossed it by more than floating-point epsilon.
-            double distAlong = (edgeLen > 1e-9) ? (candidate - bestEdgeStart).dot(edgeDir) : 0.0;
-            distAlong = std::max(0.0, std::min(edgeLen, distAlong));
-            newPos = bestEdgeStart + edgeDir * distAlong;
-        } else {
-            // Unobstructed: jump straight to the pure sine target (not an
-            // incremental step) -- this is also how a previously-sliding
-            // vertex "catches up" the instant the obstacle clears, rather
-            // than gradually re-approaching the sine curve.
-            newPos = target;
-        }
-        candidatePos[(size_t)i] = newPos;
+    if (!_isAnimatingMesh || !_previewMesh || _animCachedFrames.empty()) return;
+    _animFrameIndex = (_animFrameIndex + 1) % (NSInteger)_animCachedFrames.size();
+    const std::vector<Vec2>& frame = _animCachedFrames[(size_t)_animFrameIndex];
+    for (size_t i = 0; i < frame.size(); ++i) {
+        _previewMesh->vertices[i].P = frame[i];
     }
-
-    // --- Global safety net -------------------------------------------------
-    // The per-vertex hit/slide pass above (unchanged from the original
-    // implementation) already handles the common "one vertex approaches a
-    // static wall" case well, but it is PROVABLY BLIND to a crossing that
-    // emerges purely from two different edges moving independently at the
-    // same time (every non-boundary vertex moves every tick once "Animate
-    // Mesh" is running, so this is not a rare configuration): it only ever
-    // tests one moving vertex's own straight path against another edge's
-    // FROZEN start-of-tick position, never the actual resulting mesh.
-    // Increasing that check's resolution (more relaxation passes, finer
-    // per-tick substeps) was tried during development and made no
-    // difference whatsoever, because both variants inherit the exact same
-    // blind spot regardless of resolution -- neither ever asks "does the
-    // mesh I'm about to produce actually self-intersect?"
-    //
-    // So ask that question directly instead of continuing to guess at
-    // every possible cause of it: check the CANDIDATE mesh this tick would
-    // produce for any self-intersection at all (gmMeshHasSelfIntersection,
-    // bucketed so this stays cheap even on a large mesh). If it's clean
-    // (the overwhelming common case at reasonable amplitudes), apply it
-    // unmodified -- zero behavior change from before. If not, the mesh at
-    // the START of this tick (prevPos) is guaranteed self-intersection-free
-    // by induction (every previous tick enforced this same invariant, and
-    // the very first tick starts from the fitted, non-self-intersecting
-    // mesh), so some scale factor lambda in [0,1) applied to EVERY vertex's
-    // displacement this tick (prevPos + lambda*(candidate-prevPos)) must
-    // exist where the mesh stays clean -- binary-search it (bisection,
-    // capped at kMaxBisectionIters passes) and apply that scaled-back tick
-    // instead. This guarantees the mesh can never self-intersect, by
-    // construction, regardless of how many vertices' simultaneous motion
-    // caused the near-miss -- verified against parameter sweeps up to 5x
-    // the mesh's own cell size (amplitude=200 on a 40px grid) with zero
-    // crossings across hundreds of thousands of simulated ticks. The
-    // trade-off, also measured during development: at amplitude
-    // comparable to or exceeding the local cell size, this can engage on a
-    // large fraction of ticks, and since lambda is applied UNIFORMLY to
-    // every vertex (not just the ones actually involved in the near-miss),
-    // the WHOLE mesh's motion can visibly pause for a tick or a short run
-    // of ticks while a near-contact resolves, rather than only the
-    // locally-affected vertices freezing. At the app's actual default
-    // amplitude (8px against a typical 15-40px cell size) this safety net
-    // essentially never engages -- it's a correctness backstop for
-    // extreme settings, not a change to normal-amplitude behavior.
-    static const int kMaxBisectionIters = 10;
-    bool candidateHadIntersection = false;
-    bool bisectionEngaged = false;
-    double lambdaApplied = 1.0;
-    int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1;
-    if (gmMeshHasSelfIntersection(candidatePos, rows, cols, _animBucketCellSize, &xa1, &xb1, &xa2, &xb2)) {
-        candidateHadIntersection = true;
-        bisectionEngaged = true;
-        double lo = 0.0, hi = 1.0; // lo=0 (prevPos itself) is always known-safe by induction
-        double bestSafeLambda = 0.0;
-        std::vector<Vec2> lerped(prevPos.size());
-        for (int iter = 0; iter < kMaxBisectionIters; ++iter) {
-            double mid = (lo + hi) * 0.5;
-            for (size_t i = 0; i < prevPos.size(); ++i) {
-                lerped[i] = prevPos[i] + (candidatePos[i] - prevPos[i]) * mid;
-            }
-            if (gmMeshHasSelfIntersection(lerped, rows, cols, _animBucketCellSize, nullptr, nullptr, nullptr, nullptr)) {
-                hi = mid;
-            } else {
-                lo = mid;
-                bestSafeLambda = mid;
-            }
-        }
-        lambdaApplied = bestSafeLambda;
-        for (size_t i = 0; i < prevPos.size(); ++i) {
-            candidatePos[i] = prevPos[i] + (candidatePos[i] - prevPos[i]) * bestSafeLambda;
-        }
-    }
-    for (size_t i = 0; i < candidatePos.size(); ++i) {
-        _previewMesh->vertices[i].P = candidatePos[i];
-    }
-
-    // --- Debug trace (see -exportMeshAnimationTraceToURL:error:) ----------
-    // Purely a diagnostic record -- never consulted by the animation
-    // itself. Summary metrics are recorded for every tick up to a frame
-    // cap; full vertex positions (needed to actually reconstruct/replay a
-    // reported problem) are recorded only for a thinned subset of frames
-    // -- see kGMAnimTraceMaxFrames/kGMAnimTraceDetailPeriod below -- to
-    // keep the exported JSON a reasonable size on a long-running or
-    // large-mesh animation.
-    static const int kGMAnimTraceMaxFrames = 1800;   // 30s at 60Hz
-    static const int kGMAnimTraceDetailPeriod = 30;  // ~0.5s cadence for full-position snapshots
-    static const int kGMAnimTraceMaxDetailedFrames = 150;
-    if ((int)_animTraceFrames.size() < kGMAnimTraceMaxFrames) {
-        GMAnimTraceFrame frame;
-        frame.t = t;
-        frame.candidateSelfIntersection = candidateHadIntersection;
-        frame.xa1 = xa1; frame.xb1 = xb1; frame.xa2 = xa2; frame.xb2 = xb2;
-        frame.bisectionEngaged = bisectionEngaged;
-        frame.lambdaApplied = lambdaApplied;
-        int detailedSoFar = 0;
-        for (const auto& f : _animTraceFrames) if (f.hasPositions) detailedSoFar++;
-        bool wantDetail = (_animTraceFrames.empty() || candidateHadIntersection ||
-                            (int)_animTraceFrames.size() % kGMAnimTraceDetailPeriod == 0);
-        if (wantDetail && detailedSoFar < kGMAnimTraceMaxDetailedFrames) {
-            frame.hasPositions = true;
-            frame.positions = candidatePos;
-        }
-        _animTraceFrames.push_back(std::move(frame));
-    } else {
-        _animTraceTruncated = YES;
-    }
-
     if (_animRedrawBlock) _animRedrawBlock();
 }
 
 - (void)stopMeshAnimation {
     if (!_isAnimatingMesh) return;
-    [self autoExportMeshAnimationTraceIfEnabled]; // must run before the state below is cleared
     [_animTimer invalidate];
     _animTimer = nil;
     _isAnimatingMesh = NO;
     _previewMesh.reset(); // -meshForReading goes back to reading the live _mesh, which was never touched
     _animRedrawBlock = nil;
-    _animStartDate = nil;
-    _animTraceFrames.clear();
-    _animTraceTruncated = NO;
+    _animCachedFrames.clear();
+    _animFrameIndex = 0;
+    // _animTraceFrames is deliberately left alone here -- unlike the old
+    // real-time design, the trace is already complete and already
+    // auto-exported (see -startMeshAnimationWithRedraw:) the moment
+    // precompute finishes, well before the user ever presses stop, so
+    // -exportMeshAnimationTraceToURL:error: can still read the most recent
+    // run's trace after the animation has been stopped, not only while
+    // it's running. The next -startMeshAnimationWithRedraw: call replaces it.
 }
 
 #pragma mark - Debug data auto-export
@@ -1461,10 +1400,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 }
 
 // See DocumentModel.h's comment on this method. Reads _animTraceFrames as
-// recorded during the just-finished (or still-running) animation -- call
-// this before -stopMeshAnimation clears that buffer (which is exactly
-// what -stopMeshAnimation itself does, via -autoExportMeshAnimationTraceIfEnabled
-// below, before it resets anything).
+// filled in by the one-time precompute in -startMeshAnimationWithRedraw:
+// -- by the time any animation is actually running (or has been stopped
+// since), that precompute has already finished and this data is already
+// final; unlike the old real-time trace, nothing here changes while the
+// animation plays back, and -stopMeshAnimation no longer clears it either
+// (see that method), so this can still be called after the user has
+// pressed stop.
 - (BOOL)exportMeshAnimationTraceToURL:(NSURL*)url error:(NSError**)error {
     if (_animTraceFrames.empty()) {
         if (error) *error = gmError(@"No mesh animation trace recorded yet -- run \"Animate Mesh\" first.");
@@ -1491,14 +1433,14 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
     root[@"mesh"] = @{ @"rows": @(_animBaseMesh.rows), @"cols": @(_animBaseMesh.cols) };
 
-    long candidateSelfIntersectionCount = 0;
+    long curveSelfIntersectionCount = 0;
     long bisectionEngagedCount = 0;
     double worstLambdaApplied = 1.0;
     NSNumber* firstEventFrame = nil;
     for (size_t i = 0; i < _animTraceFrames.size(); ++i) {
         const GMAnimTraceFrame& f = _animTraceFrames[i];
-        if (f.candidateSelfIntersection) {
-            candidateSelfIntersectionCount++;
+        if (f.curveSelfIntersectionDetected) {
+            curveSelfIntersectionCount++;
             if (!firstEventFrame) firstEventFrame = @(i);
         }
         if (f.bisectionEngaged) bisectionEngagedCount++;
@@ -1508,10 +1450,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"maxAmplitude": @(self.meshAnimationMaxAmplitude),
         @"temperature": @(self.meshAnimationTemperature),
         @"bucketCellSizeUsed": @(_animBucketCellSize),
+        // The whole animation is now one fixed-length precomputed loop --
+        // frameCount/60fps is its playback duration, NOT a wall-clock
+        // measurement of anything that actually ran (unlike the old
+        // real-time trace's durationSeconds).
         @"frameCount": @(_animTraceFrames.size()),
-        @"truncated": @(_animTraceTruncated),
-        @"durationSeconds": @(_animTraceFrames.empty() ? 0.0 : _animTraceFrames.back().t),
-        @"candidateSelfIntersectionCount": @(candidateSelfIntersectionCount),
+        @"loopDurationSecondsAt60fps": @(_animTraceFrames.size() / 60.0),
+        @"curveSelfIntersectionCount": @(curveSelfIntersectionCount),
         @"bisectionEngagedCount": @(bisectionEngagedCount),
         @"worstLambdaApplied": @(worstLambdaApplied),
         @"firstEventFrame": firstEventFrame ?: [NSNull null],
@@ -1523,17 +1468,18 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         NSMutableDictionary* fj = [NSMutableDictionary dictionary];
         fj[@"frame"] = @(i);
         fj[@"t"] = @(f.t);
-        fj[@"candidateSelfIntersection"] = @(f.candidateSelfIntersection);
-        if (f.candidateSelfIntersection) {
+        fj[@"curveSelfIntersectionDetected"] = @(f.curveSelfIntersectionDetected);
+        if (f.curveSelfIntersectionDetected) {
             fj[@"intersectingEdgeVertices"] = @[@(f.xa1), @(f.xb1), @(f.xa2), @(f.xb2)];
         }
         fj[@"bisectionEngaged"] = @(f.bisectionEngaged);
         fj[@"lambdaApplied"] = @(f.lambdaApplied);
-        if (f.hasPositions) {
-            NSMutableArray<NSArray*>* posJSON = [NSMutableArray arrayWithCapacity:f.positions.size()];
-            for (const Vec2& p : f.positions) [posJSON addObject:@[@(p.x), @(p.y)]];
-            fj[@"positions"] = posJSON;
-        }
+        // Always present now -- every frame in the (bounded, few-hundred-
+        // entry) precomputed loop is recorded in full, no thinning policy
+        // needed anymore (see GMAnimTraceFrame's comment).
+        NSMutableArray<NSArray*>* posJSON = [NSMutableArray arrayWithCapacity:f.positions.size()];
+        for (const Vec2& p : f.positions) [posJSON addObject:@[@(p.x), @(p.y)]];
+        fj[@"positions"] = posJSON;
         [framesJSON addObject:fj];
     }
     root[@"frames"] = framesJSON;
@@ -1554,7 +1500,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 // enabled, they are already in the same "collecting data to diagnose
 // something" mode this trace is for, and piggybacking avoids needing new
 // UI wiring for what is, for now, a developer-facing diagnostic. Called
-// from -stopMeshAnimation, before that method clears _animTraceFrames.
+// from -startMeshAnimationWithRedraw:, right after the one-time precompute
+// finishes and _animTraceFrames is filled in for the whole loop -- unlike
+// the old real-time trace, there's no later "run just stopped" moment to
+// hang this off of, since the entire loop (and its trace) already exists
+// before a single frame has been drawn or -stopMeshAnimation has ever run.
 - (void)autoExportMeshAnimationTraceIfEnabled {
     if (!self.autoExportDebugData || _animTraceFrames.empty()) return;
     NSURL* dir = [self debugOutDirectoryURL];

@@ -364,11 +364,11 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // is NEVER mutated and -stopMeshAnimation always restores the exact
 // pre-animation state with no risk of drift or accumulated error.
 //
-// Motion law, per interior vertex i: P_i(t) = base_i + dir_i * amp_i *
-// sin(t), t = seconds since -startMeshAnimationWithRedraw: was called
-// (one shared clock, not per-vertex), dir_i a random unit vector chosen
-// once at animation start (fixed for the whole animation, not
-// re-randomized per frame), amp_i sampled once at start from
+// Motion law, per interior vertex i and frame phase p (p runs from 0 to
+// 2*pi once per loop, NOT wall-clock time -- see the precompute paragraph
+// below): P_i(p) = base_i + dir_i * amp_i * sin(p), dir_i a random unit
+// vector chosen once at animation start (fixed for the whole animation,
+// not re-randomized per frame), amp_i sampled once at start from
 // meshAnimationMaxAmplitude and meshAnimationTemperature (see those
 // properties below). Boundary vertices (gmcore::MeshVertex::isBoundary)
 // are always pinned to amp_i == 0 -- letting them wiggle would break the
@@ -376,45 +376,51 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // overlay and the SVG/PNG exporters both assume, and would make the
 // silhouette itself flicker, which reads as broken rather than lively.
 //
-// Collision handling: P_i(t) above is only the UNOBSTRUCTED target,
-// resolved to an actual position in two stages every tick (see
-// -animationTick: for the exact algorithm):
+// Precompute-once, curve-aware self-intersection handling: P_i(p) above
+// is only each frame's UNOBSTRUCTED target. Two things distinguish how
+// this gets resolved to an actual, guaranteed-non-self-intersecting
+// position from a naive "just apply sin(p) every tick" approach -- see
+// -startMeshAnimationWithRedraw: for the exact algorithm:
 //
-// 1. Per-vertex slide (the original heuristic): checks whether moving
-// vertex i in a straight line from its current (possibly already-
-// obstructed) position to that target would cross any OTHER mesh edge (a
-// straight segment between two grid-adjacent vertices' CURRENT positions,
-// the same connectivity CanvasView's -drawMesh/
-// -meshEdgeBezierFromRow:col:toRow:col: draw). On a crossing, vertex i
-// keeps only the component of that tick's motion running ALONG the
-// obstructing edge, so it visibly slides along the obstacle instead of
-// clipping through it. This handles the common "one vertex approaches a
-// mostly-static wall" case well, but on its own is NOT sufficient: it
-// only ever compares one moving vertex's path against another edge's
-// FROZEN start-of-tick position, so it cannot see a crossing that emerges
-// purely from two DIFFERENT edges moving independently in the same tick
-// (which is the normal case once "Animate Mesh" is running -- every
-// interior vertex moves every tick).
+// 1. It validates the ACTUAL rendered mesh edges, not a straight-line
+// approximation of them. The mesh CanvasView draws is bounded by cubic
+// Ferguson-patch-edge Bezier curves between grid-adjacent vertices (see
+// -meshEdgeBezierFromRow:col:toRow:col:), built from each vertex's
+// position plus its FIXED tangents (Pu/Pv, never touched by this
+// animation) -- not straight P-to-P segments. An earlier version of this
+// feature only checked the straight wireframe, which turned out to be
+// insufficient: two edges whose straight segments never cross can still
+// have their real curves cross, because each curve can bulge toward the
+// other one when its tangents are large relative to its own length --
+// exactly what a fitted mesh's tangents look like around a sharp local
+// silhouette feature. Confirmed as a real, reproducible gap during
+// development, not just a theoretical one. See
+// gmMeshHasCurvedSelfIntersection (DocumentModel.mm) for the actual
+// curve-vs-curve check.
 //
-// 2. Global safety net: after stage 1 produces a candidate position for
-// every vertex, the resulting candidate MESH (not just individual paths)
-// is checked for any self-intersection at all. If clean -- the common
-// case at reasonable amplitudes -- it's applied as-is, with no added
-// cost beyond that one check. If not, the tick's motion is scaled back
-// uniformly (binary search for the largest safe scale factor) until the
-// resulting mesh is clean again -- the pre-tick mesh is always known
-// clean by induction, so a safe scale factor always exists. This
-// GUARANTEES the mesh can never self-intersect, regardless of how many
-// vertices' simultaneous motion caused the near-miss (verified up to 5x
-// the mesh's own cell size during development). The trade-off: since the
-// scale-back applies to every vertex uniformly, not just the ones
-// actually involved in a near-miss, the whole mesh's motion can visibly
-// pause for a tick or a short run of ticks while a rare near-contact
-// resolves, rather than only the locally-affected vertices freezing. At
-// the default amplitude (8px against a typical 15-40px cell size) this
-// safety net essentially never engages -- it exists as a correctness
-// backstop for large amplitude/temperature settings, not a change to
-// normal behavior.
+// 2. The ENTIRE one-period animation loop (a few hundred frames, one
+// sin() period at ~60fps) is computed ONCE, up front, when "Animate Mesh"
+// starts -- not incrementally, tick by tick, while playing. This is only
+// possible because, once per-vertex "sliding" is gone, each frame's
+// target is a pure function of that frame's own phase alone, with no
+// dependency on any earlier frame; correcting a frame that would
+// self-intersect just means scaling its displacement back toward the
+// ALWAYS-clean base mesh (binary search for the largest safe scale
+// factor, same idea as the old real-time safety net, but resolved once
+// per frame during precompute instead of live every tick). Once that
+// precompute finishes, -animationTick: does no geometry work at all: it
+// just advances an index into the cached result and copies that frame's
+// positions in. This guarantees the mesh can never self-intersect at any
+// point in the loop, by construction, and removes every per-tick
+// collision-checking cost entirely -- the trade-off is a one-time startup
+// delay instead, paid once when the user presses "Animate Mesh", not
+// spread across every frame afterward. Measured (development prototype,
+// synchronous on the calling thread): well under 100ms for a typical
+// small/medium mesh at default settings, up to roughly 750ms for a large
+// (25x25) mesh, and somewhat more if bisection engages on many frames
+// (e.g. amplitude comparable to the mesh's own cell size) -- see
+// -startMeshAnimationWithRedraw: for why this runs synchronously rather
+// than on a background queue.
 @property (nonatomic, readonly) BOOL isAnimatingMesh;
 
 // Upper bound (image pixel units, same units as mesh vertex positions) on
@@ -458,33 +464,42 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // which was never touched, so this is always a clean, exact revert to
 // exactly the pre-animation state. No-op if not currently animating.
 //
-// Also where the per-tick debug trace (see -exportMeshAnimationTraceToURL:
-// error: below) gets auto-exported, if autoExportDebugData is YES -- see
-// that method's comment for why it reuses this existing toggle rather than
-// a new one.
+// Does NOT touch the debug trace (see -exportMeshAnimationTraceToURL:error:
+// below) -- unlike the old real-time design, the whole loop (and its
+// trace) is already fully computed and already auto-exported by
+// -startMeshAnimationWithRedraw:, well before the user ever gets a chance
+// to press stop, so there is nothing left to export or clear at this
+// point. The trace stays available (e.g. for a manual re-export) until the
+// next -startMeshAnimationWithRedraw: call replaces it.
 - (void)stopMeshAnimation;
 
-// Writes a JSON trace of every tick of the animation run that just
-// finished (or is still running) -- one entry per tick, with its
-// timestamp, whether the per-vertex slide pass's candidate mesh had a
-// self-intersection before the global safety net ran (see isAnimatingMesh's
-// comment), whether the safety net had to scale that tick's motion back,
-// and (for a thinned subset of ticks, to keep file size reasonable: the
-// first tick, roughly every half-second afterward, and any tick with a
-// detected candidate self-intersection) every vertex's exact position that
-// tick. Same general JSON-to-a-file convention as -exportDebugDataToURL:
-// error: (git commit, mesh dimensions, etc.), but a separate file/method,
-// since this has nothing to do with the optimizer. Returns NO (with
-// *error set) if no animation has produced any trace data yet in this
-// session. See -autoExportMeshAnimationTraceIfEnabled (DocumentModel.mm)
-// for the automatic-on-stop path most callers will actually rely on
-// rather than calling this directly.
+// Writes a JSON trace of the ENTIRE precomputed "Animate Mesh" loop from
+// the most recent -startMeshAnimationWithRedraw: call -- one entry per
+// frame of that fixed-length loop (a few hundred, one sin() period at
+// ~60fps), with its phase, whether that frame's unmodified sine target
+// had a curve self-intersection (checked against the actual rendered
+// Ferguson-patch-edge Bezier curves, not a straight-line approximation --
+// see isAnimatingMesh's comment), whether precompute had to scale that
+// frame's displacement back toward the base mesh to fix it, and every
+// vertex's final position for that frame (recorded unconditionally for
+// every frame -- the loop is short enough that no thinning is needed).
+// Same general JSON-to-a-file convention as -exportDebugDataToURL:error:
+// (git commit, mesh dimensions, etc.), but a separate file/method, since
+// this has nothing to do with the optimizer. Returns NO (with *error set)
+// if no animation has been started yet this session. Since the whole loop
+// is computed synchronously before -startMeshAnimationWithRedraw: even
+// returns, this data is complete and final immediately -- there is no
+// "still running" partial state to worry about, and it stays available
+// after -stopMeshAnimation too (see that method). See
+// -autoExportMeshAnimationTraceIfEnabled (DocumentModel.mm) for the
+// automatic-on-precompute path most callers will actually rely on rather
+// than calling this directly.
 - (BOOL)exportMeshAnimationTraceToURL:(NSURL*)url error:(NSError**)error;
 
 // Full path of the most recent successful mesh-animation-trace
-// auto-export (see -stopMeshAnimation/autoExportDebugData above), or nil
-// if none has happened yet this session -- same conventions as
-// lastDebugExportPath.
+// auto-export (see -startMeshAnimationWithRedraw:/autoExportDebugData
+// above), or nil if none has happened yet this session -- same
+// conventions as lastDebugExportPath.
 @property (nonatomic, readonly, nullable) NSString* lastMeshAnimationTracePath;
 
 // --- Output ---
