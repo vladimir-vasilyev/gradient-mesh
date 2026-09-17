@@ -281,6 +281,154 @@ static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const 
     }
     return false;
 }
+// Continuous per-vertex "how much clearance room is left" margin --
+// companion to gmMeshHasCurvedSelfIntersection above, and the basis of
+// the smooth per-vertex damping in -startMeshAnimationWithRedraw: that
+// replaced discrete conflict-set membership as the primary thing driving
+// correction (see that method's comment for the full story: a shared
+// lambda scoped to a discretely-grown conflict SET meant a vertex that
+// only just grazed the clearance threshold got a hard, visible snap the
+// instant a far-more-severely-conflicted groupmate pulled it into the
+// set, and another snap back the instant it left -- a real
+// frame-to-frame jump of several pixels was confirmed in an exported
+// trace, even though the underlying geometry only changed by a fraction
+// of a degree of phase between those two frames). Where that function
+// answers a yes/no question ("is anything already too close?"), this one
+// answers "how close is the closest thing, for each vertex individually?"
+// as a real number that varies smoothly as the candidate positions vary
+// smoothly (every vertex moves along a fixed sin() curve every frame) --
+// exactly the property needed to turn correction into a continuous
+// per-vertex damping factor instead of a discrete in-the-set-or-not one.
+//
+// Deliberately DIFFERENT from gmMeshHasCurvedSelfIntersection in one
+// respect: self-loop (same-curve) pairs are folded into the SAME
+// distance-based margin as cross-edge pairs here, even though the exact
+// checker above uses a hard crossing-only test for them (see that
+// function's comment for why -- a slow-moving stretch of one smooth
+// curve can pass as close, in polyline-sample terms, as a real fold, so
+// treating closeness as a hard PASS/FAIL there gave false positives on
+// clean meshes). That reasoning doesn't carry over here: this function
+// only ever feeds a smoothstep that softly reduces amplitude, never a
+// hard pass/fail, so a self-loop stretch that merely LOOKS close costs
+// at worst a little unnecessary damping -- never a wrong hard rejection.
+// The false-positive-free self-loop test stays exactly as it was for the
+// actual pass/fail decision (the exact re-check kept in
+// -startMeshAnimationWithRedraw: after damping); this function's
+// self-loop numbers only ever feed how much to damp.
+//
+// `searchRadius` (>= minClearanceDistance) is the largest distance worth
+// reporting: once a vertex's margin reaches minClearanceDistance plus the
+// damping transition width, its damping factor is already saturated at
+// 1.0 and a more precise margin value couldn't change anything (see the
+// smoothstep in -startMeshAnimationWithRedraw:), so the broad phase only
+// needs to pad by `searchRadius`, not by the whole mesh's extent -- this
+// keeps this extra per-frame pass roughly as cheap as the existing exact
+// check, verified empirically (standalone harness) to be no slower than
+// the whole-mesh check it complements, even though it never early-outs.
+static void gmMeshComputeVertexClearanceMargins(const std::vector<Vec2>& pos, const GradientMesh& baseMesh,
+                                                 int samplesPerEdge, double bucketCellSize, double searchRadius,
+                                                 std::vector<double>& outMargins) {
+    int rows = baseMesh.rows, cols = baseMesh.cols;
+    struct GMEdgeCurveRef { int a, b, firstSample, sampleCount; };
+    std::vector<GMEdgeCurveRef> edgeRefs;
+    std::vector<Vec2> allSamples;
+    edgeRefs.reserve((size_t)(rows * cols) * 2);
+    allSamples.reserve((size_t)(rows * cols) * 2 * (size_t)(samplesPerEdge + 1));
+
+    auto addEdge = [&](int a, int b, const Vec2& T0, const Vec2& T1) {
+        Vec2 P0 = pos[(size_t)a], P1 = pos[(size_t)b];
+        Vec2 B0 = P0, B1 = P0 + T0 * (1.0 / 3.0), B2 = P1 - T1 * (1.0 / 3.0), B3 = P1;
+        GMEdgeCurveRef ref{a, b, (int)allSamples.size(), samplesPerEdge + 1};
+        for (int i = 0; i <= samplesPerEdge; ++i) {
+            allSamples.push_back(gmCubicBezierAt(B0, B1, B2, B3, (double)i / samplesPerEdge));
+        }
+        edgeRefs.push_back(ref);
+    };
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            int idxA = r * cols + c;
+            if (c + 1 < cols) {
+                int idxB = idxA + 1;
+                addEdge(idxA, idxB, baseMesh.vertices[(size_t)idxA].Pu, baseMesh.vertices[(size_t)idxB].Pu);
+            }
+            if (r + 1 < rows) {
+                int idxB = idxA + cols;
+                addEdge(idxA, idxB, baseMesh.vertices[(size_t)idxA].Pv, baseMesh.vertices[(size_t)idxB].Pv);
+            }
+        }
+    }
+
+    outMargins.assign(pos.size(), std::numeric_limits<double>::infinity());
+
+    double minX = 1e300, minY = 1e300, maxX = -1e300, maxY = -1e300;
+    for (const Vec2& p : allSamples) {
+        minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+        minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+    }
+    double margin = std::max(0.0, searchRadius); // pad by the full search radius, not just the hard clearance
+    double cell = bucketCellSize > 1e-6 ? bucketCellSize : 1.0;
+    int gw = std::max(1, std::min(4096, (int)std::floor((maxX - minX) / cell) + 2));
+    int gh = std::max(1, std::min(4096, (int)std::floor((maxY - minY) / cell) + 2));
+    std::vector<std::vector<int>> grid((size_t)gw * (size_t)gh);
+
+    std::vector<int> segToEdge;
+    std::vector<int> segFirstSample;
+    std::vector<int> segLocalIndex;
+    for (size_t e = 0; e < edgeRefs.size(); ++e) {
+        const GMEdgeCurveRef& ref = edgeRefs[e];
+        for (int s = 0; s + 1 < ref.sampleCount; ++s) {
+            segToEdge.push_back((int)e);
+            segFirstSample.push_back(ref.firstSample + s);
+            segLocalIndex.push_back(s);
+        }
+    }
+    auto clampIdx = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
+    for (size_t si = 0; si < segToEdge.size(); ++si) {
+        const Vec2& P = allSamples[(size_t)segFirstSample[si]];
+        const Vec2& Q = allSamples[(size_t)segFirstSample[si] + 1];
+        int cx0 = clampIdx((int)std::floor((std::min(P.x, Q.x) - margin - minX) / cell), 0, gw - 1);
+        int cx1 = clampIdx((int)std::floor((std::max(P.x, Q.x) + margin - minX) / cell), 0, gw - 1);
+        int cy0 = clampIdx((int)std::floor((std::min(P.y, Q.y) - margin - minY) / cell), 0, gh - 1);
+        int cy1 = clampIdx((int)std::floor((std::max(P.y, Q.y) + margin - minY) / cell), 0, gh - 1);
+        for (int cy = cy0; cy <= cy1; ++cy)
+            for (int cx = cx0; cx <= cx1; ++cx)
+                grid[(size_t)(cy * gw + cx)].push_back((int)si);
+    }
+
+    auto noteDistance = [&](const GMEdgeCurveRef& r, double d) {
+        if (d < outMargins[(size_t)r.a]) outMargins[(size_t)r.a] = d;
+        if (d < outMargins[(size_t)r.b]) outMargins[(size_t)r.b] = d;
+    };
+
+    for (int cy = 0; cy < gh; ++cy) {
+        for (int cx = 0; cx < gw; ++cx) {
+            const std::vector<int>& idxs = grid[(size_t)(cy * gw + cx)];
+            for (size_t i = 0; i < idxs.size(); ++i) {
+                for (size_t j = i + 1; j < idxs.size(); ++j) {
+                    int s1 = idxs[i], s2 = idxs[j];
+                    int e1 = segToEdge[(size_t)s1], e2 = segToEdge[(size_t)s2];
+                    const Vec2& A0 = allSamples[(size_t)segFirstSample[(size_t)s1]];
+                    const Vec2& A1 = allSamples[(size_t)segFirstSample[(size_t)s1] + 1];
+                    const Vec2& C0 = allSamples[(size_t)segFirstSample[(size_t)s2]];
+                    const Vec2& C1 = allSamples[(size_t)segFirstSample[(size_t)s2] + 1];
+                    if (e1 == e2) {
+                        int li1 = segLocalIndex[(size_t)s1], li2 = segLocalIndex[(size_t)s2];
+                        if (std::abs(li1 - li2) <= 1) continue;
+                        double d = gmSegmentSegmentDistance(A0, A1, C0, C1);
+                        noteDistance(edgeRefs[(size_t)e1], d);
+                    } else {
+                        const GMEdgeCurveRef& r1 = edgeRefs[(size_t)e1];
+                        const GMEdgeCurveRef& r2 = edgeRefs[(size_t)e2];
+                        if (r1.a == r2.a || r1.a == r2.b || r1.b == r2.a || r1.b == r2.b) continue;
+                        double d = gmSegmentSegmentDistance(A0, A1, C0, C1);
+                        noteDistance(r1, d);
+                        noteDistance(r2, d);
+                    }
+                }
+            }
+        }
+    }
+}
 // One frame of the precomputed "Animate Mesh" loop, for
 // -exportMeshAnimationTraceToURL:error: (see DocumentModel.h and that
 // method's comment) -- NOT used by the animation itself (playback just
@@ -305,6 +453,14 @@ struct GMAnimTraceFrame {
     // uncorrected target position this frame, unlike the old whole-mesh
     // correction this replaced.
     int affectedVertexCount = 0;
+    // The continuous stage's own activity this frame (see
+    // -startMeshAnimationWithRedraw:'s "continuous per-vertex damping"
+    // comment) -- distinct from bisectionEngaged/affectedVertexCount
+    // above, which now record only the rare exact-checker FALLBACK, not
+    // the smooth damping that runs every frame and normally handles
+    // everything on its own.
+    int dampedVertexCount = 0;    // vertices whose continuous damping factor was < 1.0 this frame
+    double worstDampingFactor = 1.0; // smallest continuous damping factor applied this frame (1.0 = none)
     std::vector<Vec2> positions; // this frame's final (possibly corrected) vertex positions -- always recorded
 };
 
@@ -1382,6 +1538,20 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // development.
     static const int kAnimSamplesPerEdge = 16; // curve tessellation density, see gmMeshHasCurvedSelfIntersection
     static const int kAnimBisectionIters = 10;
+    // How far beyond minClearanceDistance the continuous damping ramp
+    // extends, as a multiple of minClearanceDistance itself (so it scales
+    // with whatever clearance the user configured, same as the bucket
+    // grid's own padding does). Swept empirically (standalone harness,
+    // 9x9 mesh, amplitude 40-200, temperature 1-20, plus a large-tangent
+    // self-loop-prone mesh): 1.0 already leaves an occasional sub-3px
+    // residual snap on the worst tested case; 1.5 reduced snaps to zero
+    // on every scenario tried (normal, stress, extreme, self-loop-prone,
+    // and a larger 15x15 mesh) while still finishing FASTER than the
+    // discrete-correction-only design it replaces, since a frame that
+    // needs no correction now costs one extra O(mesh) pass instead of
+    // zero, but a frame that DID need correction no longer pays for a
+    // conflict-set growth loop plus a full bisection search.
+    static const double kAnimMarginTransitionWidthFactor = 1.5;
     NSInteger frameCount = (NSInteger)std::lround(kTwoPi * 60.0); // one full sin() period at ~60fps
     frameCount = std::max((NSInteger)1, frameCount);
 
@@ -1406,6 +1576,46 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
         GMAnimTraceFrame trace;
         trace.t = phase;
+
+        // --- Continuous stage: ALWAYS runs, every frame, before any
+        // discrete pass/fail check -- this is what makes a vertex's
+        // position a continuous function of phase with no "just joined/
+        // left the conflict set" jump (see gmMeshComputeVertexClearance
+        // Margins' comment for the full rationale). When nothing is
+        // close to anything, every margin is >= the search radius, every
+        // damping factor saturates to 1.0, and this is a no-op --
+        // `candidate` passes through unchanged, exactly as before this
+        // stage existed.
+        double transitionWidth = std::max(1e-6, minClearanceDistance * kAnimMarginTransitionWidthFactor);
+        double searchRadius = minClearanceDistance + transitionWidth;
+        std::vector<double> margins;
+        gmMeshComputeVertexClearanceMargins(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
+                                             searchRadius, margins);
+        for (NSInteger i = 0; i < n; ++i) {
+            double m = margins[(size_t)i];
+            double tRamp = (m - minClearanceDistance) / transitionWidth;
+            tRamp = std::max(0.0, std::min(1.0, tRamp));
+            double damping = tRamp * tRamp * (3.0 - 2.0 * tRamp); // smoothstep
+            if (damping < 1.0) {
+                trace.dampedVertexCount++;
+                trace.worstDampingFactor = std::min(trace.worstDampingFactor, damping);
+                const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+                candidate[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * damping;
+            }
+        }
+
+        // --- Fallback stage: the exact, zero-false-positive checker gets
+        // the final say, exactly as before this change -- the difference
+        // is it now runs against the ALREADY-DAMPED candidate above
+        // rather than the raw full-amplitude target, so this is expected
+        // to engage far less often (verified empirically: 0 times across
+        // every normal/stress/extreme scenario tried, only appearing when
+        // the transition width is deliberately crippled well below
+        // kAnimMarginTransitionWidthFactor -- confirming it's genuinely a
+        // rare safety net now, not the primary correction mechanism).
+        // Reuses the exact SAME conflict-set-growth + shared-lambda
+        // bisection already shipped and verified (see the comments on
+        // each step below, unchanged from before).
         int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1;
         if (gmMeshHasCurvedSelfIntersection(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
                                              minClearanceDistance, &xa1, &xb1, &xa2, &xb2)) {
@@ -1686,6 +1896,9 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     long bisectionEngagedCount = 0;
     double worstLambdaApplied = 1.0;
     int worstAffectedVertexCount = 0;
+    long dampedFrameCount = 0;
+    int worstDampedVertexCount = 0;
+    double worstDampingFactorOverall = 1.0;
     NSNumber* firstEventFrame = nil;
     for (size_t i = 0; i < _animTraceFrames.size(); ++i) {
         const GMAnimTraceFrame& f = _animTraceFrames[i];
@@ -1696,6 +1909,9 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         if (f.bisectionEngaged) bisectionEngagedCount++;
         worstLambdaApplied = std::min(worstLambdaApplied, f.lambdaApplied);
         worstAffectedVertexCount = std::max(worstAffectedVertexCount, f.affectedVertexCount);
+        if (f.dampedVertexCount > 0) dampedFrameCount++;
+        worstDampedVertexCount = std::max(worstDampedVertexCount, f.dampedVertexCount);
+        worstDampingFactorOverall = std::min(worstDampingFactorOverall, f.worstDampingFactor);
     }
     root[@"animation"] = @{
         @"maxAmplitude": @(self.meshAnimationMaxAmplitude),
@@ -1719,6 +1935,17 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"worstAffectedVertexCount": @(worstAffectedVertexCount),
         @"totalVertexCount": @(_animBaseMesh.vertices.size()),
         @"firstEventFrame": firstEventFrame ?: [NSNull null],
+        // The continuous per-vertex damping stage's own activity (see
+        // gmMeshComputeVertexClearanceMargins and this method's
+        // "continuous stage" comment) -- separate from
+        // bisectionEngagedCount/worstAffectedVertexCount above, which now
+        // describe only the rare exact-checker FALLBACK. A run where
+        // bisectionEngagedCount is 0 but dampedFrameCount is high means
+        // the smooth stage quietly handled every close call on its own,
+        // with no discrete correction needed at all.
+        @"dampedFrameCount": @(dampedFrameCount),
+        @"worstDampedVertexCount": @(worstDampedVertexCount),
+        @"worstDampingFactor": @(worstDampingFactorOverall),
     };
 
     NSMutableArray<NSDictionary*>* framesJSON = [NSMutableArray arrayWithCapacity:_animTraceFrames.size()];
@@ -1734,6 +1961,8 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         fj[@"bisectionEngaged"] = @(f.bisectionEngaged);
         fj[@"lambdaApplied"] = @(f.lambdaApplied);
         fj[@"affectedVertexCount"] = @(f.affectedVertexCount);
+        fj[@"dampedVertexCount"] = @(f.dampedVertexCount);
+        fj[@"worstDampingFactor"] = @(f.worstDampingFactor);
         // Always present now -- every frame in the (bounded, few-hundred-
         // entry) precomputed loop is recorded in full, no thinning policy
         // needed anymore (see GMAnimTraceFrame's comment).
