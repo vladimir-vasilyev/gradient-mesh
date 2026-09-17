@@ -22,6 +22,7 @@ using gmcore::Color;
 using gmcore::CubicBezier;
 using gmcore::BezierSpline;
 using gmcore::GradientMesh;
+using gmcore::MeshVertex;
 using gmcore::Image;
 using gmcore::VectorLine;
 using gmcore::OptimizerOptions;
