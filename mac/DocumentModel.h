@@ -394,9 +394,19 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // other one when its tangents are large relative to its own length --
 // exactly what a fitted mesh's tangents look like around a sharp local
 // silhouette feature. Confirmed as a real, reproducible gap during
-// development, not just a theoretical one. See
-// gmMeshHasCurvedSelfIntersection (DocumentModel.mm) for the actual
-// curve-vs-curve check.
+// development, not just a theoretical one.
+//
+// This validation actually covers two distinct failure modes, both fixed
+// after real reports at large amplitude/temperature settings: a single
+// edge's own curve folding back and crossing ITSELF (its tangent stays
+// fixed while its chord shrinks or reverses under animation -- the
+// classic condition for a cubic Bezier to loop), and two DIFFERENT edges'
+// curves coming closer than meshAnimationMinClearanceDistance to each
+// other, not just literally crossing (a mesh can be technically
+// self-intersection-free and still show visible rendering artifacts once
+// two boundaries drift close enough). See gmMeshHasCurvedSelfIntersection
+// (DocumentModel.mm) for the actual checks, including why the clearance
+// margin is deliberately NOT applied to the self-loop case.
 //
 // 2. The ENTIRE one-period animation loop (a few hundred frames, one
 // sin() period at ~60fps) is computed ONCE, up front, when "Animate Mesh"
@@ -446,6 +456,31 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // (division); the caller (MainWindowController) clamps it away from 0
 // before passing it down.
 @property (nonatomic, assign) double meshAnimationTemperature;
+
+// Minimum required separation (image pixel units) between two DIFFERENT
+// mesh edges' curves -- not just "don't literally cross", but "don't even
+// come this close". Added after literal self-intersections were fixed but
+// visible rendering artifacts (thin slivers, near-degenerate overlaps)
+// could still appear at large amplitude once two different patch
+// boundaries drifted uncomfortably close without technically crossing.
+// Checked (and, when violated, corrected the same way an actual crossing
+// is -- see gmMeshHasCurvedSelfIntersection in DocumentModel.mm) for every
+// pair of edges that don't share a mesh vertex; a single edge's own
+// self-loop check (a curve folding back on itself) is exempt from this
+// margin and uses an exact zero-tolerance crossing test instead -- see
+// that function's comment for why: a perfectly smooth, non-looping curve
+// can slow down enough in one stretch that two of its own non-adjacent
+// samples end up just as close in space as a genuine tiny loop would be,
+// so there is no reliable way to apply a clearance margin to a curve
+// against itself without false-flagging ordinary, perfectly clean
+// meshes. Default 2.0 (a couple of pixels -- enough to avoid the
+// thinnest, most artifact-prone slivers without being so strict that a
+// merely tight-but-fine layout keeps triggering the correction below).
+// Read once at -startMeshAnimationWithRedraw: time, same convention as
+// meshAnimationMaxAmplitude/meshAnimationTemperature above; clamped to
+// >= 0 there (0 disables this check entirely, falling back to literal
+// crossing only, same as before this property existed).
+@property (nonatomic, assign) double meshAnimationMinClearanceDistance;
 
 // Starts animating: snapshots the current mesh, samples a random
 // direction+amplitude per interior vertex (see isAnimatingMesh's comment),

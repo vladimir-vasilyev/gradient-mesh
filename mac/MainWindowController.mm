@@ -71,13 +71,15 @@
 // "Animate Mesh" -- see DocumentModel.h's isAnimatingMesh/
 // startMeshAnimationWithRedraw:/stopMeshAnimation and -toggleAnimateMesh:.
 // animateMeshButton's title toggles between "Animate Mesh"/"Stop
-// Animation"; the two fields mirror DocumentModel.meshAnimationMaxAmplitude/
-// meshAnimationTemperature, read (and clamped) into the model each time
-// animation is (re)started, same "typed value takes effect on next start"
-// convention as the geometry/colour weight fields above.
+// Animation"; the three fields mirror DocumentModel.meshAnimationMaxAmplitude/
+// meshAnimationTemperature/meshAnimationMinClearanceDistance, read (and
+// clamped) into the model each time animation is (re)started, same "typed
+// value takes effect on next start" convention as the geometry/colour
+// weight fields above.
 @property (nonatomic, strong) NSButton* animateMeshButton;
 @property (nonatomic, strong) NSTextField* animAmplitudeField;
 @property (nonatomic, strong) NSTextField* animTemperatureField;
+@property (nonatomic, strong) NSTextField* animClearanceField;
 @end
 
 @implementation MainWindowController
@@ -303,12 +305,20 @@
     NSTextField* animTemperatureLabel = [self makeLabel:@"Temperature:"];
     self.animTemperatureField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationTemperature]];
+    // Minimum required separation (px) between two DIFFERENT mesh edges'
+    // curves -- see meshAnimationMinClearanceDistance's doc comment in
+    // DocumentModel.h. Same seed-from-model-default / read-and-clamp-on-
+    // (re)start convention as the two fields above.
+    NSTextField* animClearanceLabel = [self makeLabel:@"Min clearance:"];
+    self.animClearanceField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationMinClearanceDistance]];
     NSTextField* animHintLabel = [self makeLabel:@"(colors fixed; low temperature = calm, high = chaotic)"];
     animHintLabel.textColor = [NSColor secondaryLabelColor];
     animHintLabel.font = [NSFont systemFontOfSize:11];
 
     for (NSView* v in @[self.animateMeshButton, animAmplitudeLabel, self.animAmplitudeField,
-                         animTemperatureLabel, self.animTemperatureField, animHintLabel])
+                         animTemperatureLabel, self.animTemperatureField, animClearanceLabel,
+                         self.animClearanceField, animHintLabel])
         [controlsRow6 addSubview:v];
 
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
@@ -708,6 +718,10 @@
     // applies again defensively, so a stray 0 typed here can never crash.
     self.documentModel.meshAnimationMaxAmplitude = MAX(0.0, self.animAmplitudeField.doubleValue);
     self.documentModel.meshAnimationTemperature = MAX(0.01, self.animTemperatureField.doubleValue);
+    // 0 is a valid value here (disables the clearance check entirely,
+    // falling back to literal-crossing-only) -- see
+    // meshAnimationMinClearanceDistance's doc comment in DocumentModel.h.
+    self.documentModel.meshAnimationMinClearanceDistance = MAX(0.0, self.animClearanceField.doubleValue);
     __weak typeof(self) weakSelf = self;
     [self.documentModel startMeshAnimationWithRedraw:^{
         // -refreshActivePreview is a cheap no-op when "Show reconstruction"

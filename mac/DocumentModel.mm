@@ -67,6 +67,34 @@ static Vec2 gmCubicBezierAt(const Vec2& B0, const Vec2& B1, const Vec2& B2, cons
     return Vec2(a * B0.x + b * B1.x + c * B2.x + d * B3.x, a * B0.y + b * B1.y + c * B2.y + d * B3.y);
 }
 
+// Shortest distance from point P to segment [A,B] -- clamps the
+// projection of P onto the segment's line to [0,1] first, so a point
+// beyond either endpoint measures against that endpoint rather than the
+// segment's infinite extension.
+static double gmPointSegmentDistance(const Vec2& P, const Vec2& A, const Vec2& B) {
+    Vec2 ab = B - A;
+    double len2 = ab.dot(ab);
+    if (len2 < 1e-12) return (P - A).length(); // degenerate (near-zero-length) segment
+    double t = std::max(0.0, std::min(1.0, (P - A).dot(ab) / len2));
+    Vec2 proj = A + ab * t;
+    return (P - proj).length();
+}
+
+// Shortest distance between two segments [A0,A1] and [B0,B1] -- 0.0 if
+// they cross (gmSegmentsIntersect), otherwise the smallest of the four
+// endpoint-to-opposite-segment distances (the standard robust reduction:
+// for two straight segments, the closest pair of points is always either
+// a genuine crossing or one segment's endpoint against the other).
+static double gmSegmentSegmentDistance(const Vec2& A0, const Vec2& A1, const Vec2& B0, const Vec2& B1) {
+    double t;
+    if (gmSegmentsIntersect(A0, A1, B0, B1, &t)) return 0.0;
+    double d1 = gmPointSegmentDistance(A0, B0, B1);
+    double d2 = gmPointSegmentDistance(A1, B0, B1);
+    double d3 = gmPointSegmentDistance(B0, A0, A1);
+    double d4 = gmPointSegmentDistance(B1, A0, A1);
+    return std::min(std::min(d1, d2), std::min(d3, d4));
+}
+
 // Full-mesh self-intersection check over the ACTUAL rendered mesh edges --
 // the cubic Ferguson-patch-edge Bezier curves
 // -meshEdgeBezierFromRow:col:toRow:col: draws between grid-adjacent
@@ -82,6 +110,40 @@ static Vec2 gmCubicBezierAt(const Vec2& B0, const Vec2& B1, const Vec2& B2, cons
 // bulge to the exact same midpoint by construction, even though the rows
 // themselves never get any closer together.
 //
+// Two DISTINCT things are checked, with two DIFFERENT criteria, because
+// they turned out to need them:
+//
+// 1. A single edge's own curve looping back and crossing ITSELF. A cubic
+// Bezier's tangent magnitudes are fixed (Pu/Pv, read from the frozen base
+// mesh), but its CHORD length changes as its endpoints animate -- at
+// large amplitude a chord can shrink, or its direction can flip relative
+// to where it started, while the tangent stays exactly as large as it
+// was sized for the ORIGINAL chord. That combination is the classic
+// condition for a cubic Bezier to fold back on itself. This is checked
+// with the EXACT crossing test only (gmSegmentsIntersect, zero tolerance)
+// -- NOT the clearance distance below -- because a perfectly smooth,
+// non-looping curve can slow down enough in one stretch that two
+// non-adjacent samples end up just as close in space as a genuine tiny
+// loop's crossing point would be. A standalone repro confirmed both cases
+// can have near-identical (even sub-pixel) separation ALONG the curve, so
+// there is no reliable way to tell "just slow there" from "a real fold"
+// from polyline samples alone; applying the clearance margin here
+// produced false positives on ordinary, perfectly clean meshes during
+// development. Segments are only exempted from this check when they are
+// truly ADJACENT within the same curve (share a sample point, and so
+// trivially "touch") -- unlike an earlier version of this function, which
+// skipped EVERY pair from the same curve and so could never see this at
+// all.
+//
+// 2. Two DIFFERENT edges' curves coming closer than `minClearanceDistance`
+// to each other, not just literally crossing. Even a mesh with zero
+// technical self-intersections can still show visible rendering artifacts
+// (thin slivers, near-degenerate overlaps) once two different patch
+// boundaries drift close enough together, so this check treats "too
+// close" the same as "crossed" for any two edges that don't share a mesh
+// vertex (edges that DO share a vertex legitimately meet there and are
+// exempted entirely, same as before).
+//
 // `pos` gives every vertex's CURRENT (possibly animated) position;
 // `baseMesh` supplies the tangents (Pu/Pv), which this animation never
 // touches, so they always come from the frozen base mesh regardless of
@@ -89,16 +151,19 @@ static Vec2 gmCubicBezierAt(const Vec2& B0, const Vec2& B1, const Vec2& B2, cons
 // tessellated into a `samplesPerEdge`-segment polyline, and polyline
 // SEGMENTS (not whole curves) are broad-phased through the same flat
 // uniform grid the old straight-wireframe check used -- bucketed by each
-// little segment's own tiny bounding box, so bucketCellSize remains a
-// performance tuning value only, never a correctness one. Segment pairs
-// whose PARENT edges share a mesh vertex are skipped, since those curves
-// legitimately meet at that shared endpoint. Verified (standalone
-// prototype) against a synthetic crossing case and a stress sweep of a
-// 9x9 mesh with amplitude comparable to the mesh's own cell size: every
-// frame the bisection in -startMeshAnimationWithRedraw: corrects
+// little segment's own tiny bounding box, padded by minClearanceDistance
+// so a near (not just overlapping) pair still lands in a shared bucket;
+// bucketCellSize itself remains a performance tuning value only, never a
+// correctness one. Verified (standalone prototype) against a synthetic
+// cross-edge crossing case, the self-loop case above, a battery of clean
+// regular grids at varied cell sizes/tangent magnitudes (zero false
+// positives), a constructed near-miss that passes within the clearance
+// margin without literally crossing, and a stress sweep reproducing a
+// real large-amplitude run (9x9 mesh, amplitude=100, temperature=10):
+// every frame the bisection in -startMeshAnimationWithRedraw: corrects
 // re-verifies clean afterward.
 static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const GradientMesh& baseMesh,
-                                             int samplesPerEdge, double bucketCellSize,
+                                             int samplesPerEdge, double bucketCellSize, double minClearanceDistance,
                                              int* outA1, int* outB1, int* outA2, int* outB2) {
     int rows = baseMesh.rows, cols = baseMesh.cols;
     struct GMEdgeCurveRef { int a, b, firstSample, sampleCount; };
@@ -135,6 +200,8 @@ static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const 
         minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
         minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
     }
+    double clearance = std::max(0.0, minClearanceDistance);
+    double margin = clearance; // pad AABBs so a near (not just overlapping) pair still shares a bucket
     double cell = bucketCellSize > 1e-6 ? bucketCellSize : 1.0;
     int gw = std::max(1, std::min(4096, (int)std::floor((maxX - minX) / cell) + 2));
     int gh = std::max(1, std::min(4096, (int)std::floor((maxY - minY) / cell) + 2));
@@ -142,21 +209,23 @@ static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const 
 
     std::vector<int> segToEdge;
     std::vector<int> segFirstSample; // index of the segment's first sample within allSamples
+    std::vector<int> segLocalIndex;  // this segment's index WITHIN its own curve (0-based)
     for (size_t e = 0; e < edgeRefs.size(); ++e) {
         const GMEdgeCurveRef& ref = edgeRefs[e];
         for (int s = 0; s + 1 < ref.sampleCount; ++s) {
             segToEdge.push_back((int)e);
             segFirstSample.push_back(ref.firstSample + s);
+            segLocalIndex.push_back(s);
         }
     }
     auto clampIdx = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
     for (size_t si = 0; si < segToEdge.size(); ++si) {
         const Vec2& P = allSamples[(size_t)segFirstSample[si]];
         const Vec2& Q = allSamples[(size_t)segFirstSample[si] + 1];
-        int cx0 = clampIdx((int)std::floor((std::min(P.x, Q.x) - minX) / cell), 0, gw - 1);
-        int cx1 = clampIdx((int)std::floor((std::max(P.x, Q.x) - minX) / cell), 0, gw - 1);
-        int cy0 = clampIdx((int)std::floor((std::min(P.y, Q.y) - minY) / cell), 0, gh - 1);
-        int cy1 = clampIdx((int)std::floor((std::max(P.y, Q.y) - minY) / cell), 0, gh - 1);
+        int cx0 = clampIdx((int)std::floor((std::min(P.x, Q.x) - margin - minX) / cell), 0, gw - 1);
+        int cx1 = clampIdx((int)std::floor((std::max(P.x, Q.x) + margin - minX) / cell), 0, gw - 1);
+        int cy0 = clampIdx((int)std::floor((std::min(P.y, Q.y) - margin - minY) / cell), 0, gh - 1);
+        int cy1 = clampIdx((int)std::floor((std::max(P.y, Q.y) + margin - minY) / cell), 0, gh - 1);
         for (int cy = cy0; cy <= cy1; ++cy)
             for (int cx = cx0; cx <= cx1; ++cx)
                 grid[(size_t)(cy * gw + cx)].push_back((int)si);
@@ -169,23 +238,41 @@ static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const 
                 for (size_t j = i + 1; j < idxs.size(); ++j) {
                     int s1 = idxs[i], s2 = idxs[j];
                     int e1 = segToEdge[(size_t)s1], e2 = segToEdge[(size_t)s2];
-                    if (e1 == e2) continue; // same curve, adjacent samples always "touch"
-                    const GMEdgeCurveRef& r1 = edgeRefs[(size_t)e1];
-                    const GMEdgeCurveRef& r2 = edgeRefs[(size_t)e2];
-                    // Skip curve pairs that share a mesh vertex -- they
-                    // legitimately meet AT that shared endpoint.
-                    if (r1.a == r2.a || r1.a == r2.b || r1.b == r2.a || r1.b == r2.b) continue;
                     const Vec2& A0 = allSamples[(size_t)segFirstSample[(size_t)s1]];
                     const Vec2& A1 = allSamples[(size_t)segFirstSample[(size_t)s1] + 1];
                     const Vec2& C0 = allSamples[(size_t)segFirstSample[(size_t)s2]];
                     const Vec2& C1 = allSamples[(size_t)segFirstSample[(size_t)s2] + 1];
-                    double t;
-                    if (gmSegmentsIntersect(A0, A1, C0, C1, &t)) {
-                        if (outA1) *outA1 = r1.a;
-                        if (outB1) *outB1 = r1.b;
-                        if (outA2) *outA2 = r2.a;
-                        if (outB2) *outB2 = r2.b;
-                        return true;
+                    if (e1 == e2) {
+                        // Same curve -- exact-crossing self-loop check only
+                        // (see this function's comment for why the
+                        // clearance margin doesn't apply here). Adjacent
+                        // samples (sharing a sample point) always
+                        // trivially "touch" and are skipped; anything
+                        // farther apart that still crosses is a real fold.
+                        int li1 = segLocalIndex[(size_t)s1], li2 = segLocalIndex[(size_t)s2];
+                        if (std::abs(li1 - li2) <= 1) continue;
+                        double t;
+                        if (gmSegmentsIntersect(A0, A1, C0, C1, &t)) {
+                            const GMEdgeCurveRef& r1 = edgeRefs[(size_t)e1];
+                            if (outA1) *outA1 = r1.a;
+                            if (outB1) *outB1 = r1.b;
+                            if (outA2) *outA2 = r1.a;
+                            if (outB2) *outB2 = r1.b;
+                            return true;
+                        }
+                    } else {
+                        const GMEdgeCurveRef& r1 = edgeRefs[(size_t)e1];
+                        const GMEdgeCurveRef& r2 = edgeRefs[(size_t)e2];
+                        // Skip curve pairs that share a mesh vertex -- they
+                        // legitimately meet AT that shared endpoint.
+                        if (r1.a == r2.a || r1.a == r2.b || r1.b == r2.a || r1.b == r2.b) continue;
+                        if (gmSegmentSegmentDistance(A0, A1, C0, C1) < clearance) {
+                            if (outA1) *outA1 = r1.a;
+                            if (outB1) *outB1 = r1.b;
+                            if (outA2) *outA2 = r2.a;
+                            if (outB2) *outB2 = r2.b;
+                            return true;
+                        }
                     }
                 }
             }
@@ -425,6 +512,12 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         // 1.0 is a plain uniform amplitude draw (neither "cold" nor "hot").
         self.meshAnimationMaxAmplitude = 8.0;
         self.meshAnimationTemperature = 1.0;
+        // 2px -- per the user's request after seeing rendering artifacts
+        // at large amplitude even once literal self-intersections were
+        // fixed: reject not just a crossing but any two different edges'
+        // curves coming closer than this (see
+        // meshAnimationMinClearanceDistance's doc comment).
+        self.meshAnimationMinClearanceDistance = 2.0;
     }
     return self;
 }
@@ -1123,6 +1216,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // convention as -optimizeWithPyramidLevels:...'s opts.
     double maxAmplitude = std::max(0.0, self.meshAnimationMaxAmplitude);
     double temperature = std::max(1e-6, self.meshAnimationTemperature); // guard against div-by-zero
+    // Minimum required separation between two DIFFERENT edges' curves --
+    // see gmMeshHasCurvedSelfIntersection's comment for why this is only
+    // applied to cross-edge pairs, not a single edge's own self-loop
+    // check. Clamped to >= 0 here the same way maxAmplitude is above;
+    // meshAnimationMinClearanceDistance's own doc comment covers the
+    // default and what it trades off.
+    double minClearanceDistance = std::max(0.0, self.meshAnimationMinClearanceDistance);
     const double kTwoPi = 6.283185307179586;
 
     std::mt19937 rng(std::random_device{}());
@@ -1216,7 +1316,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         trace.t = phase;
         int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1;
         if (gmMeshHasCurvedSelfIntersection(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
-                                             &xa1, &xb1, &xa2, &xb2)) {
+                                             minClearanceDistance, &xa1, &xb1, &xa2, &xb2)) {
             trace.curveSelfIntersectionDetected = true;
             trace.xa1 = xa1; trace.xb1 = xb1; trace.xa2 = xa2; trace.xb2 = xb2;
             trace.bisectionEngaged = true;
@@ -1237,7 +1337,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
                     lerped[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * mid;
                 }
                 if (gmMeshHasCurvedSelfIntersection(lerped, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
-                                                     nullptr, nullptr, nullptr, nullptr)) {
+                                                     minClearanceDistance, nullptr, nullptr, nullptr, nullptr)) {
                     hi = mid;
                 } else {
                     lo = mid;
