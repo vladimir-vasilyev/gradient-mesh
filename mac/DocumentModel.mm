@@ -298,6 +298,13 @@ struct GMAnimTraceFrame {
     int xa1 = -1, xb1 = -1, xa2 = -1, xb2 = -1; // offending edge endpoints if so, else -1
     bool bisectionEngaged = false; // did precompute have to scale this frame's displacement back toward the base mesh?
     double lambdaApplied = 1.0; // 1.0 = unmodified sine target used; see -startMeshAnimationWithRedraw:
+    // How many vertices were actually part of this frame's correction --
+    // see -startMeshAnimationWithRedraw:'s "conflict set" comment. Only
+    // vertices in this set have lambdaApplied applied to them; every
+    // OTHER vertex (of the mesh's total vertex count) kept its full,
+    // uncorrected target position this frame, unlike the old whole-mesh
+    // correction this replaced.
+    int affectedVertexCount = 0;
     std::vector<Vec2> positions; // this frame's final (possibly corrected) vertex positions -- always recorded
 };
 
@@ -1405,19 +1412,54 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
             trace.curveSelfIntersectionDetected = true;
             trace.xa1 = xa1; trace.xb1 = xb1; trace.xa2 = xa2; trace.xb2 = xb2;
             trace.bisectionEngaged = true;
-            // Bisect against the BASE mesh (always known clean by
-            // construction), not the previous frame -- unlike the old
-            // real-time design, there's no "previous frame" dependency to
-            // preserve here, and anchoring every correction to the same
-            // fixed base keeps every frame's correction independent of
-            // frame order, which matters for a perfectly looping result:
-            // the frameCount-1 -> 0 wraparound has to be just as clean a
-            // transition as any other consecutive pair.
+
+            // --- Step 1: grow a minimal "conflict set" of vertices allowed
+            // to be pulled back, until pinning JUST that set to the base
+            // mesh (every other vertex left at its full, untouched target)
+            // is clean. This is what makes the correction LOCAL instead of
+            // whole-mesh: only vertices that actually end up in this set
+            // ever move any less far than requested this frame -- every
+            // other vertex keeps animating at full amplitude even while a
+            // completely unrelated part of the mesh is being corrected.
+            //
+            // Guaranteed to terminate in at most n iterations (in
+            // practice, almost always 1-2): any violation reported here
+            // must involve at least one vertex NOT YET in the set, because
+            // once ALL of a violating pair's endpoints are pinned to base,
+            // that pair's two curves are IDENTICAL to the base mesh's own
+            // edges -- and the base mesh is clean by construction, so it
+            // can never be reported as violating itself. Worst case (every
+            // vertex ends up in the set) reduces to exactly the old
+            // whole-mesh behavior this replaces -- correctness never
+            // regresses, only the common case gets much more local.
+            std::vector<bool> inConflictSet((size_t)n, false);
+            std::vector<Vec2> trial = candidate;
+            for (NSInteger guard = 0; guard <= n; ++guard) {
+                int a1 = -1, b1 = -1, a2 = -1, b2 = -1;
+                if (!gmMeshHasCurvedSelfIntersection(trial, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
+                                                      minClearanceDistance, &a1, &b1, &a2, &b2)) {
+                    break; // trial (conflict set pinned to base) is clean
+                }
+                for (int idx : {a1, b1, a2, b2}) {
+                    if (idx < 0 || inConflictSet[(size_t)idx]) continue;
+                    inConflictSet[(size_t)idx] = true;
+                    trial[(size_t)idx] = _animBaseMesh.vertices[(size_t)idx].P;
+                }
+            }
+
+            // --- Step 2: within just that conflict set, binary-search the
+            // LARGEST shared lambda that keeps the whole mesh clean --
+            // same bisection-against-the-always-clean-base-mesh idea the
+            // old whole-mesh correction used, just scoped to a subset of
+            // vertices instead of all of them. Every vertex outside the
+            // set is left completely alone (still at `candidate`'s full
+            // target) for the whole search.
             double lo = 0.0, hi = 1.0, bestSafeLambda = 0.0;
-            std::vector<Vec2> lerped((size_t)n);
+            std::vector<Vec2> lerped = candidate;
             for (int iter = 0; iter < kAnimBisectionIters; ++iter) {
                 double mid = (lo + hi) * 0.5;
                 for (NSInteger i = 0; i < n; ++i) {
+                    if (!inConflictSet[(size_t)i]) continue;
                     const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
                     lerped[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * mid;
                 }
@@ -1431,8 +1473,30 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
             }
             trace.lambdaApplied = bestSafeLambda;
             for (NSInteger i = 0; i < n; ++i) {
+                if (!inConflictSet[(size_t)i]) continue;
                 const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
                 candidate[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * bestSafeLambda;
+            }
+
+            // Defensive final re-check: the bisection above assumes
+            // "closer to base is monotonically safer", the same
+            // not-formally-proven-but-empirically-solid assumption the
+            // ORIGINAL whole-mesh bisection already relied on (see git
+            // history). If that ever fails to hold, fall back to pinning
+            // the whole conflict set outright rather than shipping a
+            // possibly-unsafe frame -- still only affects the conflict
+            // set, never the rest of the mesh.
+            if (gmMeshHasCurvedSelfIntersection(candidate, _animBaseMesh, kAnimSamplesPerEdge, _animBucketCellSize,
+                                                 minClearanceDistance, nullptr, nullptr, nullptr, nullptr)) {
+                trace.lambdaApplied = 0.0;
+                for (NSInteger i = 0; i < n; ++i) {
+                    if (!inConflictSet[(size_t)i]) continue;
+                    candidate[(size_t)i] = _animBaseMesh.vertices[(size_t)i].P;
+                }
+            }
+
+            for (NSInteger i = 0; i < n; ++i) {
+                if (inConflictSet[(size_t)i]) trace.affectedVertexCount++;
             }
         }
         trace.positions = candidate;
@@ -1621,6 +1685,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     long curveSelfIntersectionCount = 0;
     long bisectionEngagedCount = 0;
     double worstLambdaApplied = 1.0;
+    int worstAffectedVertexCount = 0;
     NSNumber* firstEventFrame = nil;
     for (size_t i = 0; i < _animTraceFrames.size(); ++i) {
         const GMAnimTraceFrame& f = _animTraceFrames[i];
@@ -1630,6 +1695,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         }
         if (f.bisectionEngaged) bisectionEngagedCount++;
         worstLambdaApplied = std::min(worstLambdaApplied, f.lambdaApplied);
+        worstAffectedVertexCount = std::max(worstAffectedVertexCount, f.affectedVertexCount);
     }
     root[@"animation"] = @{
         @"maxAmplitude": @(self.meshAnimationMaxAmplitude),
@@ -1644,6 +1710,14 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"curveSelfIntersectionCount": @(curveSelfIntersectionCount),
         @"bisectionEngagedCount": @(bisectionEngagedCount),
         @"worstLambdaApplied": @(worstLambdaApplied),
+        // Largest number of vertices held back in any single frame, out of
+        // _animBaseMesh.vertices.size() total -- see GMAnimTraceFrame's
+        // affectedVertexCount comment. Small relative to the mesh's total
+        // vertex count means corrections stayed local; equal to it means
+        // some frame needed the same whole-mesh fallback the old design
+        // always used.
+        @"worstAffectedVertexCount": @(worstAffectedVertexCount),
+        @"totalVertexCount": @(_animBaseMesh.vertices.size()),
         @"firstEventFrame": firstEventFrame ?: [NSNull null],
     };
 
@@ -1659,6 +1733,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         }
         fj[@"bisectionEngaged"] = @(f.bisectionEngaged);
         fj[@"lambdaApplied"] = @(f.lambdaApplied);
+        fj[@"affectedVertexCount"] = @(f.affectedVertexCount);
         // Always present now -- every frame in the (bounded, few-hundred-
         // entry) precomputed loop is recorded in full, no thinning policy
         // needed anymore (see GMAnimTraceFrame's comment).
