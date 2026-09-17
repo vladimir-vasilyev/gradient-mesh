@@ -366,12 +366,40 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 //
 // Motion law, per interior vertex i and frame phase p (p runs from 0 to
 // 2*pi once per loop, NOT wall-clock time -- see the precompute paragraph
-// below): P_i(p) = base_i + dir_i * amp_i * sin(p), dir_i a random unit
-// vector chosen once at animation start (fixed for the whole animation,
-// not re-randomized per frame), amp_i sampled once at start from
-// meshAnimationMaxAmplitude and meshAnimationTemperature (see those
-// properties below). Boundary vertices (gmcore::MeshVertex::isBoundary)
-// are always pinned to amp_i == 0 -- letting them wiggle would break the
+// below): P_i(p) = base_i + dir_i * amp_i * sin(p - offset_i). dir_i,
+// amp_i and offset_i are all sampled/computed once at animation start
+// (fixed for the whole animation, not touched per frame) and depend on
+// meshAnimationStyle -- see that enum's doc comment just below for what
+// each of the 4 styles does conceptually, and
+// -startMeshAnimationWithRedraw: for the exact per-style formulas:
+//
+// - GMMeshAnimationStyleJitter (the original, default): dir_i a random
+//   unit vector, amp_i drawn from meshAnimationMaxAmplitude/
+//   meshAnimationTemperature (see those properties below), offset_i == 0.
+// - GMMeshAnimationStyleWave: dir_i the SAME fixed unit vector for every
+//   vertex (perpendicular to meshAnimationWaveDirectionDegrees -- a
+//   transverse wave), amp_i == meshAnimationMaxAmplitude for every
+//   vertex, offset_i a per-vertex phase shift proportional to that
+//   vertex's own position along the travel direction -- this offset is
+//   what makes it an actual TRAVELING ripple rather than the whole mesh
+//   pulsing in unison.
+// - GMMeshAnimationStyleBreathing: dir_i == (base_i - centroid) (i.e. the
+//   vertex's own radial vector, NOT unit-length), amp_i a single shared
+//   scale factor == meshAnimationMaxAmplitude / (max radial distance
+//   among interior vertices) -- so the whole mesh scales uniformly
+//   in/out from its centroid and the farthest-out interior vertex is the
+//   one that reaches exactly meshAnimationMaxAmplitude of displacement,
+//   same as every other style. offset_i == 0 (breathes in unison).
+// - GMMeshAnimationStyleSquashStretch: like Breathing, but dir_i ==
+//   (dx, -dy) instead of (dx, dy) -- so as one axis scales up the other
+//   scales down (and back), instead of both growing/shrinking together.
+//   offset_i == 0.
+//
+// All 4 styles share the SAME amplitude semantics (meshAnimationMaxAmplitude
+// is always the upper bound on any single vertex's displacement, see that
+// property's own comment) and the SAME boundary-pinning rule: boundary
+// vertices (gmcore::MeshVertex::isBoundary) are always pinned to amp_i ==
+// 0 regardless of style -- letting them wiggle would break the
 // boundary-lies-on-the-fitted-spline invariant CanvasView's boundary
 // overlay and the SVG/PNG exporters both assume, and would make the
 // silhouette itself flicker, which reads as broken rather than lively.
@@ -433,13 +461,39 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // than on a background queue.
 @property (nonatomic, readonly) BOOL isAnimatingMesh;
 
+// Selects which of the 4 motion laws described in isAnimatingMesh's
+// comment above is used. Read once at -startMeshAnimationWithRedraw:
+// time, same convention as every other meshAnimation* property below;
+// changing it mid-animation has no effect until the next start.
+typedef NS_ENUM(NSInteger, GMMeshAnimationStyle) {
+    // Original: independent per-vertex random direction + amplitude,
+    // shaped by meshAnimationTemperature. A chaotic, textile-like
+    // dither -- every vertex effectively does its own thing.
+    GMMeshAnimationStyleJitter = 0,
+    // A single ripple travels across the whole mesh along
+    // meshAnimationWaveDirectionDegrees, like a flag or a water surface.
+    // Spatially coherent: neighboring vertices are almost in phase,
+    // distant ones can be fully out of phase.
+    GMMeshAnimationStyleWave = 1,
+    // The whole mesh scales uniformly in and out from its own centroid,
+    // like a pulse/heartbeat. meshAnimationTemperature and
+    // meshAnimationWaveDirectionDegrees are both ignored by this style.
+    GMMeshAnimationStyleBreathing = 2,
+    // Like Breathing, but the two axes are inversely coupled: as the
+    // mesh stretches horizontally it squashes vertically, and back --
+    // the classic cartoon squash-and-stretch look. Also ignores
+    // meshAnimationTemperature/meshAnimationWaveDirectionDegrees.
+    GMMeshAnimationStyleSquashStretch = 3,
+};
+@property (nonatomic, assign) GMMeshAnimationStyle meshAnimationStyle;
+
 // Upper bound (image pixel units, same units as mesh vertex positions) on
 // how far any single interior vertex can be displaced from its base
 // position -- see isAnimatingMesh's comment for the exact motion law. Read
 // once, at -startMeshAnimationWithRedraw: time, same "typed value takes
 // effect on next start, not retroactively" convention as the optimizer
 // weight properties. Clamped to >= 0 by the caller (MainWindowController);
-// 0 means every vertex stays put (temperature becomes moot).
+// 0 means every vertex stays put (temperature becomes moot for Jitter).
 @property (nonatomic, assign) double meshAnimationMaxAmplitude;
 
 // Controls how each interior vertex's OWN amplitude (see isAnimatingMesh's
@@ -454,8 +508,22 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // (a chaotic, energetic mesh). Read once at -startMeshAnimationWithRedraw:
 // time, same convention as meshAnimationMaxAmplitude above. Must be > 0
 // (division); the caller (MainWindowController) clamps it away from 0
-// before passing it down.
+// before passing it down. Only meaningful for
+// GMMeshAnimationStyleJitter -- ignored by the other 3 styles.
 @property (nonatomic, assign) double meshAnimationTemperature;
+
+// Direction (degrees, 0 = +X/left-to-right, 90 = +Y) the ripple travels
+// in under GMMeshAnimationStyleWave -- ignored by every other style. The
+// actual per-vertex DISPLACEMENT axis is this direction rotated 90
+// degrees (a transverse wave: the mesh moves perpendicular to the
+// direction the ripple itself travels, like a flag rippling sideways
+// while the ripple runs along its length). The spatial wavelength is not
+// separately configurable: it is always exactly one full period across
+// the mesh's own extent along this direction, so a single ripple is
+// visible at a time regardless of image size, with no extra tunable
+// needed. Read once at -startMeshAnimationWithRedraw: time, same
+// convention as every other meshAnimation* property.
+@property (nonatomic, assign) double meshAnimationWaveDirectionDegrees;
 
 // Minimum required separation (image pixel units) between two DIFFERENT
 // mesh edges' curves -- not just "don't literally cross", but "don't even

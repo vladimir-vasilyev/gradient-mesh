@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <random>
+#include <limits>
 
 using gmcore::Vec2;
 using gmcore::Color;
@@ -430,6 +431,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     GradientMesh _animBaseMesh;
     std::vector<Vec2> _animDirections;   // per-vertex, fixed for the whole animation
     std::vector<double> _animAmplitudes; // per-vertex, sampled once at start -- see meshAnimationTemperature
+    // Per-vertex sin() phase shift -- 0 for every style except
+    // GMMeshAnimationStyleWave, where it is what turns a mesh-wide pulse
+    // into an actual traveling ripple (see -startMeshAnimationWithRedraw:
+    // and isAnimatingMesh's doc comment for the exact formula).
+    std::vector<double> _animPhaseOffsets;
     // The whole one-period animation loop, precomputed ONCE in
     // -startMeshAnimationWithRedraw: (see that method's comment) and
     // simply indexed into every tick thereafter by -animationTick: -- no
@@ -510,8 +516,10 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         // is a small, clearly-visible wiggle at typical image resolutions
         // without the mesh grid swamping the underlying image; temperature
         // 1.0 is a plain uniform amplitude draw (neither "cold" nor "hot").
+        self.meshAnimationStyle = GMMeshAnimationStyleJitter;
         self.meshAnimationMaxAmplitude = 8.0;
         self.meshAnimationTemperature = 1.0;
+        self.meshAnimationWaveDirectionDegrees = 0.0;
         // 2px -- per the user's request after seeing rendering artifacts
         // at large amplitude even once literal self-intersections were
         // fixed: reject not just a crossing but any two different edges'
@@ -1224,20 +1232,93 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // default and what it trades off.
     double minClearanceDistance = std::max(0.0, self.meshAnimationMinClearanceDistance);
     const double kTwoPi = 6.283185307179586;
+    GMMeshAnimationStyle style = self.meshAnimationStyle;
+    _animPhaseOffsets.assign((size_t)n, 0.0);
 
-    std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<double> unit01(0.0, 1.0);
-    for (NSInteger i = 0; i < n; ++i) {
-        const MeshVertex& v = _animBaseMesh.vertices[(size_t)i];
-        if (v.isBoundary) continue; // pinned at direction={0,0}/amplitude=0 -- see isAnimatingMesh's comment
-        double angle = unit01(rng) * kTwoPi;
-        // amp = maxAmplitude * uniform01^(1/temperature): temperature==1 is
-        // a plain uniform draw; <1 ("cold") concentrates amplitudes near 0;
-        // >1 ("hot") pushes them toward maxAmplitude. See
-        // meshAnimationTemperature's doc comment in DocumentModel.h.
-        double amp = maxAmplitude * std::pow(unit01(rng), 1.0 / temperature);
-        _animDirections[(size_t)i] = Vec2(std::cos(angle), std::sin(angle));
-        _animAmplitudes[(size_t)i] = amp;
+    // Populate _animDirections/_animAmplitudes/_animPhaseOffsets once,
+    // here, per meshAnimationStyle -- see isAnimatingMesh's doc comment
+    // for the P_i(p) = base_i + dir_i*amp_i*sin(p - offset_i) formula
+    // every style plugs into, and GMMeshAnimationStyle's own comment
+    // (DocumentModel.h) for what each style looks like. Every branch
+    // below leaves boundary vertices at their default {0,0}/0.0/0.0 --
+    // pinned regardless of style, same reasoning as the original Jitter
+    // code had (see isAnimatingMesh's comment).
+    if (style == GMMeshAnimationStyleWave) {
+        // A single ripple traveling along meshAnimationWaveDirectionDegrees.
+        // Every interior vertex shares the same displacement AXIS
+        // (travelDir rotated 90 degrees -- a transverse wave, like a flag
+        // or a water ripple) and the same amplitude; what varies per
+        // vertex is only its phase, shifted in proportion to its own
+        // position projected onto travelDir, so a fixed point of the sine
+        // wave moves across the mesh as the animation phase advances
+        // instead of the whole mesh pulsing in lockstep (that's
+        // Breathing, below).
+        double theta = self.meshAnimationWaveDirectionDegrees * kTwoPi / 360.0;
+        Vec2 travelDir(std::cos(theta), std::sin(theta));
+        Vec2 perpDir(-std::sin(theta), std::cos(theta)); // travelDir rotated 90 degrees
+        double sMin = std::numeric_limits<double>::infinity();
+        double sMax = -std::numeric_limits<double>::infinity();
+        for (NSInteger i = 0; i < n; ++i) {
+            double s = _animBaseMesh.vertices[(size_t)i].P.dot(travelDir);
+            sMin = std::min(sMin, s);
+            sMax = std::max(sMax, s);
+        }
+        // One full spatial period across the mesh's own extent along
+        // travelDir -- chosen so exactly one ripple crest is visible at a
+        // time regardless of image size, with no extra tunable needed.
+        double span = std::max(1.0, sMax - sMin);
+        double kWave = kTwoPi / span;
+        for (NSInteger i = 0; i < n; ++i) {
+            const MeshVertex& v = _animBaseMesh.vertices[(size_t)i];
+            if (v.isBoundary) continue;
+            double s = v.P.dot(travelDir);
+            _animDirections[(size_t)i] = perpDir;
+            _animAmplitudes[(size_t)i] = maxAmplitude;
+            _animPhaseOffsets[(size_t)i] = kWave * (s - sMin);
+        }
+    } else if (style == GMMeshAnimationStyleBreathing || style == GMMeshAnimationStyleSquashStretch) {
+        // Both styles are a single global, centroid-relative scale --
+        // they differ only in whether the two axes scale together
+        // (Breathing) or inversely (SquashStretch). Using the base
+        // mesh's own centroid (over ALL vertices, moving or not, so it
+        // tracks the actual visual center of the shape) and normalizing
+        // by the farthest-out INTERIOR vertex (the only ones that
+        // actually move) so meshAnimationMaxAmplitude means exactly the
+        // same thing here as it does for Jitter/Wave: the largest
+        // displacement any single vertex reaches over the whole loop.
+        Vec2 centroid(0.0, 0.0);
+        for (NSInteger i = 0; i < n; ++i) centroid = centroid + _animBaseMesh.vertices[(size_t)i].P;
+        centroid = centroid * (1.0 / std::max((NSInteger)1, n));
+        double maxRadius = 0.0;
+        for (NSInteger i = 0; i < n; ++i) {
+            const MeshVertex& v = _animBaseMesh.vertices[(size_t)i];
+            if (v.isBoundary) continue;
+            maxRadius = std::max(maxRadius, (v.P - centroid).length());
+        }
+        maxRadius = std::max(1.0, maxRadius); // guard: degenerate mesh (all interior vertices at the centroid)
+        double ampScale = maxAmplitude / maxRadius;
+        for (NSInteger i = 0; i < n; ++i) {
+            const MeshVertex& v = _animBaseMesh.vertices[(size_t)i];
+            if (v.isBoundary) continue;
+            Vec2 r = v.P - centroid;
+            _animDirections[(size_t)i] = (style == GMMeshAnimationStyleSquashStretch) ? Vec2(r.x, -r.y) : r;
+            _animAmplitudes[(size_t)i] = ampScale;
+        }
+    } else { // GMMeshAnimationStyleJitter (default) -- the original random per-vertex motion.
+        std::mt19937 rng(std::random_device{}());
+        std::uniform_real_distribution<double> unit01(0.0, 1.0);
+        for (NSInteger i = 0; i < n; ++i) {
+            const MeshVertex& v = _animBaseMesh.vertices[(size_t)i];
+            if (v.isBoundary) continue; // pinned at direction={0,0}/amplitude=0 -- see isAnimatingMesh's comment
+            double angle = unit01(rng) * kTwoPi;
+            // amp = maxAmplitude * uniform01^(1/temperature): temperature==1 is
+            // a plain uniform draw; <1 ("cold") concentrates amplitudes near 0;
+            // >1 ("hot") pushes them toward maxAmplitude. See
+            // meshAnimationTemperature's doc comment in DocumentModel.h.
+            double amp = maxAmplitude * std::pow(unit01(rng), 1.0 / temperature);
+            _animDirections[(size_t)i] = Vec2(std::cos(angle), std::sin(angle));
+            _animAmplitudes[(size_t)i] = amp;
+        }
     }
 
     // Average base-mesh edge length -- see gmMeshHasCurvedSelfIntersection's
@@ -1303,13 +1384,17 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
     for (NSInteger k = 0; k < frameCount; ++k) {
         double phase = kTwoPi * (double)k / (double)frameCount;
-        double s = std::sin(phase);
         std::vector<Vec2> candidate((size_t)n);
         for (NSInteger i = 0; i < n; ++i) {
             const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+            // sin(phase - offset_i): offset_i is 0 for every style except
+            // Wave (see the setup block above), so this is exactly
+            // sin(phase) -- i.e. unchanged -- for Jitter/Breathing/
+            // SquashStretch.
+            double sEff = std::sin(phase - _animPhaseOffsets[(size_t)i]);
             candidate[(size_t)i] = base.isBoundary
                 ? base.P
-                : base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * s);
+                : base.P + _animDirections[(size_t)i] * (_animAmplitudes[(size_t)i] * sEff);
         }
 
         GMAnimTraceFrame trace;

@@ -71,14 +71,26 @@
 // "Animate Mesh" -- see DocumentModel.h's isAnimatingMesh/
 // startMeshAnimationWithRedraw:/stopMeshAnimation and -toggleAnimateMesh:.
 // animateMeshButton's title toggles between "Animate Mesh"/"Stop
-// Animation"; the three fields mirror DocumentModel.meshAnimationMaxAmplitude/
-// meshAnimationTemperature/meshAnimationMinClearanceDistance, read (and
-// clamped) into the model each time animation is (re)started, same "typed
-// value takes effect on next start" convention as the geometry/colour
-// weight fields above.
+// Animation"; animStylePopup mirrors DocumentModel.meshAnimationStyle
+// (see GMMeshAnimationStyle in DocumentModel.h -- item order matches the
+// enum's raw values exactly, 0=Jitter/1=Wave/2=Breathing/
+// 3=SquashStretch, so -indexOfSelectedItem casts straight to the enum
+// with no separate mapping table needed); the four text fields mirror
+// DocumentModel.meshAnimationMaxAmplitude/meshAnimationTemperature/
+// meshAnimationWaveDirectionDegrees/meshAnimationMinClearanceDistance,
+// read (and clamped) into the model each time animation is (re)started,
+// same "typed value takes effect on next start" convention as the
+// geometry/colour weight fields above. Temperature only matters for
+// Jitter and Direction only matters for Wave, but both fields stay
+// visible regardless of the selected style (same "harmless if unused
+// otherwise" treatment meshAnimationMinClearanceDistance's field
+// already gets) -- simpler than wiring show/hide logic to the popup for
+// two rarely-confusing, always-labeled fields.
 @property (nonatomic, strong) NSButton* animateMeshButton;
+@property (nonatomic, strong) NSPopUpButton* animStylePopup;
 @property (nonatomic, strong) NSTextField* animAmplitudeField;
 @property (nonatomic, strong) NSTextField* animTemperatureField;
+@property (nonatomic, strong) NSTextField* animDirectionField;
 @property (nonatomic, strong) NSTextField* animClearanceField;
 @end
 
@@ -121,6 +133,13 @@
     NSView* controlsRow4 = [self makeRow];
     NSView* controlsRow5 = [self makeRow];
     NSView* controlsRow6 = [self makeRow];
+    // Row 7: "Animate Mesh" style picker -- kept as its own row rather
+    // than folded into Row 6, which was already the widest/most crowded
+    // row in the whole panel even before this (Button + Amplitude +
+    // Temperature + Min clearance + a long hint label); adding a style
+    // popup and a direction field to it would very likely overflow the
+    // window at its minimum size.
+    NSView* controlsRow7 = [self makeRow];
 
     // --- Row 1: file + tool selection ---
     NSButton* openBtn = [self buttonTitled:@"Open Image…" action:@selector(openImage:)];
@@ -321,6 +340,31 @@
                          self.animClearanceField, animHintLabel])
         [controlsRow6 addSubview:v];
 
+    // --- Row 7: animation STYLE (Jitter/Wave/Breathing/Squash & Stretch)
+    // -- see GMMeshAnimationStyle in DocumentModel.h. A plain (pullsDown:
+    // NO) popup, same pattern as self.solverPopup above: no target/action
+    // wired up, since -- like every other field on this row -- it's only
+    // ever read at "Animate Mesh" press time (-toggleAnimateMesh:), not
+    // live. Item order matches the enum's raw values exactly.
+    NSTextField* animStyleLabel = [self makeLabel:@"Style:"];
+    self.animStylePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    self.animStylePopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.animStylePopup addItemsWithTitles:@[@"Jitter", @"Wave", @"Breathing", @"Squash & Stretch"]];
+    [self.animStylePopup selectItemAtIndex:(NSInteger)self.documentModel.meshAnimationStyle];
+    // Direction only matters for Wave -- see
+    // meshAnimationWaveDirectionDegrees's doc comment in DocumentModel.h
+    // for the 0/90-degree convention and why there's no separate
+    // wavelength control.
+    NSTextField* animDirectionLabel = [self makeLabel:@"Direction (Wave), °:"];
+    self.animDirectionField = [self makeWeightFieldWithValue:
+        [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationWaveDirectionDegrees]];
+    NSTextField* animStyleHintLabel = [self makeLabel:@"(Temperature applies to Jitter only; Direction applies to Wave only)"];
+    animStyleHintLabel.textColor = [NSColor secondaryLabelColor];
+    animStyleHintLabel.font = [NSFont systemFontOfSize:11];
+
+    for (NSView* v in @[animStyleLabel, self.animStylePopup, animDirectionLabel, self.animDirectionField, animStyleHintLabel])
+        [controlsRow7 addSubview:v];
+
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
     self.canvasView.documentModel = self.documentModel;
@@ -393,11 +437,12 @@
     [content addSubview:controlsRow4];
     [content addSubview:controlsRow5];
     [content addSubview:controlsRow6];
+    [content addSubview:controlsRow7];
     [content addSubview:canvasRow];
     [content addSubview:self.statusLabel];
 
     NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow1b, controlsRow2, controlsRow3, controlsRow4,
-                                                           controlsRow5, controlsRow6, canvasRow, _statusLabel);
+                                                           controlsRow5, controlsRow6, controlsRow7, canvasRow, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1b]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
@@ -405,11 +450,12 @@
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow4]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow5]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow6]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow7]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[canvasRow]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
         @"V:|-8-[controlsRow1(28)]-6-[controlsRow1b(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
-        "-6-[controlsRow6(28)]-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
+        "-6-[controlsRow6(28)]-6-[controlsRow7(28)]-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
@@ -419,6 +465,7 @@
     [self layoutRowChildren:controlsRow4];
     [self layoutRowChildren:controlsRow5];
     [self layoutRowChildren:controlsRow6];
+    [self layoutRowChildren:controlsRow7];
 }
 
 - (NSView*)makeRow {
@@ -716,8 +763,13 @@
     // (see meshAnimationTemperature's doc comment in DocumentModel.h) --
     // same clamp DocumentModel.mm's -startMeshAnimationWithRedraw: itself
     // applies again defensively, so a stray 0 typed here can never crash.
+    self.documentModel.meshAnimationStyle = (GMMeshAnimationStyle)self.animStylePopup.indexOfSelectedItem;
     self.documentModel.meshAnimationMaxAmplitude = MAX(0.0, self.animAmplitudeField.doubleValue);
     self.documentModel.meshAnimationTemperature = MAX(0.01, self.animTemperatureField.doubleValue);
+    // No clamping here -- any real degree value is meaningful (cos/sin
+    // wrap around on their own), and this only affects Wave -- see
+    // meshAnimationWaveDirectionDegrees's doc comment in DocumentModel.h.
+    self.documentModel.meshAnimationWaveDirectionDegrees = self.animDirectionField.doubleValue;
     // 0 is a valid value here (disables the clearance check entirely,
     // falling back to literal-crossing-only) -- see
     // meshAnimationMinClearanceDistance's doc comment in DocumentModel.h.
