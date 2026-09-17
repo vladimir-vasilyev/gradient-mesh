@@ -300,21 +300,25 @@ static bool gmMeshHasCurvedSelfIntersection(const std::vector<Vec2>& pos, const 
 // exactly the property needed to turn correction into a continuous
 // per-vertex damping factor instead of a discrete in-the-set-or-not one.
 //
-// Deliberately DIFFERENT from gmMeshHasCurvedSelfIntersection in one
-// respect: self-loop (same-curve) pairs are folded into the SAME
-// distance-based margin as cross-edge pairs here, even though the exact
-// checker above uses a hard crossing-only test for them (see that
-// function's comment for why -- a slow-moving stretch of one smooth
-// curve can pass as close, in polyline-sample terms, as a real fold, so
-// treating closeness as a hard PASS/FAIL there gave false positives on
-// clean meshes). That reasoning doesn't carry over here: this function
-// only ever feeds a smoothstep that softly reduces amplitude, never a
-// hard pass/fail, so a self-loop stretch that merely LOOKS close costs
-// at worst a little unnecessary damping -- never a wrong hard rejection.
-// The false-positive-free self-loop test stays exactly as it was for the
-// actual pass/fail decision (the exact re-check kept in
-// -startMeshAnimationWithRedraw: after damping); this function's
-// self-loop numbers only ever feed how much to damp.
+// Same-curve (self-loop) pairs are SKIPPED entirely here, NOT folded
+// into the distance margin even softly -- an earlier version of this
+// function DID fold them in (reasoning that a smoothstep can only ever
+// over-damp, never mis-fire a hard rejection), but that was wrong in a
+// way that mattered in practice, not just in theory: a smoothly-curving
+// Bezier's own non-adjacent tessellation samples can sit closer together
+// than minClearanceDistance purely from sampling density, on the
+// UNDISTURBED base curve with zero animation displacement, once the
+// mesh is reasonably dense relative to the configured clearance
+// (confirmed directly: about half of a 9x9 test mesh's interior
+// vertices already read a sub-clearance margin at rest once cell size
+// drops to 10-20 units against a clearance of 1-2). Feeding that into
+// the smoothstep clamps damping toward 0 independent of phase -- which
+// looks exactly like "no animation visible, mesh frozen", a real
+// regression reported right after this design first shipped. Only
+// cross-edge (different-curve) pairs feed the continuous margin now; an
+// actual self-loop fold is still caught, just as before this whole
+// feature existed, by the exact crossing-only test in the retained
+// fallback stage below.
 //
 // `searchRadius` (>= minClearanceDistance) is the largest distance worth
 // reporting: once a vertex's margin reaches minClearanceDistance plus the
@@ -412,10 +416,7 @@ static void gmMeshComputeVertexClearanceMargins(const std::vector<Vec2>& pos, co
                     const Vec2& C0 = allSamples[(size_t)segFirstSample[(size_t)s2]];
                     const Vec2& C1 = allSamples[(size_t)segFirstSample[(size_t)s2] + 1];
                     if (e1 == e2) {
-                        int li1 = segLocalIndex[(size_t)s1], li2 = segLocalIndex[(size_t)s2];
-                        if (std::abs(li1 - li2) <= 1) continue;
-                        double d = gmSegmentSegmentDistance(A0, A1, C0, C1);
-                        noteDistance(edgeRefs[(size_t)e1], d);
+                        continue; // self-loop pairs excluded from the continuous margin -- see comment above
                     } else {
                         const GMEdgeCurveRef& r1 = edgeRefs[(size_t)e1];
                         const GMEdgeCurveRef& r2 = edgeRefs[(size_t)e2];
@@ -1541,17 +1542,23 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // How far beyond minClearanceDistance the continuous damping ramp
     // extends, as a multiple of minClearanceDistance itself (so it scales
     // with whatever clearance the user configured, same as the bucket
-    // grid's own padding does). Swept empirically (standalone harness,
-    // 9x9 mesh, amplitude 40-200, temperature 1-20, plus a large-tangent
-    // self-loop-prone mesh): 1.0 already leaves an occasional sub-3px
-    // residual snap on the worst tested case; 1.5 reduced snaps to zero
-    // on every scenario tried (normal, stress, extreme, self-loop-prone,
-    // and a larger 15x15 mesh) while still finishing FASTER than the
-    // discrete-correction-only design it replaces, since a frame that
-    // needs no correction now costs one extra O(mesh) pass instead of
-    // zero, but a frame that DID need correction no longer pays for a
-    // conflict-set growth loop plus a full bisection search.
-    static const double kAnimMarginTransitionWidthFactor = 1.5;
+    // grid's own padding does). Re-swept empirically (standalone harness,
+    // same battery as before: 9x9 mesh, amplitude 40-200, temperature
+    // 1-20, a large-tangent self-loop-prone mesh, a 15x15 scale check)
+    // AFTER fixing the self-loop margin bug above, since that bug was
+    // incidentally masking how much correction the real (uncapped)
+    // motion actually needs. 6.0 fully eliminates snaps for the exact
+    // scenario a user-reported trace first surfaced this whole feature's
+    // "bounce back" bug on (9x9, amplitude 40, temperature 1), and cuts
+    // them sharply everywhere else tried, at a precompute cost (~2.9s
+    // for that same 9x9 case) close to the discrete-correction-only
+    // design's own baseline (~2.6s) -- values much higher than 6 do keep
+    // reducing the (already rare) residual snaps further in more extreme
+    // synthetic stress scenarios, but at a steeper precompute cost this
+    // did not seem worth paying for cases well beyond what a real mesh
+    // animation is expected to need; can be revisited if a real report
+    // shows otherwise.
+    static const double kAnimMarginTransitionWidthFactor = 6.0;
     NSInteger frameCount = (NSInteger)std::lround(kTwoPi * 60.0); // one full sin() period at ~60fps
     frameCount = std::max((NSInteger)1, frameCount);
 
