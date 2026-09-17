@@ -693,7 +693,11 @@
         self.optimizeButton.enabled = YES;
         self.buildMeshButton.enabled = YES;
         self.statusLabel.stringValue = @"Animation stopped.";
-        [self.canvasView setNeedsDisplay:YES];
+        // -meshForReading now reads the real (never-touched) _mesh again --
+        // refresh the reconstruction preview back to it, or "Show
+        // reconstruction" would keep showing the last animated frame's
+        // stale raster/GPU buffers until some OTHER action refreshed it.
+        [self refreshActivePreview];
         return;
     }
     if (!self.documentModel.hasMesh) { self.statusLabel.stringValue = @"Build a mesh first."; return; }
@@ -706,7 +710,16 @@
     self.documentModel.meshAnimationTemperature = MAX(0.01, self.animTemperatureField.doubleValue);
     __weak typeof(self) weakSelf = self;
     [self.documentModel startMeshAnimationWithRedraw:^{
-        [weakSelf.canvasView setNeedsDisplay:YES];
+        // -refreshActivePreview is a cheap no-op when "Show reconstruction"
+        // is off (just a couple of property assignments); when it's on, it
+        // re-rasterizes (CPU) or re-uploads mesh buffers (GPU) from the
+        // CURRENT animated mesh every tick, so the reconstruction preview
+        // wiggles along with the mesh grid, not just the wireframe overlay.
+        // NOTE: the CPU raster path re-rasterizes the full target image
+        // every tick and can feel choppy at 60fps on a large photo --
+        // switch on "GPU (OpenGL)" for a smooth real-time reconstruction
+        // preview while animating.
+        [weakSelf refreshActivePreview];
     }];
     self.animateMeshButton.title = @"Stop Animation";
     self.optimizeButton.enabled = NO;

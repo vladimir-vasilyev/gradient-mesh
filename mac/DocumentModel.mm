@@ -1050,9 +1050,16 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 #pragma mark - Output
 
 - (NSImage*)renderReconstructionPreview {
-    if (!_mesh || !_hasImage) return nil;
-    Image rendered = _mesh->render((int)_target.width, (int)_target.height, 8);
-    // _mesh->render() fully patch-interpolates (Sec 3's Ferguson patches),
+    // See -meshForReading's comment: reads the animated preview mesh while
+    // isAnimatingMesh (so "Show reconstruction" actually animates along
+    // with the mesh grid, not just a frozen pre-animation render), the
+    // live-optimize snapshot while hasLivePreviewMesh, or the settled
+    // _mesh otherwise -- the same accessor every other mesh-reading method
+    // in this class already goes through.
+    const GradientMesh* m = [self meshForReading];
+    if (!m || !_hasImage) return nil;
+    Image rendered = m->render((int)_target.width, (int)_target.height, 8);
+    // GradientMesh::render() fully patch-interpolates (Sec 3's Ferguson patches),
     // producing per-pixel POINT VALUES throughout -- so, unlike Cu/Cv/Cuv,
     // the raster it returns is safe/correct to convert wholesale. Must run
     // before the clamped01() loop below (see that call's own note on why).
@@ -1099,16 +1106,20 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 }
 
 - (nullable GMGPUMeshBuffers*)gpuMeshBuffersWithSamplesPerPatchEdge:(NSInteger)samplesPerPatchEdge {
-    if (!_mesh) return nil;
-    gmcore::MeshRenderBuffers buf = gmcore::MeshRenderBuffers::build(*_mesh, (int)samplesPerPatchEdge);
+    // See -meshForReading's comment -- same "animated preview while
+    // isAnimatingMesh" routing -renderReconstructionPreview now uses, so
+    // the GPU preview animates along with the mesh grid too.
+    const GradientMesh* m = [self meshForReading];
+    if (!m) return nil;
+    gmcore::MeshRenderBuffers buf = gmcore::MeshRenderBuffers::build(*m, (int)samplesPerPatchEdge);
 
     // Mesh geometry (P) bounding box -- see GMGPUMeshBuffers.minX/etc's
     // doc comment; lets GLReconstructionView fit+center the mesh the same
     // way CanvasView's -imageDisplayRect letterboxes the CPU preview.
     double minX = 1e300, minY = 1e300, maxX = -1e300, maxY = -1e300;
-    for (int row = 0; row < _mesh->rows; ++row) {
-        for (int col = 0; col < _mesh->cols; ++col) {
-            const Vec2& p = _mesh->at(row, col).P;
+    for (int row = 0; row < m->rows; ++row) {
+        for (int col = 0; col < m->cols; ++col) {
+            const Vec2& p = m->at(row, col).P;
             minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
             minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
         }
