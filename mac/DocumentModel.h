@@ -376,26 +376,45 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // overlay and the SVG/PNG exporters both assume, and would make the
 // silhouette itself flicker, which reads as broken rather than lively.
 //
-// Collision handling: P_i(t) above is only the UNOBSTRUCTED target --
-// each tick checks whether moving vertex i in a straight line from its
-// current (possibly already-obstructed) position to that target would
-// cross any OTHER mesh edge (a straight segment between two grid-adjacent
-// vertices' CURRENT positions, the same connectivity CanvasView's
-// -drawMesh/-meshEdgeBezierFromRow:col:toRow:col: draw -- edges incident
-// to vertex i itself are never checked, since they share an endpoint with
-// it and always "touch" trivially). On a crossing, vertex i does not stop
-// dead: it keeps only the component of that tick's motion running ALONG
-// the obstructing edge (a "slide"), dropping the component that would
-// have crossed it, so it visibly slides along the obstacle instead of
-// clipping through it. Once the obstacle (itself possibly also animating)
-// moves clear, the vertex resumes tracking sin(t) directly. See
-// -animationTick: for the exact per-tick algorithm; this is a real-time
-// cosmetic effect, not a physically exact contact solver -- it does not
-// resolve simultaneous multi-edge contact (e.g. a vertex pinned into a
-// corner) beyond picking the single nearest crossing each tick, and a
-// very large amplitude/temperature relative to the mesh's own cell size
-// can still visibly distort the grid around a contact point rather than
-// producing a perfectly rigid-looking bounce.
+// Collision handling: P_i(t) above is only the UNOBSTRUCTED target,
+// resolved to an actual position in two stages every tick (see
+// -animationTick: for the exact algorithm):
+//
+// 1. Per-vertex slide (the original heuristic): checks whether moving
+// vertex i in a straight line from its current (possibly already-
+// obstructed) position to that target would cross any OTHER mesh edge (a
+// straight segment between two grid-adjacent vertices' CURRENT positions,
+// the same connectivity CanvasView's -drawMesh/
+// -meshEdgeBezierFromRow:col:toRow:col: draw). On a crossing, vertex i
+// keeps only the component of that tick's motion running ALONG the
+// obstructing edge, so it visibly slides along the obstacle instead of
+// clipping through it. This handles the common "one vertex approaches a
+// mostly-static wall" case well, but on its own is NOT sufficient: it
+// only ever compares one moving vertex's path against another edge's
+// FROZEN start-of-tick position, so it cannot see a crossing that emerges
+// purely from two DIFFERENT edges moving independently in the same tick
+// (which is the normal case once "Animate Mesh" is running -- every
+// interior vertex moves every tick).
+//
+// 2. Global safety net: after stage 1 produces a candidate position for
+// every vertex, the resulting candidate MESH (not just individual paths)
+// is checked for any self-intersection at all. If clean -- the common
+// case at reasonable amplitudes -- it's applied as-is, with no added
+// cost beyond that one check. If not, the tick's motion is scaled back
+// uniformly (binary search for the largest safe scale factor) until the
+// resulting mesh is clean again -- the pre-tick mesh is always known
+// clean by induction, so a safe scale factor always exists. This
+// GUARANTEES the mesh can never self-intersect, regardless of how many
+// vertices' simultaneous motion caused the near-miss (verified up to 5x
+// the mesh's own cell size during development). The trade-off: since the
+// scale-back applies to every vertex uniformly, not just the ones
+// actually involved in a near-miss, the whole mesh's motion can visibly
+// pause for a tick or a short run of ticks while a rare near-contact
+// resolves, rather than only the locally-affected vertices freezing. At
+// the default amplitude (8px against a typical 15-40px cell size) this
+// safety net essentially never engages -- it exists as a correctness
+// backstop for large amplitude/temperature settings, not a change to
+// normal behavior.
 @property (nonatomic, readonly) BOOL isAnimatingMesh;
 
 // Upper bound (image pixel units, same units as mesh vertex positions) on
@@ -438,7 +457,35 @@ typedef NS_ENUM(NSInteger, GMBoundarySide) {
 // every mesh-reading accessor above) goes back to reading the real _mesh,
 // which was never touched, so this is always a clean, exact revert to
 // exactly the pre-animation state. No-op if not currently animating.
+//
+// Also where the per-tick debug trace (see -exportMeshAnimationTraceToURL:
+// error: below) gets auto-exported, if autoExportDebugData is YES -- see
+// that method's comment for why it reuses this existing toggle rather than
+// a new one.
 - (void)stopMeshAnimation;
+
+// Writes a JSON trace of every tick of the animation run that just
+// finished (or is still running) -- one entry per tick, with its
+// timestamp, whether the per-vertex slide pass's candidate mesh had a
+// self-intersection before the global safety net ran (see isAnimatingMesh's
+// comment), whether the safety net had to scale that tick's motion back,
+// and (for a thinned subset of ticks, to keep file size reasonable: the
+// first tick, roughly every half-second afterward, and any tick with a
+// detected candidate self-intersection) every vertex's exact position that
+// tick. Same general JSON-to-a-file convention as -exportDebugDataToURL:
+// error: (git commit, mesh dimensions, etc.), but a separate file/method,
+// since this has nothing to do with the optimizer. Returns NO (with
+// *error set) if no animation has produced any trace data yet in this
+// session. See -autoExportMeshAnimationTraceIfEnabled (DocumentModel.mm)
+// for the automatic-on-stop path most callers will actually rely on
+// rather than calling this directly.
+- (BOOL)exportMeshAnimationTraceToURL:(NSURL*)url error:(NSError**)error;
+
+// Full path of the most recent successful mesh-animation-trace
+// auto-export (see -stopMeshAnimation/autoExportDebugData above), or nil
+// if none has happened yet this session -- same conventions as
+// lastDebugExportPath.
+@property (nonatomic, readonly, nullable) NSString* lastMeshAnimationTracePath;
 
 // --- Output ---
 - (nullable NSImage*)renderReconstructionPreview;
