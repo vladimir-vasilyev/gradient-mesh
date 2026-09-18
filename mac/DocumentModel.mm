@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <random>
 #include <limits>
+#include <cstdlib> // getenv, for the GM_ANIM_DISABLE_CONTINUOUS debug toggle
 
 using gmcore::Vec2;
 using gmcore::Color;
@@ -1404,6 +1405,18 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // meshAnimationMinClearanceDistance's own doc comment covers the
     // default and what it trades off.
     double minClearanceDistance = std::max(0.0, self.meshAnimationMinClearanceDistance);
+    // DIAGNOSTIC ONLY: when set, skips BOTH the continuous per-vertex
+    // damping stage and the post-process temporal smoothing stage below,
+    // leaving only the ORIGINAL (pre-this-session) exact-checker +
+    // conflict-set + bisection fallback as the sole correction mechanism.
+    // Lets a report of residual unevenness be isolated at the source:
+    // does the discrete-only design already look uneven for a given
+    // mesh/settings, or does the continuous/smoothing machinery introduce
+    // it? Toggle via an environment variable (Xcode scheme's Arguments/
+    // Environment panel, or `GM_ANIM_DISABLE_CONTINUOUS=1` before
+    // launching from Terminal) -- not exposed in the UI on purpose, since
+    // this is a debugging aid, not a real animation option.
+    BOOL debugDisableContinuousStages = (getenv("GM_ANIM_DISABLE_CONTINUOUS") != NULL);
     const double kTwoPi = 6.283185307179586;
     GMMeshAnimationStyle style = self.meshAnimationStyle;
     _animPhaseOffsets.assign((size_t)n, 0.0);
@@ -1622,31 +1635,33 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         GMAnimTraceFrame trace;
         trace.t = phase;
 
-        // --- Continuous stage: ALWAYS runs, every frame, before any
-        // discrete pass/fail check -- this is what makes a vertex's
-        // position a continuous function of phase with no "just joined/
-        // left the conflict set" jump (see gmMeshComputeVertexClearance
-        // Margins' comment for the full rationale). When nothing is
-        // close to anything, every margin is >= the search radius, every
-        // damping factor saturates to 1.0, and this is a no-op --
-        // `candidate` passes through unchanged, exactly as before this
-        // stage existed.
-        double transitionWidth = std::max(1e-6, minClearanceDistance * kAnimMarginTransitionWidthFactor);
-        transitionWidth = std::min(transitionWidth, kAnimMarginMaxTransitionWidthCellFactor * _animBucketCellSize);
-        double searchRadius = minClearanceDistance + transitionWidth;
-        std::vector<double> margins;
-        gmMeshComputeVertexClearanceMargins(candidate, _animBaseMesh, kAnimMarginSamplesPerEdge, _animBucketCellSize,
-                                             searchRadius, margins);
-        for (NSInteger i = 0; i < n; ++i) {
-            double m = margins[(size_t)i];
-            double tRamp = (m - minClearanceDistance) / transitionWidth;
-            tRamp = std::max(0.0, std::min(1.0, tRamp));
-            double damping = tRamp * tRamp * (3.0 - 2.0 * tRamp); // smoothstep
-            if (damping < 1.0) {
-                trace.dampedVertexCount++;
-                trace.worstDampingFactor = std::min(trace.worstDampingFactor, damping);
-                const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
-                candidate[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * damping;
+        // --- Continuous stage: ALWAYS runs (unless the debug toggle above
+        // disables it), every frame, before any discrete pass/fail check
+        // -- this is what makes a vertex's position a continuous function
+        // of phase with no "just joined/left the conflict set" jump (see
+        // gmMeshComputeVertexClearanceMargins' comment for the full
+        // rationale). When nothing is close to anything, every margin is
+        // >= the search radius, every damping factor saturates to 1.0,
+        // and this is a no-op -- `candidate` passes through unchanged,
+        // exactly as before this stage existed.
+        if (!debugDisableContinuousStages) {
+            double transitionWidth = std::max(1e-6, minClearanceDistance * kAnimMarginTransitionWidthFactor);
+            transitionWidth = std::min(transitionWidth, kAnimMarginMaxTransitionWidthCellFactor * _animBucketCellSize);
+            double searchRadius = minClearanceDistance + transitionWidth;
+            std::vector<double> margins;
+            gmMeshComputeVertexClearanceMargins(candidate, _animBaseMesh, kAnimMarginSamplesPerEdge, _animBucketCellSize,
+                                                 searchRadius, margins);
+            for (NSInteger i = 0; i < n; ++i) {
+                double m = margins[(size_t)i];
+                double tRamp = (m - minClearanceDistance) / transitionWidth;
+                tRamp = std::max(0.0, std::min(1.0, tRamp));
+                double damping = tRamp * tRamp * (3.0 - 2.0 * tRamp); // smoothstep
+                if (damping < 1.0) {
+                    trace.dampedVertexCount++;
+                    trace.worstDampingFactor = std::min(trace.worstDampingFactor, damping);
+                    const MeshVertex& base = _animBaseMesh.vertices[(size_t)i];
+                    candidate[(size_t)i] = base.P + (candidate[(size_t)i] - base.P) * damping;
+                }
             }
         }
 
@@ -1825,7 +1840,7 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // half-window 14, so there is real safety margin before this would
     // ever trade away correctness.
     static const int kAnimSmoothingHalfWindow = 8; // 17-tap circular moving average
-    if (frameCount >= (NSInteger)(2 * kAnimSmoothingHalfWindow + 1)) {
+    if (!debugDisableContinuousStages && frameCount >= (NSInteger)(2 * kAnimSmoothingHalfWindow + 1)) {
         std::vector<std::vector<Vec2>> smoothed((size_t)frameCount, std::vector<Vec2>((size_t)n));
         for (NSInteger k = 0; k < frameCount; ++k) {
             for (NSInteger i = 0; i < n; ++i) {
@@ -2031,6 +2046,13 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     };
 
     root[@"mesh"] = @{ @"rows": @(_animBaseMesh.rows), @"cols": @(_animBaseMesh.cols) };
+
+    // Whether GM_ANIM_DISABLE_CONTINUOUS was set for the run that produced
+    // this trace (see -startMeshAnimationWithRedraw:'s debug toggle
+    // comment) -- read fresh here since exporting can happen well after
+    // precompute; the value doesn't change mid-run, but re-reading keeps
+    // this honest without needing a stored ivar just for the export.
+    root[@"continuousStagesDisabledForDebug"] = @(getenv("GM_ANIM_DISABLE_CONTINUOUS") != NULL);
 
     long curveSelfIntersectionCount = 0;
     long bisectionEngagedCount = 0;
