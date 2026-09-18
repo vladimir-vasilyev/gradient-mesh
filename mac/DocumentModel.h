@@ -550,6 +550,27 @@ typedef NS_ENUM(NSInteger, GMMeshAnimationStyle) {
 // crossing only, same as before this property existed).
 @property (nonatomic, assign) double meshAnimationMinClearanceDistance;
 
+// DIAGNOSTIC ONLY: when YES, -startMeshAnimationWithRedraw: skips BOTH
+// the continuous per-vertex damping stage and the post-process temporal
+// smoothing stage, leaving only the ORIGINAL (pre-those-two-stages)
+// exact self-intersection checker + conflict-set/bisection fallback as
+// the sole correction mechanism. Added after a residual-unevenness
+// report was disputed by direct visual observation of the running app:
+// this lets that question be settled by watching the SAME real mesh in
+// both modes, without guessing from numeric instrumentation alone.
+// Mirrored by a checkbox on the "Animate Mesh" row (see
+// MainWindowController's -buildUI/-toggleAnimateMesh:) -- read (and
+// written into this property) each time animation is (re)started, same
+// "read once at start" convention as meshAnimationMaxAmplitude/
+// meshAnimationMinClearanceDistance above, so it can be flipped live in
+// a running app with no rebuild or relaunch: just tick the box and click
+// "Animate Mesh" again. Seeded at -init time from the
+// GM_ANIM_DISABLE_CONTINUOUS environment variable so an existing
+// invocation (Xcode scheme, script) keeps working, but the checkbox is
+// the primary way to use this now. Not a real animation option end
+// users should ever need to touch -- purely a debugging aid.
+@property (nonatomic, assign) BOOL meshAnimationDebugDisableContinuousStages;
+
 // Starts animating: snapshots the current mesh, samples a random
 // direction+amplitude per interior vertex (see isAnimatingMesh's comment),
 // and starts a ~60fps real-time timer that calls `redraw` every tick after

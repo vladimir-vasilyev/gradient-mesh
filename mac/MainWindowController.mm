@@ -92,6 +92,13 @@
 @property (nonatomic, strong) NSTextField* animTemperatureField;
 @property (nonatomic, strong) NSTextField* animDirectionField;
 @property (nonatomic, strong) NSTextField* animClearanceField;
+// Mirrors DocumentModel.meshAnimationDebugDisableContinuousStages -- see
+// that property's doc comment in DocumentModel.h. Read (like every other
+// field on the Animate Mesh row) at "Animate Mesh" press time
+// (-toggleAnimateMesh:), not live -- ticking it mid-animation has no
+// effect until the animation is (re)started, same convention as every
+// other control on this row.
+@property (nonatomic, strong) NSButton* animDisableContinuousCheckbox;
 @end
 
 @implementation MainWindowController
@@ -140,6 +147,11 @@
     // popup and a direction field to it would very likely overflow the
     // window at its minimum size.
     NSView* controlsRow7 = [self makeRow];
+    // Row 7b: a single debug checkbox for
+    // DocumentModel.meshAnimationDebugDisableContinuousStages -- kept as
+    // its own row, same reasoning as Row 7 itself, rather than crowding
+    // an already-busy row further.
+    NSView* controlsRow7b = [self makeRow];
 
     // --- Row 1: file + tool selection ---
     NSButton* openBtn = [self buttonTitled:@"Open Image…" action:@selector(openImage:)];
@@ -365,6 +377,27 @@
     for (NSView* v in @[animStyleLabel, self.animStylePopup, animDirectionLabel, self.animDirectionField, animStyleHintLabel])
         [controlsRow7 addSubview:v];
 
+    // --- Row 7b: debug-only "disable continuous stages" checkbox -- see
+    // DocumentModel.h's meshAnimationDebugDisableContinuousStages doc
+    // comment for what it does and why it exists (isolating a disputed
+    // residual-unevenness report). No target/action wired up, same as
+    // animStylePopup above -- only ever read at "Animate Mesh" press time
+    // (-toggleAnimateMesh:), not live. Off by default unless
+    // GM_ANIM_DISABLE_CONTINUOUS was set in the environment at launch --
+    // see DocumentModel -init.
+    self.animDisableContinuousCheckbox = [NSButton checkboxWithTitle:@"Debug: disable damping/smoothing (self-intersection check only)"
+                                                                target:nil action:nil];
+    self.animDisableContinuousCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+    self.animDisableContinuousCheckbox.state = self.documentModel.meshAnimationDebugDisableContinuousStages
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    NSTextField* animDisableContinuousHintLabel = [self makeLabel:
+        @"(isolates whether unevenness is inherent to the plain self-intersection guard, or introduced by damping/smoothing)"];
+    animDisableContinuousHintLabel.textColor = [NSColor secondaryLabelColor];
+    animDisableContinuousHintLabel.font = [NSFont systemFontOfSize:11];
+
+    for (NSView* v in @[self.animDisableContinuousCheckbox, animDisableContinuousHintLabel])
+        [controlsRow7b addSubview:v];
+
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
     self.canvasView.documentModel = self.documentModel;
@@ -438,11 +471,12 @@
     [content addSubview:controlsRow5];
     [content addSubview:controlsRow6];
     [content addSubview:controlsRow7];
+    [content addSubview:controlsRow7b];
     [content addSubview:canvasRow];
     [content addSubview:self.statusLabel];
 
     NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1, controlsRow1b, controlsRow2, controlsRow3, controlsRow4,
-                                                           controlsRow5, controlsRow6, controlsRow7, canvasRow, _statusLabel);
+                                                           controlsRow5, controlsRow6, controlsRow7, controlsRow7b, canvasRow, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1b]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow2]-8-|" options:0 metrics:nil views:views]];
@@ -451,11 +485,12 @@
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow5]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow6]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow7]-8-|" options:0 metrics:nil views:views]];
+    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow7b]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[canvasRow]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
         @"V:|-8-[controlsRow1(28)]-6-[controlsRow1b(28)]-6-[controlsRow2(28)]-6-[controlsRow3(28)]-6-[controlsRow4(28)]-6-[controlsRow5(28)]"
-        "-6-[controlsRow6(28)]-6-[controlsRow7(28)]-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
+        "-6-[controlsRow6(28)]-6-[controlsRow7(28)]-6-[controlsRow7b(28)]-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
     [self layoutRowChildren:controlsRow1];
@@ -466,6 +501,7 @@
     [self layoutRowChildren:controlsRow5];
     [self layoutRowChildren:controlsRow6];
     [self layoutRowChildren:controlsRow7];
+    [self layoutRowChildren:controlsRow7b];
 }
 
 - (NSView*)makeRow {
@@ -774,6 +810,12 @@
     // falling back to literal-crossing-only) -- see
     // meshAnimationMinClearanceDistance's doc comment in DocumentModel.h.
     self.documentModel.meshAnimationMinClearanceDistance = MAX(0.0, self.animClearanceField.doubleValue);
+    // See meshAnimationDebugDisableContinuousStages' doc comment in
+    // DocumentModel.h -- same "read once at (re)start" convention as
+    // every other field on this row, so ticking the box takes effect the
+    // next time "Animate Mesh" is (re)started, no rebuild required.
+    self.documentModel.meshAnimationDebugDisableContinuousStages =
+        (self.animDisableContinuousCheckbox.state == NSControlStateValueOn);
     __weak typeof(self) weakSelf = self;
     [self.documentModel startMeshAnimationWithRedraw:^{
         // -refreshActivePreview is a cheap no-op when "Show reconstruction"

@@ -700,6 +700,11 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         // curves coming closer than this (see
         // meshAnimationMinClearanceDistance's doc comment).
         self.meshAnimationMinClearanceDistance = 2.0;
+        // See meshAnimationDebugDisableContinuousStages' doc comment --
+        // seeded from the environment variable for compatibility, but the
+        // checkbox mirroring this property (read fresh at each "Animate
+        // Mesh" click) is what actually matters for day-to-day use.
+        self.meshAnimationDebugDisableContinuousStages = (getenv("GM_ANIM_DISABLE_CONTINUOUS") != NULL);
     }
     return self;
 }
@@ -1405,18 +1410,26 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     // meshAnimationMinClearanceDistance's own doc comment covers the
     // default and what it trades off.
     double minClearanceDistance = std::max(0.0, self.meshAnimationMinClearanceDistance);
-    // DIAGNOSTIC ONLY: when set, skips BOTH the continuous per-vertex
+    // DIAGNOSTIC ONLY: when YES, skips BOTH the continuous per-vertex
     // damping stage and the post-process temporal smoothing stage below,
     // leaving only the ORIGINAL (pre-this-session) exact-checker +
     // conflict-set + bisection fallback as the sole correction mechanism.
     // Lets a report of residual unevenness be isolated at the source:
     // does the discrete-only design already look uneven for a given
     // mesh/settings, or does the continuous/smoothing machinery introduce
-    // it? Toggle via an environment variable (Xcode scheme's Arguments/
-    // Environment panel, or `GM_ANIM_DISABLE_CONTINUOUS=1` before
-    // launching from Terminal) -- not exposed in the UI on purpose, since
-    // this is a debugging aid, not a real animation option.
-    BOOL debugDisableContinuousStages = (getenv("GM_ANIM_DISABLE_CONTINUOUS") != NULL);
+    // it? Read once, here, same "read once at start" convention as
+    // maxAmplitude/minClearanceDistance above -- see
+    // meshAnimationDebugDisableContinuousStages' doc comment in
+    // DocumentModel.h and MainWindowController's -toggleAnimateMesh: for
+    // how the checkbox driving it works, letting this be flipped live in
+    // a running app (tick the box, click "Animate Mesh" again) instead of
+    // needing a relaunch with a different environment variable. A single
+    // BOOL check here (and one more below, at the smoothing stage) costs
+    // nothing regardless of mesh size -- what actually matters for
+    // performance is whether the much heavier
+    // gmMeshComputeVertexClearanceMargins/smoothing-window work runs at
+    // all, not the cost of the check gating it.
+    BOOL debugDisableContinuousStages = self.meshAnimationDebugDisableContinuousStages;
     const double kTwoPi = 6.283185307179586;
     GMMeshAnimationStyle style = self.meshAnimationStyle;
     _animPhaseOffsets.assign((size_t)n, 0.0);
@@ -2047,12 +2060,15 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
 
     root[@"mesh"] = @{ @"rows": @(_animBaseMesh.rows), @"cols": @(_animBaseMesh.cols) };
 
-    // Whether GM_ANIM_DISABLE_CONTINUOUS was set for the run that produced
-    // this trace (see -startMeshAnimationWithRedraw:'s debug toggle
-    // comment) -- read fresh here since exporting can happen well after
-    // precompute; the value doesn't change mid-run, but re-reading keeps
-    // this honest without needing a stored ivar just for the export.
-    root[@"continuousStagesDisabledForDebug"] = @(getenv("GM_ANIM_DISABLE_CONTINUOUS") != NULL);
+    // Whether the debug checkbox ("Disable damping/smoothing" on the
+    // Animate Mesh row -- see meshAnimationDebugDisableContinuousStages'
+    // doc comment in DocumentModel.h) was on for the run that produced
+    // this trace. Reading self.meshAnimationDebugDisableContinuousStages
+    // here is still exactly the value this run used: nothing between the
+    // top of this method and this export call ever writes that property
+    // -- it's only ever written by -toggleAnimateMesh:, at the START of a
+    // (re)start, never mid-run.
+    root[@"continuousStagesDisabledForDebug"] = @(self.meshAnimationDebugDisableContinuousStages);
 
     long curveSelfIntersectionCount = 0;
     long bisectionEngagedCount = 0;
