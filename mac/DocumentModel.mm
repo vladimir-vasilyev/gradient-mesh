@@ -1765,11 +1765,66 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         _animCachedFrames[(size_t)k] = std::move(candidate);
     }
 
-    // --- Post-process temporal smoothing stage: see this method's
-    // "post-process temporal smoothing" comment above for the full
-    // root-cause analysis and empirical justification. Runs once, after
-    // every frame above has already been computed and verified.
-    static const int kAnimSmoothingHalfWindow = 2; // 5-tap circular moving average
+    // --- Post-process temporal smoothing stage -----------------------
+    // Third distinct animation defect, reported right after the previous
+    // Wave-jerking fix (7bdd524) shipped: "vertices move in jerks, not
+    // smoothly". Diagnosed from a user-provided real trace: neither a
+    // "snap" (large single-frame jump) nor a "reversal" (>120-degree
+    // direction change over 3 frames) appeared anywhere in it, yet the
+    // motion still looked jerky.
+    //
+    // Root cause, confirmed via a new detector (vector velocity/
+    // acceleration/jerk from central differences on raw x,y, not on
+    // displacement magnitude, which has its own spurious cusp at
+    // zero-crossings unrelated to any real non-smoothness):
+    // gmMeshComputeVertexClearanceMargins reports each vertex's distance
+    // to its CLOSEST nearby edge -- a minimum over several independently-
+    // moving smooth distance functions. Such a minimum is only piecewise
+    // smooth: its derivative has a genuine corner every time the identity
+    // of the closest edge switches. Since the continuous damping stage
+    // above multiplies displacement by smoothstep(margin) directly, every
+    // one of those corners becomes a real jump in the vertex's own
+    // acceleration -- invisible to both existing detectors, since it never
+    // produces a large position delta or a sharp reversal by itself.
+    // Retuning the transition width (tried first) does not fix this: it
+    // only relocates/rescales where in "margin space" the corners occur,
+    // and in some configurations sharpens them further (verified
+    // empirically across the same multi-style battery used for the
+    // previous two animation fixes) -- the corners are inherent to using a
+    // hard min() at all, not to how wide the ramp around it is.
+    //
+    // The fix is a lightweight, CIRCULAR moving-average filter over the
+    // already fully-precomputed, already collision-verified trajectory --
+    // viable specifically because the whole loop is computed up front
+    // before a single frame is ever displayed, and because the loop is
+    // periodic (frame 0 continues seamlessly from the last frame), so a
+    // circular window has no start/end edge artifacts. This is strictly a
+    // cosmetic pass: a frame's vertex positions are only ever replaced
+    // with an average of nearby (already-safe) frames, and every
+    // replacement is re-verified against the SAME exact, zero-false-
+    // positive checker used everywhere else in this method before being
+    // accepted -- any frame where smoothing would reintroduce a violation
+    // simply keeps its original (already safe) positions instead, so this
+    // can never make correctness worse, only leave some frames
+    // un-smoothed. Boundary vertices are excluded, same as every other
+    // stage in this method.
+    //
+    // Window size: first shipped at 2 (a 5-tap filter), swept only against
+    // synthetic test meshes (a clean uniform grid with a little tangent
+    // jitter). A user follow-up report showed that window measurably
+    // helped (peak per-vertex acceleration on the affected row dropped
+    // from ~27x to ~17x a smooth sine's baseline) but didn't fully remove
+    // the jerk -- their REAL mesh (an actual optimized reconstruction, far
+    // more irregular tangents than the synthetic proxy) has more frequent,
+    // sharper margin arg-min switches than a 5-tap average can cancel.
+    // Re-swept directly against that real mesh's own geometry (extracted
+    // from the user's own debug export): 8 (a 17-tap filter) drives peak
+    // acceleration under 5.3x baseline and the spike-affected-vertex count
+    // to 0 even at a demanding clearance setting, with zero frames ever
+    // needing to revert -- and reverts stayed at zero even swept up to
+    // half-window 14, so there is real safety margin before this would
+    // ever trade away correctness.
+    static const int kAnimSmoothingHalfWindow = 8; // 17-tap circular moving average
     if (frameCount >= (NSInteger)(2 * kAnimSmoothingHalfWindow + 1)) {
         std::vector<std::vector<Vec2>> smoothed((size_t)frameCount, std::vector<Vec2>((size_t)n));
         for (NSInteger k = 0; k < frameCount; ++k) {
