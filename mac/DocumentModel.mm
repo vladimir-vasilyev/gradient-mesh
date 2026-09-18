@@ -462,6 +462,15 @@ struct GMAnimTraceFrame {
     // everything on its own.
     int dampedVertexCount = 0;    // vertices whose continuous damping factor was < 1.0 this frame
     double worstDampingFactor = 1.0; // smallest continuous damping factor applied this frame (1.0 = none)
+    // A third, separate mechanism (see -startMeshAnimationWithRedraw:'s
+    // "post-process temporal smoothing" comment): a circular moving-average
+    // pass applied AFTER the continuous damping stage and exact-checker
+    // fallback above have already produced this frame's positions. Distinct
+    // from both: it never runs per-vertex, only whole-frame (either the
+    // smoothed frame passes the same exact checker everyone else uses, or
+    // this frame keeps its original positions unchanged).
+    bool smoothingApplied = false;  // this frame's positions were replaced by the smoothed average
+    bool smoothingReverted = false; // smoothing was computed but rejected -- would have reintroduced a violation
     std::vector<Vec2> positions; // this frame's final (possibly corrected) vertex positions -- always recorded
 };
 
@@ -1756,6 +1765,40 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         _animCachedFrames[(size_t)k] = std::move(candidate);
     }
 
+    // --- Post-process temporal smoothing stage: see this method's
+    // "post-process temporal smoothing" comment above for the full
+    // root-cause analysis and empirical justification. Runs once, after
+    // every frame above has already been computed and verified.
+    static const int kAnimSmoothingHalfWindow = 2; // 5-tap circular moving average
+    if (frameCount >= (NSInteger)(2 * kAnimSmoothingHalfWindow + 1)) {
+        std::vector<std::vector<Vec2>> smoothed((size_t)frameCount, std::vector<Vec2>((size_t)n));
+        for (NSInteger k = 0; k < frameCount; ++k) {
+            for (NSInteger i = 0; i < n; ++i) {
+                if (_animBaseMesh.vertices[(size_t)i].isBoundary) {
+                    smoothed[(size_t)k][(size_t)i] = _animBaseMesh.vertices[(size_t)i].P;
+                    continue;
+                }
+                Vec2 sum(0.0, 0.0);
+                for (int d = -kAnimSmoothingHalfWindow; d <= kAnimSmoothingHalfWindow; ++d) {
+                    NSInteger kk = ((k + d) % frameCount + frameCount) % frameCount;
+                    sum = sum + _animCachedFrames[(size_t)kk][(size_t)i];
+                }
+                smoothed[(size_t)k][(size_t)i] = sum * (1.0 / (double)(2 * kAnimSmoothingHalfWindow + 1));
+            }
+        }
+        for (NSInteger k = 0; k < frameCount; ++k) {
+            if (gmMeshHasCurvedSelfIntersection(smoothed[(size_t)k], _animBaseMesh, kAnimSamplesPerEdge,
+                                                 _animBucketCellSize, minClearanceDistance,
+                                                 nullptr, nullptr, nullptr, nullptr)) {
+                _animTraceFrames[(size_t)k].smoothingReverted = true;
+                continue; // keep the original, already-verified-safe frame
+            }
+            _animTraceFrames[(size_t)k].smoothingApplied = true;
+            _animCachedFrames[(size_t)k] = smoothed[(size_t)k];
+            _animTraceFrames[(size_t)k].positions = smoothed[(size_t)k];
+        }
+    }
+
     // Export the just-finished precompute's trace right away -- there's no
     // later "run just stopped" moment to hang this off of anymore, since
     // the whole loop (and its trace) is already fully known at this point,
@@ -1941,6 +1984,8 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
     long dampedFrameCount = 0;
     int worstDampedVertexCount = 0;
     double worstDampingFactorOverall = 1.0;
+    long smoothingAppliedFrameCount = 0;
+    long smoothingRevertedFrameCount = 0;
     NSNumber* firstEventFrame = nil;
     for (size_t i = 0; i < _animTraceFrames.size(); ++i) {
         const GMAnimTraceFrame& f = _animTraceFrames[i];
@@ -1954,6 +1999,8 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         if (f.dampedVertexCount > 0) dampedFrameCount++;
         worstDampedVertexCount = std::max(worstDampedVertexCount, f.dampedVertexCount);
         worstDampingFactorOverall = std::min(worstDampingFactorOverall, f.worstDampingFactor);
+        if (f.smoothingApplied) smoothingAppliedFrameCount++;
+        if (f.smoothingReverted) smoothingRevertedFrameCount++;
     }
     root[@"animation"] = @{
         @"maxAmplitude": @(self.meshAnimationMaxAmplitude),
@@ -1988,6 +2035,19 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         @"dampedFrameCount": @(dampedFrameCount),
         @"worstDampedVertexCount": @(worstDampedVertexCount),
         @"worstDampingFactor": @(worstDampingFactorOverall),
+        // The post-process temporal smoothing stage's own activity (see
+        // -startMeshAnimationWithRedraw:'s "post-process temporal
+        // smoothing" comment) -- a frame counts toward EITHER
+        // smoothingAppliedFrameCount (its positions were replaced by the
+        // circular moving average) OR smoothingRevertedFrameCount (a
+        // smoothed version was computed but rejected because it would have
+        // reintroduced a violation, so the original positions were kept),
+        // never both. A run where smoothingRevertedFrameCount is 0 means
+        // this pass never had to compromise -- it either smoothed a frame
+        // outright or left it alone, but never came close to a real
+        // conflict.
+        @"smoothingAppliedFrameCount": @(smoothingAppliedFrameCount),
+        @"smoothingRevertedFrameCount": @(smoothingRevertedFrameCount),
     };
 
     NSMutableArray<NSDictionary*>* framesJSON = [NSMutableArray arrayWithCapacity:_animTraceFrames.size()];
@@ -2005,6 +2065,8 @@ static NSString* gmRunGit(NSString* repoRoot, NSArray<NSString*>* args) {
         fj[@"affectedVertexCount"] = @(f.affectedVertexCount);
         fj[@"dampedVertexCount"] = @(f.dampedVertexCount);
         fj[@"worstDampingFactor"] = @(f.worstDampingFactor);
+        fj[@"smoothingApplied"] = @(f.smoothingApplied);
+        fj[@"smoothingReverted"] = @(f.smoothingReverted);
         // Always present now -- every frame in the (bounded, few-hundred-
         // entry) precomputed loop is recorded in full, no thinning policy
         // needed anymore (see GMAnimTraceFrame's comment).
