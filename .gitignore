@@ -5,3 +5,4 @@ xcuserdata/
 .DS_Store
 build_xcode/
 out/
+spike/ceres_joint_drift_probe_output.txt
