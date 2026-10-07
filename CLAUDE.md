@@ -10,13 +10,13 @@ Guidance for Claude Code when working in this repository. Read this first; the l
 interactive macOS app (AppKit, Objective-C++). The goal is **maximum fidelity to the paper**; every
 deviation is documented in the development log under "Known simplifications vs. the paper".
 
-| Path | What | Compiles in a Linux cloud session? |
+| Path | What | Builds where |
 |---|---|---|
-| `core/` (`gmcore`) | Portable algorithm library: mesh, optimiser, Bézier fitting, Lazy-Snapping segmentation, SVG export | **Yes** |
-| `core/tests/test_main.cpp` | `gmcore_tests`, dependency-free regression suite | **Yes** |
-| `cli/main_cli.cpp` | `gmesh_cli` command-line harness | **Yes** |
-| `mac/*.mm`, `mac/*.h` | The AppKit app (`DocumentModel`, `MainWindowController`, `CanvasView`, `GLReconstructionView`) | **No** — needs macOS + Xcode |
-| `core/src/MeshOptimizerCeres.cpp` | Optional Ceres solvers | Only if Ceres is installed (it is not by default; an empty translation unit otherwise) |
+| `core/` (`gmcore`) | Portable algorithm library: mesh, optimiser, Bézier fitting, Lazy-Snapping segmentation, SVG export | macOS and Linux |
+| `core/tests/test_main.cpp` | `gmcore_tests`, dependency-free regression suite | macOS and Linux |
+| `cli/main_cli.cpp` | `gmesh_cli` command-line harness | macOS and Linux |
+| `mac/*.mm`, `mac/*.h` | The AppKit app (`DocumentModel`, `MainWindowController`, `CanvasView`, `GLReconstructionView`) | macOS only (Xcode toolchain) |
+| `core/src/MeshOptimizerCeres.cpp` | Optional Ceres solvers | Only if CMake finds Ceres (an empty translation unit otherwise) |
 | `spike/` | Ceres experiments and probes | n/a |
 
 ## Working with the user
@@ -28,49 +28,55 @@ deviation is documented in the development log under "Known simplifications vs. 
   1. regression tests, 2. accuracy against the paper, 3. a real selection tool. **One task at a
   time: implement, debug, commit.** Items 1–3 are done; the user has since been steering work on
   "Animate Mesh" directly. Do not start unrequested side-quests.
-- He tests on his own Mac in Xcode and reports back, often with exported debug JSON. **When what he
-  sees contradicts your analysis, believe the observation** and build an experiment that settles it
+- You run on his MacBook and can build; but **you cannot see the running app**. Visual judgement (is the
+  animation smooth? does the preview look right?) is his, usually reported with exported debug JSON.
+  **When what he sees contradicts your analysis, believe the observation** and build an experiment that settles it
   (see the debug toggle below) instead of arguing from numeric proxies.
 - Be honest about what was and was not verified. Say so in the reply and in the commit message.
 
-## Build, test, run (verified on Linux, GCC 13)
+## Environment, build and test
+
+This project runs in **Claude Code on the user's MacBook**, which has Xcode. Confirm at the start of a
+session with `xcodebuild -version` and `cmake --version`. (Earlier work was done in a Linux sandbox
+with no Xcode, which is why much of the history says "unverified until a real Xcode build" and why
+the log describes a "literal extraction" test method. **That limitation no longer applies here:
+compile every `mac/` change.**)
 
 ```sh
+# library, CLI and regression tests
 cmake -B build . && cmake --build build -j --target gmcore_tests gmesh_cli
-./build/gmcore_tests                      # expect: ALL TESTS PASSED (20 cases / 3387 checks at the time of writing)
+./build/gmcore_tests        # expect: ALL TESTS PASSED (20 cases / 3387 checks at the time of writing)
 ./build/gmesh_cli --input gradient.png --rows 9 --cols 9 --pyramid-levels 4 --margin 0 --out-prefix demo
+
+# the macOS app (CMake generates the Xcode project; app is only configured on Apple platforms)
+cmake -B build . && cmake --build build --config Release --target GradientMeshStudio
+open build/GradientMeshStudio.app
+# or: cmake -G Xcode -B build_xcode . && open build_xcode/GradientMeshStudio.xcodeproj   (⌘R)
 ```
 
-- The cloud image has CMake, g++ and libpng; **Ceres is not installed**.
-- macOS app (user's machine only): `cmake -G Xcode -B build_xcode . && open build_xcode/GradientMeshStudio.xcodeproj`.
-- **Run `gmcore_tests` after every `core/` change** and add a test for new core behaviour. Nothing
-  else builds `gmesh_cli` automatically, and it silently stopped compiling once already
-  (`buildInitial` changed to take `BezierSpline`); rebuild it too when you change `GradientMesh`/
-  `MeshOptimizer` signatures. There is no CI yet — adding one would be a good first task if asked.
+(The app commands were verified by the user in Xcode; the `cmake --build ... --target GradientMeshStudio`
+line has not been run from a Claude Code session yet — if it needs adjusting, fix this file.)
 
-## The hard constraint: you cannot compile `mac/*.mm`
+- Ceres is optional. If it is installed (e.g. via Homebrew), CMake prints "Ceres found" and the Ceres
+  solver modes become available; otherwise `MeshOptimizerCeres.cpp` compiles to nothing.
+- **Run `gmcore_tests` after every `core/` change** and add a test for new core behaviour. Also rebuild
+  `gmesh_cli` and the app: `gmesh_cli` silently stopped compiling once (`buildInitial` changed to take
+  `BezierSpline`) because nothing builds it automatically. There is no CI yet; adding one would be a
+  good task if asked.
+- For fast numeric experiments on Animate Mesh logic, it is still handy to extract the pure C++ part of
+  `-startMeshAnimationWithRedraw:` into a standalone harness compiled against `core/include` (copy the
+  exact text with a script, never retype it) — but a real Xcode build is now the source of truth.
+- When patching with scripts, use `assert text.count(old) == 1` per replacement so a stale anchor fails
+  loudly. Put the full explanation (root cause, why this fix, what was measured) **in the code comment**
+  of the shipped file, not only in a script or commit message.
 
-There is no Objective-C++/AppKit/OpenGL toolchain in the cloud. Therefore:
+## Git
 
-1. Keep algorithmic logic in `core/` (pure C++) whenever possible so it can be compiled and tested.
-2. For logic that must live in `mac/*.mm` (e.g. the Animate Mesh loop in `DocumentModel.mm`), use
-   **literal extraction**: copy the *exact* patched text out of the `.mm` with a script (anchor-based
-   string slicing — never retype it) into a small `FakeDocumentModel`-style harness (ivars as
-   struct members, `typedef long NSInteger;`), compile it with `g++ -std=c++17 -Icore/include`
-   against the real `gmcore` headers, and run it on realistic meshes **before** committing.
-3. For pure UI/AppKit edits, review the diff carefully and check `{}`/`()`/`[]` balance. Say in the
-   commit message that it is uncompiled and ask the user to build in Xcode.
-4. When patching, use a Python string-replacement script with `assert text.count(old) == 1` per
-   replacement, so a stale anchor fails loudly instead of editing the wrong place.
-5. Put the full explanation (root cause, why this fix, what was measured) **in the code comment**
-   in the shipped file — once the essay ended up only in a patch script and never in the code.
-
-## Delivering changes (Code project, no device bridge)
-
-You cannot touch the user's Mac files from here. Work on a branch and open a PR (or push as
-instructed); the user pulls and builds. The local branch on his Mac is `master` and the
-remote branch is `origin/main` (`git push origin master:main`); he does his own pushes unless access is granted.
-Commits: one task per commit, message explains *why*, follow the attribution trailer the harness gives.
+Repo root is the project folder (on the user's Mac: `~/Downloads/GradientMeshStudio`). Local branch
+`master`; GitHub remote `origin` is `https://github.com/vladimir-vasilyev/gradient-mesh` with its branch
+`main` (`git push origin master:main`). One task per commit; the message explains *why* and states what
+was and was not verified; follow the attribution trailer the harness gives. **Do not push unless asked.**
+Never commit generated output (`build/`, `build_xcode/`, `out/`, `DebugOut/` are ignored or untracked).
 
 ## Code conventions
 
@@ -113,7 +119,8 @@ Lessons already paid for:
 
 ### Analysing the user's exports
 
-He uploads JSON from his `DebugOut/` folder: `gm_meshanim_<r>x<c>_<ts>.json` (animation trace:
+The app writes JSON into a `DebugOut/` folder next to the loaded image (the user has used `~/Documents/DebugOut`
+and `~/Downloads/DebugOut`) — read them straight from disk, or he may point you at a file: `gm_meshanim_<r>x<c>_<ts>.json` (animation trace:
 `animation` summary, per-frame `frames`, `git`, `mesh` = rows/cols only) and
 `gm_debug_<solver>[_cieluv]_<r>x<c>_<ts>.json` (optimiser debug dump, **with** vertex geometry).
 **Check `git.commit` / `git.dirty` first** to know which code produced a trace. Note that the actual
@@ -126,8 +133,10 @@ remove an assumption; consider adding it.
   ON (original discrete-only behaviour)? He disputed the "vertex 13 margin reaches ~0 against fixed
   boundary edge (5,6)" diagnosis, which was computed with an *assumed* clearance. Do not re-assert or
   retract it until his result arrives.
-- A new "Row 7b" was added to the Animate Mesh UI and `window.minSize` (720×560) was not adjusted;
-  the user should check the layout at minimum size.
+- **First task for a new session: build the app.** The last Animate Mesh commits (the checkbox and a new
+  "Row 7b" in `MainWindowController.mm`, plus the `GM_ANIM_DISABLE_CONTINUOUS`/property plumbing in
+  `DocumentModel`) were written without ever being compiled. Build with Xcode/CMake, fix any errors,
+  and note that `window.minSize` (720×560) was not adjusted for the extra row — the user checks the layout.
 - Housekeeping done recently: README rewritten (old one is `docs/DEVELOPMENT_LOG.md`), MIT `LICENSE`
   added, `.gitignore` extended. Still to do on GitHub by the user: repo description/topics and the
   social-preview image (`docs/media/social-preview.png`).
