@@ -11,8 +11,9 @@
 [![Platforms](https://img.shields.io/badge/core-Linux%20%7C%20macOS-lightgrey)](#how-to-build)
 [![App](https://img.shields.io/badge/app-macOS%2012%2B%20(AppKit)-black?logo=apple)](#build-the-macos-app)
 [![Tests](https://img.shields.io/badge/regression%20suite-gmcore__tests-brightgreen)](#testing)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Contents:** [Features](#features) · [Demo](#demo) · [Dependencies](#dependencies) · [How to Build](#how-to-build) · [Usage](#usage) · [How it works](#how-it-works) · [Project layout](#project-layout) · [Testing](#testing) · [Known limitations](#known-limitations) · [FAQ](#faq) · [Citation](#citation)
+**Contents:** [Features](#features) · [Demo](#demo) · [Dependencies](#dependencies) · [How to Build](#how-to-build) · [Usage](#usage) · [How it works](#how-it-works) · [Project layout](#project-layout) · [Testing](#testing) · [Known limitations](#known-limitations) · [FAQ](#faq) · [Citation](#citation) · [License](#license)
 
 ---
 
@@ -263,3 +264,7 @@ If you use the algorithm, cite the original paper:
   note    = {SIGGRAPH 2007}
 }
 ```
+
+## License
+
+Released under the [MIT License](LICENSE). The algorithm is from the paper cited above; the code in this repository is original.
