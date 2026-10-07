@@ -1,103 +1,101 @@
-# Gradient Mesh Studio
+# Gradient Mesh C++ Implementation
 
-A from-scratch C++ implementation of the algorithm from **Jian Sun, Lin Liang, Fang Wen,
-Heung-Yeung Shum, "Image Vectorization using Optimized Gradient Meshes,"
-ACM Transactions on Graphics 26(3), 2007** (SIGGRAPH 2007), plus an interactive
-macOS front-end (AppKit, Objective-C++) built as an Xcode project via CMake.
+**Gradient Mesh Studio** — an open-source, from-scratch **C++17 implementation of image vectorization with optimized gradient meshes** (Sun, Liang, Wen & Shum, *ACM Transactions on Graphics* 2007), with an interactive macOS app and **SVG2 `<meshgradient>` export**. It turns a raster image into an editable, resolution-independent gradient mesh: a grid of control points, each carrying a position *and* a colour, joined by smooth bicubic (Ferguson/Hermite) patches and fitted to the picture by minimising reconstruction error.
 
-The paper turns a raster image into an editable, scalable **gradient mesh**: a grid of
-control points, each carrying a position *and* a color, connected by curved
-(Ferguson/Hermite) patches, fitted to the image by minimizing reconstruction error.
+![Gradient Mesh Studio animating a fitted gradient mesh: control points and patch edges move over the smooth reconstruction](docs/media/hero-animated-mesh.gif)
 
-> **Update:** an earlier version of this project had internal mesh-lines stay
-> essentially rectangular instead of bending to follow color/gradient boundaries inside
-> the image, as they should (the *outer* silhouette boundary was already curving
-> correctly). Root-caused and fixed against a real test image with a sharp internal
-> boundary (`gradient.png`) -- see "Known simplifications" below (the
-> `computeGeometryEnergy` / line-search bug) and the new `smoothWeightGeom` default in
-> `MeshOptimizer.h`. If you pulled this project before that fix, rebuild.
+<sub>The macOS app animating a fitted gradient mesh (control points and patch edges drawn over the reconstruction).</sub>
 
-## What's in here
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B&logoColor=white)](https://en.cppreference.com/w/cpp/17)
+[![CMake](https://img.shields.io/badge/build-CMake%203.16%2B-064F8C?logo=cmake&logoColor=white)](https://cmake.org/)
+[![Platforms](https://img.shields.io/badge/core-Linux%20%7C%20macOS-lightgrey)](#how-to-build)
+[![App](https://img.shields.io/badge/app-macOS%2012%2B%20(AppKit)-black?logo=apple)](#build-the-macos-app)
+[![Tests](https://img.shields.io/badge/regression%20suite-gmcore__tests-brightgreen)](#testing)
 
-```
-GradientMeshStudio/
-  core/                  gmcore: the portable C++17 algorithm library (no GUI, no
-                          external dependencies beyond an optional system libpng)
-    include/gmcore/*.h
-    src/*.cpp
-    tests/test_main.cpp  gmcore_tests: permanent regression suite (see "Regression
-                          tests" below) -- run this after any core/ change
-  cli/main_cli.cpp        gmesh_cli: dependency-free command-line test harness
-  mac/                    GradientMeshStudio.app: the interactive AppKit UI
-                          (Objective-C++, macOS-only)
-  CMakeLists.txt          builds gmcore + gmesh_cli + gmcore_tests everywhere;
-                          builds the macOS app bundle only when configured on
-                          Apple platforms
-```
+**Contents:** [Features](#features) · [Demo](#demo) · [Dependencies](#dependencies) · [How to Build](#how-to-build) · [Usage](#usage) · [How it works](#how-it-works) · [Project layout](#project-layout) · [Testing](#testing) · [Known limitations](#known-limitations) · [FAQ](#faq) · [Citation](#citation)
 
-## Regression tests
+---
 
-```sh
-cmake -B build . && cmake --build build -j --target gmcore_tests
-./build/gmcore_tests
-```
+## Features
 
-`core/tests/test_main.cpp` is a small, dependency-free suite (no external test
-framework -- same "no external dependency" convention as the rest of `gmcore`,
-see `SparseBlockSolver.h`'s header comment) covering: `CubicBezier`
-endpoints/closest-point and `fitCubicBezier`; `srgbToCIELUV`/`cieluvToSRGB`
-round-tripping; `GradientMesh::evalPos`/`evalColor`'s exact Hermite-corner
-property; that geometry twist (`Puv`) stays fixed at `{0,0}` regardless of
-whatever is stored in `MeshVertex::Puv` (a paper-fidelity regression --
-Sec. 3's "muv... usually set to zero"); `MeshRenderBuffers::build()` against
-`GradientMesh`'s own `evalPos`/`evalColor` (promoted from an earlier ad hoc,
-throwaway verification program used once during the GPU-preview work);
-`SparseBlockSolver.h`'s block-sparse PCG against an independent dense
-reference solve; `Image`'s row-0-at-top addressing convention; the optimizer
-actually reducing RMSE while keeping the 4 mesh corners hard-fixed; boundary
-vertices staying on their spline after optimizing; and an `SVGExporter` smoke
-test. Exists because this project's development environment has no
-Objective-C++/AppKit compiler at all (only `g++` on Linux) -- every
-`mac/*.mm`/`.h` change ships genuinely unverified until a real Xcode build
-runs, but the pure-C++ `core/` library CAN be compiled and run right here, and
-this project's history (see the bug-fix sections below) is full of real bugs
-this suite would have caught in seconds instead of needing a human to notice a
-washed-out preview or a mirrored image. Meant to be re-run after every
-`core/` change from now on, not just written once and left to bit-rot.
+**Algorithm library (`gmcore`) — portable C++17, no GUI, no required third-party dependencies**
 
-First real run of this suite immediately found one thing: `ColorSpace.h`'s
-`cieluvToSRGB` doc comment claimed round-tripping "to within floating-point
-precision," but a 1e-9-tolerance check failed on 33/36 samples (up to ~3.8e-6
-off) -- traced to the standard published sRGB<->XYZ matrices being
-independently-rounded approximations in each direction, not exact algebraic
-inverses of each other, so real (if tiny and functionally harmless) error
-accumulates through a round trip. Not a bug worth fixing, but the doc comment
-was corrected to match measured reality instead of left overstated -- see
-`ColorSpace.h` and `core/tests/test_main.cpp`'s `test_cieluv_roundtrip`. Kept
-here as the first concrete example of this suite finding something real on
-its very first run, not just passing trivially.
+- **Gradient mesh model** — rectangular grids of control points with per-vertex position, tangents and colour, evaluated as bicubic Ferguson (Hermite) patches, exactly the representation of Sun et al. 2007, Sec. 3–4.
+- **Energy-minimising optimiser** — fits geometry and colour to the image with data, smoothness, boundary and vector-line terms (Levenberg–Marquardt-style), solved **coarse-to-fine over a Gaussian pyramid**. Includes a block-sparse PCG solver written for this project.
+- **Boundary-aware fitting** — each of the mesh's four sides is a multi-segment cubic Bézier spline, so non-convex silhouettes are tracked; boundary vertices stay on their spline while they optimise.
+- **Vector lines** — optional user-drawn guide polylines that pull nearby mesh edges into alignment with a highlight or a fold.
+- **Interactive cut-out** — Lazy-Snapping-style graph-cut segmentation (max-flow) plus contour tracing, to get the object outline the mesh is fitted inside.
+- **Optional CIELUV colour space** for perceptually uniform colour interpolation.
+- **SVG export** — writes a real SVG2 `<meshgradient>`/`<meshpatch>` document, so the mesh stays an editable vector object (e.g. in Inkscape).
+- **Optional Ceres Solver backends** — geometry-only and joint geometry+colour solvers, used only if [Ceres](http://ceres-solver.org/) is found at configure time.
+- **Command-line tool** (`gmesh_cli`) and a **regression suite** (`gmcore_tests`) that build anywhere CMake and a C++17 compiler do.
 
-## Building on macOS (the Xcode project)
+**macOS app (`GradientMeshStudio.app`) — AppKit, Objective-C++**
 
-This was developed in a Linux sandbox with no Xcode available, so instead of hand-editing
-a fragile `.xcodeproj` file blind, the project is set up so **CMake generates a real,
-Xcode-native project for you** in one step:
+- Open an image, trace an outline or cut the object out, pick four corners, set the mesh resolution, and **Optimize** with live RMSE per pyramid level.
+- **Edit the mesh by hand** — drag control points, repaint a vertex's colour.
+- **Export** the reconstruction as PNG and the mesh as SVG.
+- **GPU (OpenGL) reconstruction preview**, saved/loaded **presets**, and an optional **debug-data export** for offline solver analysis.
+- **Animate Mesh** — a cosmetic, non-destructive wiggle of the fitted mesh (Jitter, Wave, Breathing and Squash & Stretch styles) with a self-intersection guard that keeps patch edges from crossing.
+
+## Demo
+
+<p align="center">
+  <img src="docs/media/overlay-vs-reconstruction.png" alt="Left: the fitted gradient mesh drawn over the image. Right: the mesh's reconstruction with the overlay hidden." width="560">
+</p>
+
+<sub>Left: the mesh drawn over the reconstruction. Right: the reconstruction alone (a different moment of the same animation) — all the smooth colour comes from the patches, not from pixels.</sub>
+
+Reproduce a fit from the command line with the test image in this repository (`gradient.png`):
 
 ```sh
-# from the GradientMeshStudio/ directory, on your Mac:
-cmake -G Xcode -B build .
-open build/GradientMeshStudio.xcodeproj
+./build/gmesh_cli --input gradient.png --rows 9 --cols 9 --pyramid-levels 4 --margin 0 --out-prefix demo
+# Initial mesh 9x9 control points, RMSE=0.04083
+# Final RMSE=0.01502 (63.2% reduction)
+# Wrote demo_reconstruction.ppm and demo_mesh.svg
 ```
 
-Xcode will show two targets: `gmesh_cli` (a plain command-line tool -- handy for
-regression testing) and `GradientMeshStudio` (the actual app, `⌘R` to run). No
-third-party packages, no Swift Package Manager, no CocoaPods/Carthage -- everything
-the app needs is either in `core/` or an Apple system framework (Cocoa, ImageIO,
-CoreGraphics, UniformTypeIdentifiers).
+<p align="center">
+  <img src="docs/media/gradient-cli-fit.png" alt="Left: gradient.png, a synthetic test image with a sharp zig-zag internal edge. Right: its 9x9 gradient-mesh reconstruction, produced by gmesh_cli with no manual markup." width="640">
+</p>
 
-If you don't have CMake yet: `brew install cmake`.
+<sub>`gradient.png` (left) and the 9×9 mesh reconstruction (right) from `gmesh_cli` with no manual markup. A coarse mesh softens the sharp internal edge — see [Known limitations](#known-limitations).</sub>
 
-You can also just build from the terminal without opening Xcode:
+## Dependencies
+
+| Component | Needs | Required? |
+|---|---|---|
+| `gmcore` library, `gmesh_cli`, `gmcore_tests` | A **C++17** compiler (GCC, Clang, Apple Clang) and **CMake ≥ 3.16** | Yes |
+| PNG input/output in the CLI | System **libpng** | Optional — without it only PPM is read/written |
+| Ceres-based solvers | **[Ceres Solver](http://ceres-solver.org/)** | Optional — the default hand-rolled solver needs nothing |
+| `GradientMeshStudio.app` | **macOS 12+**, **Xcode**, Apple system frameworks only (Cocoa, AppKit, ImageIO, CoreGraphics, OpenGL, UniformTypeIdentifiers) | Only for the GUI |
+
+No Swift Package Manager, CocoaPods or Carthage. `gmcore` itself is original code against the C++ standard library.
+
+## How to Build
+
+### Library, CLI and tests (Linux and macOS)
+
+```sh
+git clone https://github.com/vladimir-vasilyev/gradient-mesh.git
+cd gradient-mesh
+
+cmake -B build .
+cmake --build build -j
+```
+
+This produces `libgmcore.a`, the `gmesh_cli` tool and the `gmcore_tests` suite in `build/`. CMake reports whether libpng and Ceres were found. With plain `make`, `cmake -B build . && make -C build -j` is equivalent.
+
+### Build the macOS app
+
+CMake generates a real, Xcode-native project:
+
+```sh
+cmake -G Xcode -B build_xcode .
+open build_xcode/GradientMeshStudio.xcodeproj    # then ⌘R on the GradientMeshStudio target
+```
+
+or build the bundle from the terminal:
 
 ```sh
 cmake -B build .
@@ -105,1926 +103,163 @@ cmake --build build --config Release
 open build/GradientMeshStudio.app
 ```
 
-### A note on how this was actually validated
+Install CMake with `brew install cmake` if you do not have it. The app target is only configured on Apple platforms.
 
-The sandbox this was built in can compile and run plain C++ (`gmcore` + `gmesh_cli`),
-but has no macOS SDK, so the AppKit files in `mac/` could not be compiled here. The
-algorithm core, which is the mathematically interesting part, **was** built, run, and
-checked end-to-end on Linux -- see "How this was tested" below. The `mac/*.mm` files
-were written carefully against documented AppKit/CoreGraphics APIs and reviewed by hand,
-but if Xcode's compiler flags an issue when you first build, it's most likely a small,
-easy fix-it in `mac/` (a missing cast, an availability check) rather than a problem with
-the algorithm itself.
+## Usage
 
-## Using the app
+### Command line
 
-1. **Open Image…** loads a photo.
-2. **1. Trace Boundary**: click points around the object's outline; double-click to close
-   the loop. (Or skip straight to step 5 for a quick, unattended run.)
-3. **2. Pick 4 Corners**: click 4 of the points you just traced, in order around the
-   loop -- these split the boundary into the 4 sides the mesh grid is built from
-   (Sec. 4 of the paper).
-4. Set **Rows/Cols** and click **Build Initial Mesh**.
-5. **Auto (no markup)**: shortcut that skips steps 2-4 and drops a plain inset-rectangle
-   boundary + regular grid over the whole image -- useful for a fast test, or when you
-   don't want to trace anything by hand.
-6. **3. Vector Line** (optional): click-drag to draw a guide line (e.g. along a highlight
-   or fold); the optimizer will pull nearby mesh edges to align with it.
-7. **Optimize** runs the coarse-to-fine solver in the background; the status bar shows
-   live RMSE per pyramid level/iteration.
-8. **4. Edit Mesh**: drag control points to nudge geometry; double-click one to open the
-   color panel and repaint it.
-9. **Export PNG…** rasterizes the current mesh; **Export SVG…** writes a real SVG2
-   `<meshgradient>` document (see below).
-10. **Auto-export debug data** checkbox: when ON, every completed **Optimize** run
-    automatically writes a JSON dump of everything needed to analyze that run offline
-    (see "Export Debug Data (offline solver analysis)" below) -- the actual reason this
-    exists: the Ceres-backed solvers can only be built and run on a real Mac with Ceres
-    installed, so this is how solver internals get out of a run for review elsewhere.
-
-## Export Debug Data (offline solver analysis)
-
-Added specifically because the Ceres-backed solvers (`useCeresGeometry`/`useCeresJoint`)
-can only be built and exercised on-device (Xcode + a real Ceres install) -- they cannot
-be built or run in the environment used to develop and review this code. Earlier
-debugging relied on comparing *SVG* exports between hand-rolled and Ceres runs (see the
-"Fixed and verified: useCeresJoint's color-throttling gate bug" section above), which
-turned out to be a real but limited channel: SVG2 `<meshgradient>` only carries 4 corner
-colors per patch -- no `Cu`/`Cv`/`Cuv` color derivatives, no explicit geometry tangents
-(`Pu`/`Pv`) beyond what can be *inferred* from each boundary segment's Bezier control
-points. That's enough to check seam consistency and corner-level color error, but not
-enough to see what happens *inside* a patch, where `GradientMesh::evalColor`'s full
-bicubic Hermite surface (using the real `Cu`/`Cv`/`Cuv`, not just corner colors) can
-overshoot between the sample points a corner-only check happens to land on -- exactly
-the gap that made a 9x9-mesh `useCeresJoint` run look fine at the vertex level while
-its app-reported `reconstructionRMSE` (which densely samples patch interiors, see
-`GradientMesh::reconstructionRMSE`) was ~9x worse than hand-rolled's.
-
-The **Auto-export debug data** checkbox closes that gap. When ON,
-`DocumentModel -optimizeWithPyramidLevels:progress:completion:` writes a single
-pretty-printed JSON file at the end of every run, into a `DebugOut` folder created (if
-needed) right next to the currently loaded image, named
-`gm_debug_<solver>_<rows>x<cols>_<yyyyMMdd-HHmmss-SSS>.json` -- millisecond-timestamped
-specifically so repeated runs (different solver settings, or re-running after a code
-change) accumulate side by side in `DebugOut/` instead of each one silently overwriting
-the last; the whole point is comparing a *sequence* of runs after the fact, not just the
-most recent one. No save dialog, no per-run manual step -- check the box once, then just
-run **Optimize** as many times as you want to compare (the status bar echoes the path of
-whatever it just wrote). It contains everything `GradientMesh::evalPos`/`evalColor`/
-`reconstructionRMSE` actually read, so an offline analysis can reproduce those functions
-exactly instead of approximating them from a lossy SVG. Specifically, the file has:
-
-- `git`: `commit` (full SHA) and `describe` (`git describe --always --dirty --long`) of
-  the exact working copy this binary was built from, found at export time by walking up
-  from `DocumentModel.mm`'s own compile-time `__FILE__` path looking for `.git` --
-  independent of the app bundle's runtime location, so it works from a normal Xcode
-  Debug build. `dirty: true` means uncommitted changes were present at export time.
-- `solver.builtWithCeres`: whether this binary was actually compiled with
-  `GMCORE_WITH_CERES` (via the new `gmcore::builtWithCeres()`, defined in
-  `MeshOptimizer.cpp` so it reflects the library's real build setting rather than
-  whatever `DocumentModel.mm`'s own translation unit happens to see). `solver.requested`
-  is what the UI's solver picker was set to; `solver.effective` is what actually ran --
-  they can silently differ, since `useCeresGeometry`/`useCeresJoint` no-op back to
-  hand-rolled (with only a one-time stderr warning) in a build without Ceres found. This
-  directly answers "did Ceres actually run?" without having to trust the UI picker.
-- `mesh`: full `rows`/`cols` plus every vertex's `P`, `Pu`, `Pv`, `Puv` (position and
-  geometry tangents -- `Puv` is always `[0,0]`, see `GradientMesh.h`) and `C`, `Cu`,
-  `Cv`, `Cuv` (color and color derivatives), plus `isBoundary`/`boundarySide`/
-  `boundaryT`.
-- `boundary`: the 4 fitted boundary `CubicBezier` splines (top/right/bottom/left), each
-  as `[p0,p1,p2,p3]`; `vectorLines`: any user-drawn guide lines.
-- `optimizerOptions`: every `OptimizerOptions` field actually used by the most recent
-  optimize run (not just the two solver-choice flags) -- smoothness/boundary/vector-line
-  weights, iteration/damping/CG settings, etc.
-- `lastRunHistory`: the per-outer-iteration `(pyramidLevel, outerIteration, rmse)`
-  sequence from that run, recorded unconditionally (independent of whether the UI's
-  progress callback was listening), plus `lastRunWallClockSeconds`.
-- `lastRMSE`: `reconstructionRMSE(target, 6)` -- the exact same metric/sample density
-  the status bar and the project's own filename convention (e.g.
-  `..._ceres_joint_9x9_rmse0234...`) already use.
-
-Off by default (opt-in, since it writes files without an explicit per-run save
-dialog); toggled via `DocumentModel.autoExportDebugData`, mirrored 1:1 by the checkbox.
-`DocumentModel -exportDebugDataToURL:error:` (the method that actually builds the JSON)
-is still there and still works standalone -- the auto-export path is just a thin wrapper
-around it that picks the `DebugOut/<timestamped name>.json` destination automatically
-instead of asking. If there's no loaded image (so nowhere to put a sibling `DebugOut`
-folder) or the folder can't be created, the run still completes normally; it just skips
-the write silently (logged to the console) and `-lastDebugExportPath` stays nil.
-
-## How the algorithm maps to the paper
-
-| Paper concept (Sec. 3-4) | Code |
-|---|---|
-| Ferguson patch (bicubic Hermite, 16 corner values) | `FergusonPatch.h`: `HermiteBasis`, `PatchWeights`, `evalHermitePatch<T>` |
-| Gradient mesh (grid of control points) | `GradientMesh.h/.cpp` |
-| Boundary curves the mesh is fitted within | `BezierSpline.h/.cpp` (`fitCubicBezier`, `closestT`) |
-| Energy minimization (data + smoothness + boundary + vector-line terms), Levenberg-Marquardt | `MeshOptimizer.h/.cpp` |
-| Coarse-to-fine (Gaussian pyramid) | `Image::buildPyramid`, `MeshOptimizer::optimizeCoarseToFine` |
-| User-drawn directional constraint | `VectorLine.h`, the vector-line term in `MeshOptimizer.cpp` |
-| Scalable vector output | `SVGExporter.h/.cpp` (SVG2 `<meshgradient>`) |
-
-## Known simplifications vs. the paper
-
-Implementing the full paper exactly (jointly-optimized 16 unknowns per patch corner,
-analytic derivative-continuity constraints, a general cutout/segmentation tool) is a
-multi-person, multi-month effort. To get something real, working, and checkable within
-this project's scope, a few deliberate simplifications were made -- all noted in code
-comments at the relevant spot too:
-
-* **Twist (`Puv`) is fixed at zero, per the paper's own text.** Position `P` and
-  tangents `Pu`, `Pv` are free per-vertex unknowns, jointly refined by the geometry
-  Gauss-Newton step (see "Fixed: Pu/Pv promoted to free unknowns" below). An earlier
-  pass in this project (see "Fixed: Puv promoted to a free unknown too" below, now
-  itself reverted -- see "Reverted: Puv back to fixed zero, vector-line term rewritten
-  per Sec 4.2" further down) briefly promoted `Puv` to a free unknown too, "for
-  completeness of paper-fidelity." Rereading the paper's Sec 3 turned up the actual
-  text: "The mu, mv, muv are the partial derivatives. In practice, the values of muv
-  are usually set to zero" -- i.e. the paper itself does NOT treat twist as a free
-  unknown. `GradientMesh::geomCorner()` now hardcodes it to `{0,0}` again. Color keeps
-  the full independent `(C, Cu, Cv, Cuv)` unknown set, unaffected by any of this.
-* **Block-coordinate descent, not one joint solve.** Colors enter the reconstruction
-  error *linearly*, so they're solved exactly with one sparse linear system per outer
-  iteration; geometry enters *nonlinearly* (through the image lookup) and is refined with
-  a few damped Gauss-Newton steps with backtracking line search. Both minimize the same
-  energy, just alternately rather than jointly -- see `MeshOptimizer.h`'s header comment.
-* **No external linear-algebra dependency.** Both solves use a small dependency-free
-  block-sparse Conjugate Gradient solver (`SparseBlockSolver.h`) with Jacobi
-  preconditioning, instead of e.g. Eigen -- this sandbox has no network access to vendor
-  a third-party library, and it keeps the Xcode project dependency-free too.
-* **The "cutout tool" is now a real Lazy-Snapping-style graph cut, alongside
-  manual tracing.** The paper cites a separate Lazy-Snapping-style interactive
-  segmentation tool for isolating the object; this project's boundary tool was
-  originally just click-to-add-a-point polygon tracing, fitted with cubic Beziers per
-  side afterward. See "A real cutout tool, part 1" and "part 2" below -- the graph-cut
-  segmentation algorithm (`MaxFlowGraph`/`LazySnapping`/`ContourTracing`) is implemented,
-  tested, and now wired into `CanvasView`/`MainWindowController` as two new scribble
-  tool modes plus a "Segment" action; manual click-tracing remains available
-  side-by-side as a fallback, not replaced.
-* **SVG mesh-gradient export uses one `<meshgradient>` per patch** rather than one mesh
-  object with SVG2's inter-patch implicit-shared-edge stop omission encoding. A mesh
-  gradient only paints inside its own patch boundary, so adjacent patches still tile
-  seamlessly (they share exact boundary geometry, since both are derived from the same
-  control-point tangents) -- this sidesteps a fiddly, easy-to-get-subtly-wrong part of
-  the SVG2 spec that couldn't be cross-checked without network access. See the comment
-  at the top of `SVGExporter.cpp` for the exact stop-color convention used.
-
-None of these change the fundamental approach (Ferguson patches + energy minimization +
-coarse-to-fine); they trade a bit of fidelity for something that is actually implemented,
-runs, and was checked to work.
-
-### Bug found and fixed: mesh-lines weren't bending to internal color boundaries
-
-The outer boundary always curved correctly (it's constrained to the traced Bezier
-splines), but interior mesh-lines stayed close to a plain rectangular grid instead of
-warping toward internal gradient/color edges the way the paper's figures show. Root
-cause, found by testing against a real image with a sharp internal boundary rather than
-only the smooth synthetic sphere: the geometry Gauss-Newton step's backtracking line
-search (in `optimizeAtCurrentResolution`) was accepting/rejecting steps by checking a
-cheap, differently-sampled plain-RMSE proxy (`reconstructionRMSE(target, 3)`) instead of
-the actual weighted energy the step was computed to reduce (data + smoothness +
-boundary + vector-line terms, at the sample density used to build the step). That
-mismatch let real, energy-decreasing steps get rejected; rejections drive the Levenberg
-damping up, which shrinks the next step, which makes it even less likely to clear the
-mismatched threshold -- a self-reinforcing lock that (combined with the original
-`smoothWeightGeom = 40` default being too high relative to the data-term signal once
-color has locally absorbed most of the error) left geometry essentially frozen after the
-first couple of outer iterations.
-
-Fixed by adding `computeGeometryEnergy()`, which mirrors the exact residual formulas used
-to build the Gauss-Newton normal equations, and using *that* for the line search's
-accept/reject decision instead of the RMSE proxy; and by lowering the `smoothWeightGeom`
-default from 40 to 2 (see the comment on that field in `MeshOptimizer.h`). Verified on
-`gradient.png` (a synthetic two-tone image with a sharp zigzag internal boundary,
-included in this repo): before the fix, an 11x11 mesh's interior lines stayed visibly
-grid-like and RMSE reduction topped out around 46-49%; after the fix, interior lines
-visibly bend along the zigzag and RMSE reduction reaches 51-54% depending on
-`smoothWeightGeom`. The synthetic sphere test (smooth image, no sharp internal edges)
-was re-checked too and is unaffected (still ~47% reduction) -- the fix specifically
-restores geometry's ability to respond to *sharp* internal color transitions, which the
-sphere doesn't have much of.
-
-**Separately, the mesh-line overlay in the app never actually drew curves at
-all** -- `CanvasView::drawMesh` connected control points with straight
-`lineToPoint:` segments regardless of how curved the underlying Ferguson
-patches were. So even a mesh whose control points *had* moved to follow an
-internal edge would still look like a plain rectangular grid on screen; this
-was a pure rendering bug, independent of the optimizer bug above. Fixed by
-adding `-[DocumentModel meshEdgeBezierFromRow:col:toRow:col:]`, which
-converts each patch edge's Hermite representation (`P`, plus the relevant
-derived `tangentU`/`tangentV`) to its exact equivalent cubic Bezier
-(`B0=P0, B1=P0+T0/3, B2=P1-T1/3, B3=P1` -- the standard Hermite<->Bezier
-change of basis, exact for cubic curves, not an approximation), and drawing
-that with `NSBezierPath curveToPoint:controlPoint1:controlPoint2:` instead
-of a straight line. The traced-boundary overlay got the same treatment via
-`-[DocumentModel fittedBoundaryCurves]` (previously it also drew the raw
-traced polygon instead of the 4 fitted splines). No optimizer/algorithm
-change here -- purely what you *see* now matches what the mesh actually is.
-
-`gmesh_cli` also gained a few flags for iterating on this without recompiling:
-`--smooth-geom`, `--smooth-color`, `--color-ridge`, `--boundary-weight`,
-`--outer-iters`, `--gn-iters`, `--samples` override the corresponding `OptimizerOptions`
-field, and every run now also writes `<out-prefix>_mesh_points.csv` (one `row,col,x,y`
-line per control point) for overlaying the mesh wireframe on the source image to check
-visually whether it's actually conforming to image content.
-
-### On matching the paper's reported ~0.7/pixel error (Fig. 4)
-
-The paper reports errors low enough that reconstructions are visually
-indistinguishable from the source photo. Testing against `gradient.png`
-(21x21 synthetic image with a sharp, effectively step-function, zigzag
-boundary between two flat-colored regions) at a few mesh resolutions:
-
-| Mesh | Final RMSE (0-1 scale) | ~error/pixel (0-255 scale) |
-|---|---|---|
-| 9x9   | 0.0198 | ~5.0 |
-| 15x15 | 0.0143 | ~3.6 |
-| 25x25 | 0.0114 | ~2.9 |
-
-Absolute error keeps improving with resolution/iterations (35x35 didn't
-finish within a 2-minute budget in this sandbox, so there's more headroom),
-but it's not going to reach ~0.7 on *this* image, and that's structural, not
-a bug: `gradient.png` has a true pixel-hard discontinuity, and a smooth
-C1 spline surface cannot represent a step edge to sub-1/255 accuracy unless
-a mesh-line runs exactly along it. The paper's own Sec. 4 examples are real
-photos (smooth natural gradients, not synthetic hard edges) and its cutout
-tool is specifically about placing the mesh boundary/lines coincident with
-real object silhouettes for this reason. To close the gap here: (a) increase
-`--rows/--cols` and `--outer-iters/--gn-iters/--samples` for a tighter local
-fit, and (b) drag mesh-lines (or use a vector-line guide) to sit directly on
-the zigzag -- once a mesh-line coincides with the edge instead of merely
-bending toward it, the discontinuity stops needing to be approximated by a
-smooth patch at all. Real photographs without hard synthetic edges should
-get much closer to paper-level numbers at moderate resolution.
-
-### Deeper finding: coarse meshes still don't snap to an edge the way Fig. 4 does
-
-Good catch from testing against the paper's Fig. 4 (a 4x4-patch/5x5-point mesh
-where one whole interior column sits almost exactly on a sharp boundary):
-reproducing that at 5x5 resolution on `gradient.png` still shows only
-sub-pixel geometry movement (`gmesh_cli`'s `*_mesh_points.csv` positions stay
-within ~0.5px of a perfectly uniform grid), even with the line-search fix and
-the `smoothWeightGeom` default already lowered once (40 -> 2). Instrumented
-the Gauss-Newton geometry step (`GMCORE_DEBUG_GEOM`) to see why: each outer
-iteration the color solve gives geometry a real, non-zero gradient (`|g|` in
-the low single digits), but it gets driven back to ~0 within that same outer
-iteration's few GN sub-steps (`maxDelta` shrinking from ~0.4px to ~0.0002px)
--- i.e. this genuinely converges to (very close to) the rectangular starting
-point as a real stationary point of the assembled energy at that
-`smoothWeightGeom`, not a rejected/starved step. Raising `--samples` from 8
-to 24 changed almost nothing, ruling out "the fit grid is too sparse to see
-the edge" as the cause. Sweeping `--smooth-geom` down further on the same
-5x5 case did free the geometry to move substantially:
-
-| `--smooth-geom` | interior column's x-range across rows (px) |
-|---|---|
-| 2.0 (current default) | 106.4-106.9 (~0.5) |
-| 0.5 | 104.6-106.5 (~1.9) |
-| 0.1 | 103.8-109.2 (~5.4) |
-| 0.02 | 99.2-109.1 (~9.9) |
-| 0.0 | 101.0-116.4 (~15.4) |
-
-(The true edge's x spans ~89-138 across those same rows, so even fully
-unregularized geometry (0.0) only recovers about a third of the target
-range, and not always in the right direction row-by-row -- so this isn't
-simply "set smoothWeightGeom near 0 and ship it": with no regularizer at all
-the coarse, few-DOF fit becomes a much harder non-convex problem and can
-converge to a locally-plausible but wrong shape.) **Net: the 2.0 default is
-still meaningfully overdamped for coarse-mesh edge-snapping specifically,
-but naively zeroing it isn't a clean fix either.** Likely needs one or more
-of: an annealed `smoothWeightGeom` schedule (higher early for stability,
-decaying over outer iterations), more outer/GN iterations at coarse
-resolutions, and/or promoting `Pu`/`Pv` from derived (finite-difference)
-values to free per-vertex unknowns as the paper actually does (see "Known
-simplifications" above) -- derived tangents mechanically limit how sharply
-one point can bend without its finite-difference neighbors fighting it. The
-last option is what was actually implemented -- see "Fixed: Pu/Pv promoted
-to free unknowns" below.
-
-**Diagnostic: tangent visualization.** The app has a "Show tangents"
-checkbox that draws each control point's `Pu` (orange) and `Pv` (cyan) as
-arrows (`-[DocumentModel meshVertexTangentUAtRow:col:]` /
-`...TangentVAtRow:col:]`, drawn by `-[CanvasView drawTangents]`) -- useful
-for seeing directly whether tangents are actually swinging to track an edge
-or staying axis-aligned/uniform-length like an unbent grid, which is exactly
-the symptom found above. (Originally these read the derived
-`tangentU`/`tangentV` estimate; now that `Pu`/`Pv` are free unknowns, they
-read the actual optimized `MeshVertex::Pu`/`Pv` fields instead, so what you
-see is what the optimizer is actually using.)
-
-### Fixed: Pu/Pv promoted to free unknowns (matching the paper)
-
-Implemented the option flagged above: `Pu` and `Pv` are no longer derived
-via finite differences -- they're free per-vertex unknowns, jointly refined
-alongside `P` by the same geometry Gauss-Newton step (`MeshVertex` gained
-`Pu`, `Pv` fields; `geomCorner()` reads them directly; `buildInitial()`
-seeds them from the old finite-difference estimate as a starting point; the
-GN unknown block grew from 2 components/vertex (`P.x,P.y`) to 6
-(`P.x,P.y,Pu.x,Pu.y,Pv.x,Pv.y`), with the corresponding Jacobian rows for
-`Pu`/`Pv` built directly from `PatchWeights`' `TangentU`/`TangentV` weights
--- see `MeshOptimizer.cpp`). Twist (`Puv`) stayed derived, unchanged, at the
-time this was written -- see the next section for the follow-up pass that
-closed that gap too.
-
-A free tangent has no sensible "pull toward zero" prior the way a color
-derivative does (`colorDerivRidge`) -- zero tangent collapses the patch.
-Tried it anyway as a control (`--tangent-prior 0`, i.e. completely
-unconstrained `Pu`/`Pv`): `Pu`/`Pv` values went chaotic (e.g. one run's `Pu.x`
-ranged from -53 to +188 across a mesh whose spacing is ~50px) and the
-rendered reconstruction came out visibly warped and torn at the silhouette,
-even though the coarse-sample RMSE metric it was fitting *improved* --
-classic overfitting to a sparse sample grid, invisible to that metric.
-Fixed by adding `geomTangentPriorWeight`: a soft ridge pulling `Pu`/`Pv`
-toward the *current* position-implied finite-difference estimate
-(`GradientMesh::tangentU/V`, recomputed fresh every GN sub-iteration), so
-the data term can pull a tangent away from that estimate where it has real
-signal to, without it drifting unboundedly where the signal is weak.
-`computeGeometryEnergy` was extended to include this term too, for the same
-line-search-consistency reason as everything else in it.
-
-With that grounding in place, `smoothWeightGeom` could be lowered much
-further (0.02, from 2) without the garbling seen above -- on the *same*
-5x5/`gradient.png` case from the table above, with `--tangent-prior 0.6`:
-
-| config | interior column's x-range (px) | reconstruction |
-|---|---|---|
-| old defaults (`smooth-geom 2`, derived tangents) | 106.4-106.9 (~0.5) | boxy, doesn't track the notch |
-| new defaults (`smooth-geom 0.02`, free tangents, `tangent-prior 0.6`) | 100.1-111.4 (~11.3) | visibly bends to follow the zigzag |
-
-Checked with a wireframe overlay (mesh-line Bezier curves drawn over
-`gradient.png`, same technique as the `CanvasView` fix above): with the new
-defaults the interior mesh column visibly kinks to trace the boundary's
-notch, instead of running as a nearly-straight vertical line down the
-middle. Re-checked for regressions: 25x25 on `gradient.png` improved too
-(final RMSE 0.0114 -> 0.0083, i.e. ~2.9 -> ~2.1 in 0-255 terms) and the
-noisy synthetic sphere (smooth image, the regression check for "did this
-break normal images") also improved (45.5% -> 52.6% RMSE reduction, no
-visible artifacts) rather than regressing. New defaults:
-`smoothWeightGeom = 0.02`, `geomTangentPriorWeight = 0.6` (new option;
-`--tangent-prior` in `gmesh_cli`).
-
-Caveat: the geometry unknown block growing 2 -> 6 components/vertex makes
-each Gauss-Newton solve noticeably more expensive (roughly an order of
-magnitude on the 25x25 case in this sandbox, ~3 minutes vs under a minute
-previously, at the CLI's higher-than-default iteration counts used for
-testing) -- the app's own defaults (8 outer iterations, 3 GN iterations/outer,
-per `OptimizerOptions`) stay fast at typical mesh sizes (9x9), but a large
-mesh with many manually-increased iterations will take noticeably longer
-than before. Not yet profiled/optimized.
-
-### Fixed: anisotropic smoothWeightGeom (relax smoothing near real edges)
-
-Even with free Pu/Pv, a specific complaint held up on closer comparison against
-the paper's Fig. 4: on a 5x5 mesh matching that figure's resolution, ours bent
-one interior mesh-*line* toward the sharp boundary, but never let two adjacent
-lines squeeze together into a visibly *narrow patch column* straddling the
-edge from both sides, the way Fig. 4 shows. Root cause: `smoothWeightGeom`'s
-2nd-difference term is isotropic -- it penalizes uneven spacing between
-neighboring control points identically everywhere, and two mesh-lines
-converging around an edge is, almost by definition, a large local departure
-from even spacing. Lowering the single global weight (previous fix) helps
-overall bending but can't selectively stop resisting *specifically* near a
-real edge without also giving up smoothing everywhere else.
-
-Fix: `smoothWeightGeom` is no longer a flat constant -- each 2nd-difference
-triple's effective weight is scaled by `edgeRelaxFactor()`, a new helper that
-samples the image gradient magnitude at the middle control point's *current*
-position (recomputed fresh every GN sub-iteration, so it adapts as a vertex
-approaches an edge) and relaxes smoothing there:
-`weight = smoothWeightGeom / (1 + smoothGeomEdgeGain * localGradientMagnitude)`,
-floored at `smoothGeomMinFactor` (never fully zero -- keeps the solve
-well-posed). `computeGeometryEnergy` mirrors the exact same per-triple scaling,
-for the same line-search-consistency reason as everywhere else here. New
-options: `smoothGeomEdgeGain = 40.0`, `smoothGeomMinFactor = 0.05`
-(`--edge-gain` / `--edge-min-factor` in `gmesh_cli`).
-
-Swept `--edge-gain` from 0 (isotropic, old behavior) up to 1500 on the same
-5x5/`gradient.png` case: RMSE improved from the isotropic baseline (56.6%
-reduction) up to a peak around gain 40-100 (~61.3-61.4%), then *degraded*
-at higher gain (600: 59.2%, 1500: 59.3%) -- over-relaxing lets the smoothness
-term stop doing its job even where it should, so this isn't "more is better."
-40 was picked as the default (near-peak, round number). Checked visually via
-the same wireframe-overlay technique as before: with gain 40, the interior
-mesh-lines visibly bow toward the notch rather than running close to straight
--- a real improvement -- but this alone still didn't produce a dramatic
-near-zero-width pinched column like Fig. 4's. That makes sense on reflection:
-relaxing the *resistance* to non-uniform spacing doesn't create a new force
-pulling two lines together -- it only lets an existing pull win more easily.
-The data term's own incentive to physically narrow a column, absent that,
-still seems to be fairly weak (consistent with the earlier finding that color
-alone already absorbs much of the local residual). Getting the dramatic
-Fig.-4-style pinch probably needs an actual attractive force -- the
-`vectorLineWeight` constraint was tested as one candidate (see the previous
-turn's investigation: it *did* produce dramatic column-clustering, e.g. two
-columns landing 2.5px apart, but overshot and made overall RMSE worse at its
-current default weight/semantics) -- not pursued further this round.
-
-Regression check: the noisy synthetic sphere (smooth image, no real edges,
-per-pixel noise baked in) went from 52.6% to 50.5% RMSE reduction with
-anisotropic relaxation on -- a real but small regression, because the
-injected noise itself produces small nonzero local gradients everywhere,
-so `edgeRelaxFactor` relaxes smoothing slightly even in "flat" regions
-purely from that noise. Judged an acceptable trade for a meaningfully
-better result on real edges; flagging honestly rather than hiding it. Did
-not re-verify the 25x25 gradient.png case with this change (each such run
-takes several minutes in this sandbox) -- if you have a moment, `gmesh_cli
---rows 25 --cols 25 ...` and comparing against the numbers in the section
-above would be a useful check.
-
-### Fixed: Puv (twist) promoted to a free unknown too
-
-> **Note (later reverted):** this section is kept as an honest historical record, but
-> the change it describes was undone in a later pass after rereading the paper's Sec 3
-> turned up "In practice, the values of muv are usually set to zero" -- see "Reverted:
-> Puv back to fixed zero, vector-line term rewritten per Sec 4.2" near the end of this
-> file. `Puv` is fixed at `{0,0}` again, not a free unknown.
-
-Follow-up to the two sections above: `Puv` (the mixed second partial,
-"twist", at each Ferguson-patch corner) was still *derived* via centered
-finite differences from neighboring vertices' `P` (`GradientMesh::twist`),
-the one remaining gap vs. the paper's fully-free 4-value-per-corner Hermite
-corner (`P`, `Pu`, `Pv`, `Puv` all independent). Promoting it too, for
-completeness of paper-fidelity rather than as a targeted fix for the Fig. 4
-pinch investigation above (a derived-vs-free twist term was never a leading
-hypothesis for *that* -- it only ever contributes a general surface-shape
-degree of freedom, not a force pulling mesh-lines together).
-
-Mechanically: `MeshVertex` gained a `Puv` field (`GradientMesh.h`);
-`geomCorner()` reads it directly instead of calling `twist()`;
-`buildInitial()` seeds it from `twist()` as a starting point, same pattern
-already used for `Pu`/`Pv` and `tangentU`/`tangentV`; `scalePositions()`
-scales it the same linear per-component way as `P`/`Pu`/`Pv` between
-pyramid levels; the geometry GN unknown block grew from 6 components/vertex
-to 8 (`...,Puv.x,Puv.y`, still comfortably under `SparseBlockSolver.h`'s
-`double tmp[16]` ceiling); `addTangentPriorTerms`/`computeGeometryEnergy`
-extended to also ground `Puv` toward the current `twist()` estimate via the
-same `geomTangentPriorWeight`, for the same well-posedness reason `Pu`/`Pv`
-needed grounding. The Ceres path (both `useCeresGeometry` and
-`useCeresJoint`) got the matching treatment: `PatchDataCostFunction`/
-`JointPatchDataCostFunction`'s geometry parameter block grew 6->8 doubles
-with a new Jacobian column pair using `PatchWeights`' already-existing
-`Twist` kind weight, and `TangentPriorCostFunction` grew from 4 to 6
-residuals to also ground `Puv`. This incidentally makes the joint data-term
-Jacobian *more* exact than before: the 0.168 max-relative-error gap found
-during the joint-solve `ceres::GradientChecker` verification (see below) was
-specifically because derived-`Puv` depended on neighboring vertices outside
-a residual block's own 4 corners, which the Jacobian couldn't represent --
-with `Puv` now a direct per-corner parameter, that gap is gone (reverified
-with the same finite-difference-harness method, 200 entries checked, 0 bad,
-max relative error 4e-5 -- pure FD noise).
-
-Regression-checked on the same three cases used throughout this section
-(hand-rolled path, no Ceres, defaults unchanged otherwise):
-
-| case | before (Puv derived) | after (Puv free) |
-|---|---|---|
-| synthetic sphere, 9x9 | 53.2% reduction | 54.1% reduction |
-| 25x25 `gradient.png` | 61.4% reduction | 59.1% reduction |
-| 5x5 `gradient.png` | 61.0% reduction | 60.8% reduction |
-
-No divergence or instability in any case -- RMSE still decreases smoothly
-through the optimization in all three. The 25x25 case regressed a couple of
-points; plausible since `smoothWeightGeom`/`geomTangentPriorWeight`/
-`smoothGeomEdgeGain` were all empirically tuned earlier assuming a derived
-(FD-smoothed, implicitly regularized) twist, and an unconstrained `Puv` now
-has one more way to (slightly) overfit the coarse sample grid before the
-prior fully catches it. Reporting honestly rather than re-tuning weights to
-paper over it; if it matters in practice, retuning `geomTangentPriorWeight`
-specifically for the twist term (splitting it from the shared weight `Pu`/
-`Pv` use) would be the first thing to try.
-
-### Optional: Ceres-based geometry solver
-
-The geometry Gauss-Newton block (position P + free tangents Pu, Pv, Puv) can
-optionally be solved by [Ceres Solver](http://ceres-solver.org/) instead
-of the hand-rolled damped GN + backtracking in `MeshOptimizer.cpp`. This
-is purely additive and off by default: `CMakeLists.txt` does
-`find_package(Ceres QUIET)` (never `REQUIRED`), and `core/src/MeshOptimizerCeres.cpp`
-compiles to an empty translation unit when Ceres isn't found, so the
-default, dependency-free build is completely unaffected -- nothing about
-it changed in this pass.
-
-Motivation: a fully joint (position+tangent+color) optimization pass --
-one of the fidelity options considered for closing the remaining gap to
-the paper's Fig. 4 (see "Deeper finding" above) -- would need a much
-larger per-vertex parameter block than the hand-rolled solver's fixed
-`double tmp[16]` scratch buffers can safely hold (20 dims: 8 geometry --
-`P,Pu,Pv,Puv` -- + 12 color, now that `Puv` is also free; was 18 = 6+12
-before that pass). Ceres's own sparse linear algebra and Levenberg-Marquardt
-trust region don't have that ceiling, and would also remove an entire
-class of hand-derived-Jacobian bugs (the kind that caused the "mesh-lines
-weren't bending" bug above) via analytic verification against
-`ceres::GradientChecker`. This pass ports *only* the existing geometry
-GN step (color stays solved by the exact linear closed form, unchanged)
-as a lower-risk first step and feasibility check before attempting a
-fully joint solve.
-
-Enable with `OptimizerOptions::useCeresGeometry = true` (or `gmesh_cli
---use-ceres`). Every residual/Jacobian in `MeshOptimizerCeres.cpp` is a
-direct transcription of the corresponding hand-rolled term, not a
-re-derivation -- and each was independently cross-checked before being
-wired in:
-
-- The data term (`PatchDataCostFunction`) was checked with
-  `ceres::GradientChecker` via `spike/ceres_geom_spike.cpp`. First pass
-  found a real bug: the per-sample area weight was being recomputed from
-  the *trial* (perturbed) parameters instead of frozen at the
-  linearization point, giving 906/1800 bad Jacobian entries (max relative
-  error 1.81). Fixed by freezing it from a `snapshot` mesh, matching
-  exactly how the hand-rolled path already treats that weight (frozen per
-  GN sub-iteration there). After the fix: max relative error 0.168,
-  confirmed identical between a standalone (non-Ceres) finite-difference
-  check and the real `ceres::GradientChecker` run -- and that remaining
-  gap was itself not new at the time: it was the then-still-open
-  simplification that twist (`Puv`) wasn't differentiated w.r.t.
-  neighboring vertex positions. **Now closed** -- see "Fixed: Puv promoted
-  to a free unknown too" above; with `Puv` a direct per-corner parameter,
-  this Jacobian is exact again (reverified the same way, 0 bad entries).
-- Smoothness, tangent-prior, boundary and vector-line terms were each
-  checked against a standalone finite-difference harness before being
-  transcribed here; all four matched to numerical precision (no
-  approximation involved in any of them).
-
-Design note carried over honestly: every "frozen" quantity above (area
-weight, the anisotropic edge-relax factor, tangent-prior's `tu`/`tv`
-target, the vector-line direction) is evaluated once from a mesh snapshot
-taken at the start of `optimizeGeometryCeres()`, not re-evaluated as
-Ceres's own internal LM iterations move the trial parameters -- the same
-granularity of freezing the hand-rolled path already uses (there, frozen
-per GN sub-iteration; here, frozen for the whole call, since Ceres
-iterates internally rather than the caller re-entering the loop). Not a
-new approximation introduced by this port, but worth knowing if the
-`--use-ceres` RMSE trajectory ever looks different from the hand-rolled
-one in a way that isn't obviously better.
-
-Status as of this pass: default (no-Ceres) build and `--use-ceres`'s
-graceful fallback (one-time stderr warning, hand-rolled path used) were
-verified in the Linux sandbox (this sandbox has no network access to
-install Ceres itself). The real Ceres-linked build was then verified on
-the macOS target (Homebrew `ceres-solver`/`eigen`, `cmake ..
--DCMAKE_PREFIX_PATH="$(brew --prefix)"`): `gmcore`/`gmesh_cli` link and
-run cleanly against Ceres 2.2.0. A same-seed synthetic-sphere comparison
-(`--rows 9 --cols 9 --pyramid-levels 3 --outer-iters 6 --gn-iters 3`, with
-vs. without `--use-ceres`) converged smoothly on both paths with no
-divergence, and Ceres reached a slightly *better* final RMSE (54.1%
-reduction vs. 52.0% hand-rolled) -- plausibly because Ceres's adaptive
-trust region is a more capable step-acceptance scheme than the hand-rolled
-path's fixed 4-try/0.4-shrink backtracking, though this is one run on one
-test case and not yet a full regression. Not yet done: the harder 25x25
-sharp-edge test that's the actual point of this whole line of work (does
-Ceres's more robust step acceptance help with the Fig. 4 pinching
-question), a wall-clock timing comparison, and a visual wireframe-overlay
-sanity check of the Ceres-produced mesh (same techniques used earlier in
-this file for the hand-rolled path's fidelity checks).
-
-### Bug found and fixed: boundary vertices were effectively frozen in place
-
-The paper says (Sec 4): "control points on the boundary only move along the splines" --
-1 degree of freedom per boundary vertex (its position along the curve), not 2. The
-existing soft `boundaryWeight` penalty instead pulled each boundary vertex toward a
-fixed re-projected point using the FULL 2D residual (`P.x - target.x`, `P.y -
-target.y`, both weighted equally), which resists along-curve (tangential) motion just
-as hard as off-curve (normal) drift -- not "free to slide", but "stay near this one
-point". Confirmed empirically via `_mesh_points.csv`: boundary vertices sat at almost
-exactly their initial uniform-spacing coordinates even after full optimization, no
-matter how many outer iterations ran.
-
-Fixed by projecting the residual onto only the curve's NORMAL direction at the
-vertex's current `boundaryT` (`Vec2{-tangent.y, tangent.x}.normalized()`), leaving the
-tangential component completely free -- a single scalar residual instead of two
-independent x/y ones, in both the hand-rolled path and the shared Ceres
-`BoundaryCostFunction`. Verified via before/after `_mesh_points.csv` comparison
-(vertices visibly non-uniformly spaced after the fix) and a small RMSE improvement
-across the regression suite (5x5: 60.8%->61.8%, 25x25: 59.1%->61.1%, sphere:
-unchanged). Found while investigating a user report that the mesh still wasn't
-snapping to sharp edges the way the paper's Fig. 4 shows, even on cases predating the
-Puv-free experiment above -- this was the actual root cause of that, not twist.
-
-A related follow-up fix, found later in this same investigation (see next section):
-the boundary re-projection (`closestT()` against the vertex's current position) was
-only being re-run once per OUTER iteration, not once per Gauss-Newton sub-iteration.
-That's fine for small steps, but a strong pull (like the new vector-line term below
-can produce) can move a boundary vertex far enough in a single GN sub-step that the
-target/normal computed at the top of the outer iteration is badly stale by the time
-the *next* sub-step's linearization uses it. Now re-projected every GN sub-iteration
-in both the hand-rolled path and `MeshOptimizerCeres.cpp`'s `ceresSolveOnce`/
-`jointSolveOnce`, at the same frequency backtracking already re-checks the true
-energy.
-
-### Reverted: Puv back to fixed zero, vector-line term rewritten per Sec 4.2
-
-Two changes made together after a careful reread of the paper, prompted by the
-question above ("why can't we get a sharp edge like Fig. 4") not being resolved by
-either the boundary fix or the earlier Puv-free experiment on their own:
-
-**1. Puv reverted to fixed `{0,0}`.** As already covered in the note above: the
-paper's Sec 3 says plainly, "In practice, the values of muv are usually set to zero."
-Promoting it to a free unknown (see "Fixed: Puv promoted to a free unknown too" above)
-was a paper-fidelity regression, not an improvement -- caught by rereading the primary
-source rather than assuming the more-general/more-free version was automatically more
-faithful. `GradientMesh::geomCorner()` hardcodes `Puv` to `{0,0}` again; the
-`MeshVertex::Puv` field itself is kept (as inert, always-zero storage) only so
-CSV/serialization code referencing it doesn't need to change. All Ceres cost functions
-(`PatchDataCostFunction`, `JointPatchDataCostFunction`, `SmoothTripleCostFunction`,
-`TangentPriorCostFunction`, `BoundaryCostFunction`) went back to 6-double (not 8-double)
-geometry parameter blocks.
-
-**2. The vector-line-guided term (Sec 4.2) was rewritten to match the paper's actual
-formula.** The previous implementation was a coarse approximation: it only checked the
-discrete straight edge between two adjacent control points (at its midpoint) against a
-single flat global pixel radius (`vectorLineInfluenceRadius`), and never touched the
-free tangent unknowns `Pu`/`Pv` at all -- so the term could pull vertex *positions*
-toward alignment but had no way to shape the *tangent* the way the paper describes.
-The paper's own formula (quoted verbatim from Sec 4.2): for the nearest vector line to
-a point `m(u,v)`, `wu(m(u,v)) = G(d|0,sigma_v^2)` where `d` is the distance to that
-line and `sigma_v` is one third of a "narrow band" width, itself one fifth of the
-line's own length; the term penalizes the component of the analytic surface tangent
-(`dm/du`, `dm/dv`) perpendicular to the line's direction, Gaussian-weighted by that
-`d`. This is now implemented as `nearestVectorLineField()` (`MeshOptimizer.cpp`,
-mirrored in `MeshOptimizerCeres.cpp`), evaluated at the SAME dense per-patch `(u,v)`
-sample grid the data term already uses -- not just at discrete mesh edges -- using the
-analytic `dU`/`dV` from `evalPos()` and `PatchWeights`' `wu`/`wv` arrays for the
-Jacobian, exactly the way the data term already reuses the `w` array for `d(pos)/d
-(corner)`. `vectorLineWeight`'s default changed from 60 to the paper's stated `beta=20`.
-`vectorLineInfluenceRadius` is now unused (the band width is derived per-line from
-each line's own polyline length) but left in `OptimizerOptions` as an inert field for
-config compatibility.
-
-The new term's Jacobian (`d(ru)/d(corner param)`, `d(rv)/d(corner param)` via
-`pw.wu`/`pw.wv`) was verified against a standalone finite-difference harness before
-being trusted: 60,000 entries checked across 50 random patch configurations and 25
-`(u,v)` sample points each, 0 bad, max relative error 3.0e-10 -- effectively exact.
-
-**Result -- the core question of this whole investigation, finally answered:** adding
-a single guide vector line down the middle of a 5x5 mesh's domain (`gmesh_cli --vline
-"106.5,40;106.5,173"`) causes the three interior mesh-columns to collapse tightly
-around the line -- x-coordinates of columns 1, 2 and 3 (of 0..4) landing within about
-5-8 pixels of the line's x=106.5, versus being evenly spread across the full ~200px
-width with no vector line supplied. This is the genuine "sharp edge from mesh-line
-collapse" effect the paper's Fig. 4 shows, and it did not happen with the old
-discrete-edge/flat-radius approximation. Both the boundary fix and the Puv revert were
-necessary but not sufficient on their own; it was specifically making the vector-line
-term dense, analytic-tangent-based and paper-accurate that produced the effect.
-
-**Caveat, reported honestly rather than hidden:** in that same stress test, a couple of
-boundary vertices land visibly outside the image bounds (e.g. y~277 against a 213px-tall
-image), and this persisted even after the boundary-reprojection-per-substep fix above,
-across a range of `vectorLineWeight` values including well below the default. The
-Jacobian is verified exact (see above), and the regression suite with no vector lines
-is unaffected, so this isn't a sign error -- it looks like a real (if extreme) energy
-trade-off: `computeGeometryEnergy`'s backtracking only requires each step to *decrease*
-the total weighted energy, and a single vector line spanning nearly the full height of
-a tiny 5x5 mesh is a deliberately adversarial test case (an unrealistically dominant,
-image-spanning constraint relative to the boundary/data terms) rather than typical
-usage (a shorter guide line traced along an actual detected feature, on a finer mesh
-where each line's influence is more local). Not yet re-tested with a more realistic
-guide line length/placement, or with `boundaryWeight` raised to compensate -- worth
-doing before relying on this term heavily on real images with vector-line input.
-
-Regression suite (hand-rolled path, no Ceres, no vector lines, same three cases used
-throughout this file):
-
-| case | before this pass | after this pass |
-|---|---|---|
-| synthetic sphere, 9x9 | 53.8% reduction | 53.8% reduction (unchanged) |
-| 25x25 `gradient.png` | 59.1%-61.1%\* | 60.6% reduction |
-| 5x5 `gradient.png` | 60.8%-61.8%\* | 61.7% reduction |
-
-\* range reflects the boundary-fix-only numbers from the previous section; not a
-regression, just noting the small amount of run-to-run variation already present in
-this codebase's block-coordinate scheme.
-
-Not yet done: re-verifying the equivalent Ceres-path (`--use-ceres`/`--use-ceres-joint`)
-numbers on the real macOS/Ceres build -- the changes were syntax-checked against a
-local Ceres-API stub and are structurally identical to the hand-rolled path (same
-formulas, same freezing convention), but a real `ceres::GradientChecker` run on the new
-`VectorLineCostFunction` hasn't been done yet (see "Optional: Ceres-based geometry
-solver" above for how prior passes did this verification).
-
-### Fixed: the 4 mesh corners are now hard-fixed (never move)
-
-Direct follow-up to the boundary-vertex divergence caveat in the section above: the
-corners (grid positions `(0,0)`, `(0,cols-1)`, `(rows-1,0)`, `(rows-1,cols-1)`) are
-each the exact junction of TWO boundary splines, not an interior point of a single
-one. "Control points on the boundary only move along the splines" (Sec 4) is
-ambiguous at a corner -- along *which* of the two splines? -- and
-`GradientMesh::buildInitial()`'s boundary-side assignment resolves the ambiguity
-somewhat arbitrarily (its `if`/`else-if` chain checks `r==0` before `c==cols-1`
-before `r==rows-1` before `c==0`, so e.g. the bottom-right corner ends up assigned to
-the *right* spline at `t=1`, not the bottom one). The soft normal-only boundary
-constraint's linearization (see "Fixed: boundary vertices were effectively frozen in
-place" above) is only valid for small displacements from that assigned point; at a
-`t=0`/`t=1` endpoint shared with a *different* curve, a large step (as the new,
-much stronger vector-line term can produce) can end up "tangential" with respect to
-the wrong curve's direction entirely and drift arbitrarily far before the soft
-penalty pushes back. That's exactly what the stress-test caveat above was seeing.
-
-Corners are also structurally redundant as free unknowns in the first place:
-`buildInitial()` sets them to the boundary curves' own endpoints (`P00`/`P10`/`P01`/
-`P11`) exactly, so there was never anything for the optimizer to usefully solve for
-there. Hard-fixing removes the failure mode entirely rather than tuning around it.
-
-Only *position* is fixed -- `Pu`/`Pv` (the free tangents) stay free at corner
-vertices, unaffected. Implementation differs by solve path but the effect is
-identical: the hand-rolled path solves the Gauss-Newton step as usual (corners stay
-in the normal equations, so the linear system shape doesn't change) and then simply
-zeroes the proposed position delta for the 4 corner vertices before applying it, at
-every backtracking `alpha` -- the simplest correct way to pin specific unknowns
-without restructuring the sparse solve into a smaller system. The Ceres path uses the
-tool built for exactly this, `ceres::SubsetManifold(6, {0, 1})` applied via
-`Problem::SetManifold` on each corner's 6-double `(P,Pu,Pv)` parameter block, holding
-dimensions 0-1 (`P.x`,`P.y`) constant while leaving 2-5 (`Pu`,`Pv`) free to vary --
-used identically in `ceresSolveOnce` and `jointSolveOnce`.
-
-Verified directly on the same adversarial stress test that surfaced the divergence
-(`gmesh_cli --input gradient.png --rows 5 --cols 5 --vline "106.5,40;106.5,173"`):
-all 4 corners now sit at exactly their fixed positions (`(6,6)`, `(207,6)`, `(6,207)`,
-`(207,207)` for this test's margins) in `_mesh_points.csv`, and the previous
-max-`|y|`-outside-image-bounds reading of ~277 is gone (max now ~207, i.e. within
-bounds) -- while the interior-column pinching effect that the vector-line rewrite was
-built to produce is fully preserved (columns 1-3 still land within a few pixels of
-the guide line's x-coordinate). Regression suite with no vector lines unaffected
-(sphere: 53.8%->55.4%, mildly *improved* since corners no longer waste any GN
-capacity fighting a doomed local linearization; 25x25: 60.6% unchanged; 5x5:
-61.7%->61.3%, within normal run-to-run noise).
-
-Syntax-checked against the local Ceres-API stub, extended with a minimal
-`ceres::SubsetManifold`/`Problem::SetManifold` stand-in for this check (see
-`/tmp/ceres_stub` in the session that made this change -- not checked into this
-repo). A real `ceres::GradientChecker`/build verification on this exact `SetManifold`
-usage against real Ceres hasn't been done yet.
-
-### Diagnosed: useCeresJoint gave visibly the worst reconstruction of the three solver modes
-
-Reported by the user after testing all three solver modes (hand-rolled, `--use-ceres`,
-`--use-ceres-joint`) side by side in the app: the joint solve's output looked
-noticeably worse than either of the other two, not just marginally.
-
-Went through every joint-specific residual and Jacobian line by line looking for an
-actual formula bug -- `JointPatchDataCostFunction` (data term, both geometry and
-color as live parameters), `ColorSmoothTripleCostFunction`, `ColorRidgeCostFunction`,
-and the geometry-side terms it shares with `ceresSolveOnce` (smoothness,
-tangent-prior, boundary, vector-line). None of them showed a sign error, wrong array
-offset, or mismatched weight -- every one matches its corresponding hand-rolled term
-exactly, same as the already-verified `useCeresGeometry` path.
-
-What's structurally different about joint, and the likely actual cause: its
-parameter space is 18 doubles/vertex (6 geometry + 12 color) versus
-`useCeresGeometry`'s 6. Both the hand-rolled path and `useCeresGeometry` solve color
-*exactly*, via its own dedicated closed-form linear system -- up to
-`OptimizerOptions::cgMaxIterations` (200 by default) conjugate-gradient iterations
-against `cgRelTolerance`, freshly every single outer iteration. `useCeresJoint` has no
-such dedicated solve at all: color and geometry are minimized together in one
-`ceres::Problem`, and the internal Ceres iteration cap used for that combined solve
-(`jointSolveOnce`'s `maxIters` argument) was hardcoded to the same value (6) as
-`useCeresGeometry`'s -- appropriate for a 6-dimensional-per-vertex problem, almost
-certainly far too few for one 3x the size that also has to arrive at a good color fit
-with no dedicated linear solve to fall back on. Each of those 6 outer
-Levenberg-Marquardt iterations only gets one shot at an internally-approximated
-linearized step before `optimizeJointCeres`'s own gate (`computeTrueJointEnergy`,
-same verify-and-shrink-or-revert pattern as `optimizeGeometryCeres`) re-checks the
-true energy and, on rejection, throws the whole sub-step away -- so an
-under-converged combined step is exactly the kind of thing that gate would end up
-rejecting most of the time, plausibly explaining reconstructions that look close to
-the un-optimized initial mesh.
-
-Fix: `optimizeJointCeres` now reuses `opts.cgMaxIterations` (200 by default) as
-Ceres's own outer iteration cap for the joint solve, instead of the 6 borrowed from
-`useCeresGeometry`. Ceres's own convergence tolerances (`function_tolerance` etc.)
-still apply, so a well-converged joint step should terminate well before hitting 200
-in practice -- 200 is a ceiling, not a target iteration count. Added
-`OptimizerOptions::cgMaxIterations` as a CLI flag (`gmesh_cli --cg-iters N`) so this
-(and the hand-rolled color solve's own budget, which already used this same field) is
-tunable without recompiling.
-
-**Not yet verified against a real Ceres build** -- this sandbox has no Ceres
-installed, so this fix is syntax-checked and structurally sound but unconfirmed to
-actually fix the visual quality issue; it should be re-tested by rebuilding on macOS
-with the real Homebrew Ceres and comparing `--use-ceres-joint` output before/after
-this change on the same test image. Expect `--use-ceres-joint` to run noticeably
-slower than before as a result of this change (up to ~33x more Ceres-internal
-iterations allowed per call, though real convergence should stop well short of that
-ceiling most of the time) -- a wall-clock timing comparison for this mode still
-hasn't been done (see "Optional: Ceres-based geometry solver" above).
-
-### Found the actual root cause: CGNR+JACOBI was too weak a linear solver, not just too few iterations
-
-Reported by the user after rebuilding with the `cgMaxIterations` fix above:
-`--use-ceres` (geometry only) still approximates worse than the hand-rolled path, and
-`--use-ceres-joint` is worse still -- i.e. the iteration-budget fix directly above did
-**not** resolve the problem. Went back through the whole file line by line at the
-user's explicit request ("Ceres geom аппроксимирует хуже Hand-rolled. Ceres-joint -
-еще хуже. Перепроверь код."):
-
-- Re-verified every `sqrt(weight)` residual-scaling call site (Ceres minimizes
-  sum-of-squared-residuals; the hand-rolled path's energy is `weight * r^2`) -- all
-  consistent.
-- Read `computeTrueGeometryEnergy`/`computeTrueJointEnergy` side by side against
-  `MeshOptimizer.cpp`'s `computeGeometryEnergy` term by term (data, vector-line,
-  smoothness, tangent-prior, boundary) -- identical formulas and weights.
-- Read every `ceres::CostFunction` in the file in full --
-  `PatchDataCostFunction`, `JointPatchDataCostFunction`, `ColorSmoothTripleCostFunction`,
-  `ColorRidgeCostFunction`, `SmoothTripleCostFunction`, `TangentPriorCostFunction`,
-  `BoundaryCostFunction`, `VectorLineCostFunction` -- comparing each residual and
-  Jacobian sign/index against its hand-rolled counterpart (`addSmoothnessTerms`,
-  `addTangentPriorTerms`, the boundary and vector-line blocks inside
-  `optimizeAtCurrentResolution`'s GN loop, and `PatchWeights`' `w`/`wu`/`wv` array
-  layout). No sign error, wrong array offset, or mismatched weight found anywhere --
-  every term still matches its hand-rolled equivalent exactly.
-
-With the residual/Jacobian math cleared (again), the remaining suspect was the linear
-solver itself. Both `ceresSolveOnce` and `jointSolveOnce` had `Solver::Options` set to
-`linear_solver_type = ceres::CGNR` with `preconditioner_type = ceres::JACOBI`. CGNR is
-itself an iterative conjugate-gradient solve of the normal equations (not an exact
-one), and Ceres's `JACOBI` preconditioner for CGNR is only a per-*scalar* diagonal of
-`J^T J`. Compare that to the hand-rolled path's own linear solve
-(`SparseBlockSolver.h`'s `solveSPD_PCG`): also CG, but block-Jacobi preconditioned --
-it inverts each vertex's full 6x6 diagonal block, capturing the strong coupling
-between `P`, `Pu`, and `Pv` at the same vertex. A bare scalar diagonal preconditioner
-is materially weaker than that block preconditioner, especially with the vector-line
-and boundary terms mixed in (very unevenly-weighted residuals sharing the same
-6-double block). Under a weak preconditioner, a low iteration cap (the original,
-un-fixed 6 for `useCeresGeometry`) starves the CG solve before it gets close to the
-true GN/LM step -- and raising the cap alone (the `cgMaxIterations` fix above, already
-applied to `useCeresJoint`) just means grinding more slowly toward the same
-under-converged answer; it doesn't fix the underlying solve quality, which is
-consistent with the user's report that the budget fix alone didn't help.
-
-Fix: switched `linear_solver_type` to `ceres::SPARSE_NORMAL_CHOLESKY` in both
-`ceresSolveOnce` and `jointSolveOnce` (dropping `preconditioner_type`, which only
-applies to iterative solvers). This solves the normal equations *exactly* every LM
-iteration instead of approximately -- Ceres requires Eigen as a hard dependency
-regardless of solver choice, so `EIGEN_SPARSE` is always available as the sparse
-backend even without SuiteSparse; a Homebrew `ceres-solver` install additionally links
-SuiteSparse, which Ceres prefers automatically when present, for an even faster exact
-solve. The mesh grids here are small (tens to low hundreds of vertices), so an exact
-sparse Cholesky factorization per iteration is computationally trivial. Also raised
-`optimizeGeometryCeres`'s `itersPerSubStep` from the original hardcoded 6 to
-`std::max(6, opts.cgMaxIterations)`, matching `useCeresJoint`'s budget -- with an
-exact solver, Ceres's own convergence tolerances (`function_tolerance`,
-`gradient_tolerance`, `parameter_tolerance`) stop it well short of a generous cap once
-it actually converges, so there's no real cost to keeping the two paths symmetric
-instead of leaving geometry-only arbitrarily starved relative to joint.
-
-**Not yet verified against a real Ceres build** -- same caveat as every Ceres change
-in this project: this sandbox has no Ceres installed, only a hand-written stub
-(`/tmp/ceres_stub`) used to syntax-check `MeshOptimizerCeres.cpp` compiles
-(`g++ -fsyntax-only -DGMCORE_WITH_CERES`), which caught no errors. This is a
-well-reasoned fix backed by a real, identifiable difference between the two solvers'
-preconditioning strength, not a proven one. Please rebuild on macOS with the real
-Homebrew Ceres and report reconstruction RMSE for hand-rolled vs. `--use-ceres` vs.
-`--use-ceres-joint` on the same test image so this can be confirmed -- if
-`SPARSE_NORMAL_CHOLESKY` isn't available in your Ceres build for some reason (it
-requires *some* sparse linear algebra backend at Ceres's own build time, which nearly
-every distribution -- including Homebrew's -- provides), Ceres will report that
-clearly via `Solver::Summary::message` / stderr rather than silently misbehaving.
-
-### Fixed: hand-rolled optimizer's default iteration budget was too low to converge
-
-Reported by the user: running the hand-rolled optimizer a SECOND time on its own
-already-optimized output (same mesh, same image, `optimizeCoarseToFine` called
-again) kept reducing RMSE substantially -- one 5x5-mesh `gradient.png` case went
-from 0.0315 to 0.0260. That should not happen at a real local optimum: a converged
-solve re-run on its own output should barely move.
-
-Reproduced directly with a standalone harness (`/tmp/converge_test.cpp`, exact same
-5x5-mesh-against-`gradient.png` setup as `gmesh_cli`'s defaults): one pass at the old
-default (`outerIterationsPerLevel=8`) reached RMSE 0.03147; running that same 8-outer-
-iteration pass twice in a row reached 0.03101; a single pass at
-`outerIterationsPerLevel=40` (same pyramid schedule, run once) reached 0.02817 --
-confirming 8 was simply stopping short of a real local optimum, not the run-twice
-result being an artifact of some other bug. Raising the ceiling to 100 produced
-*identical* per-level stopping iteration counts and final RMSE as 40, confirming 40
-isn't itself truncating anything -- it's a genuine ceiling, not a new bottleneck.
-
-Root cause: `outerIterationsPerLevel` defaulted to 8, a budget that was apparently
-tuned (or just guessed) against easier cases and never re-checked once other terms
-(vector-line, boundary, tangent-prior, corner-fixing) were added to the energy this
-loop is minimizing -- a harder case like a 5x5 mesh fitting a full-color gradient
-image needs meaningfully more outer Levenberg-Marquardt iterations than that to
-settle. (Also checked whether `geomGaussNewtonItersPerOuter`, the *inner* GN
-iteration count, was the real lever instead -- doubling it from 3 to 6 barely moved
-RMSE, 0.03146 vs the 8-outer-iteration baseline's 0.03147 -- so the outer count, not
-the inner one, was the actual bottleneck.)
-
-Fix, in two parts:
-
-1. Raised `OptimizerOptions::outerIterationsPerLevel`'s default from 8 to 40 (an
-   upper ceiling, not a target).
-2. Added `OptimizerOptions::outerConvergenceRelTol` (new field, default `1e-3`): the
-   outer loop now exits early once the relative improvement in
-   `computeGeometryEnergy` (the same composite data+vector-line+smoothness+tangent-
-   prior+boundary energy backtracking already checks every GN sub-iteration) between
-   successive outer iterations drops below this fraction. Without this, simply
-   raising the ceiling to 40 would make every case -- including already-converged
-   easy ones like the synthetic sphere -- 5x slower for no benefit. Set to 0 to
-   disable early-exit entirely.
-
-Verified with the same harness: a single pass at the new defaults (40 + early-stop)
-reaches RMSE 0.03065 on the 5x5 `gradient.png` case, better than manually running the
-old 8-iteration default twice (0.03101), in one `optimizeCoarseToFine` call.
-
-`outerConvergenceRelTol`'s default was then tuned by sweeping 1e-5 through 3e-3
-across three cases (synthetic sphere 9x9, `gradient.png` 25x25, `gradient.png` 5x5,
-via `/tmp/converge_test3.cpp`): the initially-chosen 1e-5 turned out needlessly
-tight -- it cost 24-40% more wall-clock than 1e-3 on *every* case (sphere: 6703ms vs
-4027ms; gradient 25x25: 42750ms vs 32583ms) for no measurable quality benefit (on the
-hard 5x5 case, 1e-3 actually reached a slightly *better* RMSE than 1e-5, 0.03041 vs
-0.03065 -- late Levenberg steps aren't guaranteed net-positive, so stopping a touch
-earlier isn't strictly a quality/speed tradeoff here). Looser still (3e-3) starts
-losing real quality on the hard case (RMSE back up to 0.03107, most of this fix's
-benefit given up), so 1e-3 was kept as the default -- a genuine sweet spot, not just
-"as loose as possible."
-
-Full regression suite (`/tmp/build_check2`, no-Ceres CMake build) re-run against the
-standard three cases (synthetic sphere 9x9, `gradient.png` 25x25, `gradient.png` 5x5)
-with these new defaults: all three run cleanly through `gmesh_cli`, early-stopping
-sensibly per pyramid level, no crashes or divergence, corner-fixing and the Sec-4.2
-vector-line term unaffected (this fix only touches the outer-loop stopping
-condition, not any residual or Jacobian).
-
-This fix, unlike the two Ceres-path fixes above, is fully verifiable in this sandbox
-(pure hand-rolled C++, no Ceres dependency) -- confirmed end-to-end here, not just
-structurally reasoned about.
-
-### Follow-up: a real bug in the early-exit itself, plus a separate (non-bug) multi-restart effect
-
-Reported by the user immediately after the fix above: it helped, but running the
-hand-rolled optimizer again on its own output *still* measurably improved RMSE.
-That shouldn't happen if the early-exit above genuinely detects convergence, so this
-needed a real second look rather than just nudging `outerConvergenceRelTol` again.
-
-Found an actual bug in the early-exit's logic, not just a mistuned constant: it
-compares this outer iteration's composite energy to the previous one and stops the
-moment the relative improvement drops below `outerConvergenceRelTol` -- but a
-rejected Gauss-Newton step (see the backtracking block in
-`optimizeAtCurrentResolution`) *reverts* the mesh to its pre-step state and only
-bumps the Levenberg damping (`lambda`) up 4x. The geometry genuinely didn't change
-that outer iteration, so of course its energy looks unchanged -- but a
-single-iteration check can't tell that apart from real convergence, and stops right
-there. The very next outer iteration, working from that same point but with more
-damping headroom already spent, can easily find a good step once `lambda` settles --
-which is exactly what calling `optimizeCoarseToFine` a second time was doing by
-accident: it resets `lambda` back to `geomDampingInitial` and gives the solve a fresh
-chance that the premature stop had denied it.
-
-Fix: added `OptimizerOptions::outerConvergencePatience` (default 3) -- the early-exit
-now requires that many CONSECUTIVE stalled outer iterations before it actually
-breaks, instead of trusting a single one. A lone stall (lambda transiently too high)
-just increments a counter and the loop keeps going; the counter resets the moment any
-iteration improves enough again.
-
-Verified this actually fixes the underlying bug, not just moves the symptom, by
-isolating the two effects that were previously tangled together:
-
-- **At a single FIXED resolution** (`optimizeAtCurrentResolution` called directly,
-  no pyramid), with the patience fix in place: calling it again on its own output
-  now shows an honest **~0.00% gap** (0.03066 -> 0.03065 -> 0.03066, i.e. noise) --
-  confirming the early-exit itself now genuinely detects convergence and the
-  original bug is fixed, not just patched over with looser numbers.
-- **Through the FULL `optimizeCoarseToFine` pyramid pipeline**, a small residual gap
-  remains even with the fix (~0.2-0.3% RMSE per repeated call on the 5x5
-  `gradient.png` case) -- but this is a *different, structurally expected*
-  phenomenon, not the same bug resurfacing: every call re-descends the mesh to the
-  COARSEST pyramid level and re-climbs, and on a repeat call that descent starts from
-  an already-refined mesh instead of the crude initial one. Because this is
-  non-convex block-coordinate descent, a different starting point at the coarse
-  level can (and measurably does) lead to a marginally different, sometimes better,
-  local optimum by the time it climbs back to the finest level -- a multi-restart
-  effect inherent to any coarse-to-fine non-convex optimizer, not a sign that any
-  individual level failed to converge.
-
-Rather than leave this as "just run it again if you want the last bit of polish"
-(what the user was already doing manually), added `OptimizerOptions::pyramidRestarts`
-(default 1, so existing behavior is unchanged) so `optimizeCoarseToFine` can repeat
-its own full sweep N times in a single call. Verified bit-exact equivalence:
-`pyramidRestarts=2` in one call produces the identical final RMSE (0.03061) as two
-separate `optimizeCoarseToFine` calls on the same mesh. Exposed as `gmesh_cli
---pyramid-restarts N` and as a `DocumentModel.pyramidRestarts` property on the macOS
-side (`DocumentModel.mm`'s `-optimizeWithPyramidLevels:progress:completion:`,
-following the same pattern as `useCeresGeometry`/`useCeresJoint`) -- left at the
-default of 1 there too rather than silently multiplying every optimize click's
-runtime; the macOS app doesn't yet have a UI control wired to this property (no
-storyboard/XIB change was made in this pass, since that can't be build-verified in
-this sandbox), so it currently only takes effect if set programmatically. A visible
-control (e.g. a small stepper next to the solver picker) would be a natural,
-low-risk follow-up.
-
-Full regression suite re-run again after this follow-up fix: sphere 9x9, `gradient.png`
-25x25 and 5x5 all build and run cleanly through `gmesh_cli`, including with
-`--pyramid-restarts 2` explicitly passed; `MeshOptimizerCeres.cpp` re-checked against
-the Ceres stub and is untouched/unaffected by this change (the patience and restart
-logic both live in the hand-rolled `optimizeAtCurrentResolution`/`optimizeCoarseToFine`
-control flow, outside the Ceres-specific solve functions those call into).
-
-### Bug found and fixed: the macOS app's internal `Image` was vertically mirrored relative to everything else
-
-Reported by the user from the app's UI: the mesh grid visually looked inconsistent
-with the displayed photo -- like one of the two was flipped vertically relative to
-the other.
-
-Traced the Y-axis convention through the entire pipeline end to end: `Image::loadPNG`/
-`loadPPM` (`core/src/Image.cpp`, used by the CLI), `GradientMesh::buildInitial`'s
-boundary/vertex construction, `CanvasView`'s on-screen mesh-overlay drawing and
-mouse-click-to-image-coordinate mapping (`mac/CanvasView.mm`), and `SVGExporter` are
-all mutually consistent: row 0 / y=0 = top, y grows downward, uniformly.
-
-Found one place that disagreed: `DocumentModel.mm`'s `-loadImageAtURL:error:`, the
-macOS app's actual image-loading path (the CLI's `Image::load` is a separate,
-unaffected code path -- see `Image.h`'s own comment that the app never calls it).
-It builds `_target` (the internal `gmcore::Image` used for every color sample, and
-for the optimizer's data/gradient energy terms) by drawing the loaded `CGImage` into
-a `CGBitmapContextCreate` bitmap context via `CGContextDrawImage`, then copying that
-buffer row-by-row into `_target` assuming row 0 = top. That assumption doesn't hold
-here: a fresh `CGBitmapContextCreate` context has Quartz/PDF's default coordinate
-convention -- origin at the BOTTOM-left, y increasing upward -- and `CGContextDrawImage`
-draws respecting that current transform, so without an explicit flip the image ends
-up right-side-up in y-up space, which means it's stored upside-down in the buffer's
-top-down memory layout. (This is a well-known, frequently-hit Core Graphics gotcha,
-not specific to this codebase -- searching "CGContextDrawImage draws image upside
-down" turns up many independent reports of exactly this scenario and exactly this
-fix.) The displayed `NSImage` (`self.displayImage`) is a completely separate object
-loaded straight from the file and was never affected -- `NSImage`'s own `-drawInRect:`
-self-orients regardless of the destination context's flip state -- so the bug was
-invisible in the raw photo display and only showed up in anything that used `_target`
-geometrically: initial per-vertex mesh colors sampled from the wrong row
-(`GradientMesh::buildInitial`, `target.sampleBilinear(S.x, S.y)`), and, if the
-optimizer ran, geometry pulled toward color/edge features that were actually the
-vertical mirror of what's on screen.
-
-Fix: added the standard `CGContextTranslateCTM(ctx, 0, h); CGContextScaleCTM(ctx, 1.0,
--1.0);` before the `CGContextDrawImage` call, so `buffer`'s row 0 ends up holding the
-image's true top row, matching every other stage's convention. Checked the app's one
-other `CGBitmapContextCreate` use (`-renderReconstructionPreview`, for the
-export/preview image): that path writes `gmcore::Image` pixel data directly into a
-buffer and wraps it with `CGBitmapContextCreateImage` -- it never calls
-`CGContextDrawImage`, so no CTM/transform is ever invoked and no flip is needed there;
-confirmed it was not a second instance of the same bug.
-
-**Confirmed on-device.** This sandbox has no Cocoa/Core Graphics toolchain, so the fix
-itself was written from reading the exact code path plus the (surprisingly hard to pin
-down with a single authoritative quote -- see below) Quartz coordinate-flip convention,
-not from a local rebuild-and-see-it-line-up test. The user rebuilt the app with this fix
-and tested against `gradient.png` (whose real corner colors, confirmed with `PIL`
-outside the app: top-left red, top-right green, bottom-right yellow, bottom-left blue,
-going clockwise -- matching the paper's own convention) and reported: before this fix
-`_target` was indeed mirrored (matching the diagnosis); after it, the mesh -- once
-optimized -- correctly snaps to the real (non-mirrored) image features, and
-`renderReconstructionPreview`'s output is correct. Direction of the fix confirmed
-correct, not just structurally reasoned about.
-
-Side note on process: trying to nail the *exact* mechanism down further by searching for
-an authoritative primary source (Apple's own docs on whether a fresh `CGBitmapContext`'s
-raw buffer row 0 is the image's top or bottom absent a flip) turned out to be
-surprisingly inconclusive -- multiple Apple reference pages and the Quartz 2D
-Programming Guide describe the *user-space* convention (bottom-left origin, y-up) but
-none of the fetched sources spelled out the raw-buffer-row question in so many words.
-The on-device empirical test above is what actually settled it, which is generally the
-more trustworthy signal for this class of bug anyway.
-
-If there's an old project file/mesh saved from before this fix, it may be worth
-re-optimizing it, since its vertex colors and any prior optimization were fit against
-the (then-mirrored) data.
-
-### Second, separate flip bug found: the DISPLAYED photo itself was upside-down in the app's canvas
-
-After the fix above, the user reported the mesh/reconstruction were now correct, but a
-follow-up, more specific report clarified something the first round of questions had
-missed: the loaded photo itself, as literally shown on screen in the canvas, displays
-upside-down -- a completely different code path than `_target`, and one this project's
-earlier CanvasView investigation (see the flip bug above) had assumed was fine.
-
-Root cause: `CanvasView.mm`'s `-drawRect:` shows the loaded photo via
-`[shown drawInRect:r fromRect:NSZeroRect operation:NSCompositingOperationCopy
-fraction:1.0]` -- `NSImage`'s "modern" (post-10.6) drawing API. The earlier
-investigation assumed this method auto-compensates for a flipped destination view
-(`CanvasView.isFlipped` returns `YES`, origin top-left, matching every other coordinate
-in this file). That assumption was wrong: `-drawInRect:fromRect:operation:fraction:`
-draws the image as-is in the current graphics-state coordinate system without any such
-compensation, so in this flipped view the photo comes out vertically mirrored. This is
-a real, if less commonly documented, AppKit gotcha -- unlike the Core Graphics flip
-fixed above, this one wasn't confirmed via extensive documentation archaeology (that
-approach had already proven unreliable once this session -- see the note above); it was
-identified directly from the user's live, on-device report and fixed on that basis.
-
-Fix: wrap just that one `drawInRect:` call in a save/concat/restore-scoped
-`NSAffineTransform` that reflects the image vertically within its own display rect
-(`translateXBy:0 yBy:(r.origin.y*2 + r.size.height)` then `scaleXBy:1.0 yBy:-1.0`,
-the standard idiom for this). Scoped narrowly so `drawBoundary`/`drawMesh`/
-`drawTangents`/`drawVectorLines` (drawn right after, via the same `viewPointFromImagePoint:`
-mapping already confirmed correct) are unaffected -- they already assumed a right-side-up
-image, so fixing the image draw to actually be right-side-up is what makes them agree
-with what's on screen, rather than requiring any change on their end.
-
-**Confirmed on-device**: after this fix, the loaded photo displays right-side-up.
-
-### Resolved: the `_target` CTM flip was backwards -- removed
-
-Immediately after confirming the photo displays correctly, a follow-up report: the
-*optimized mesh* still looks flipped (or isn't sampling from the right place during
-optimization) relative to the now-correctly-displayed photo.
-
-This raised a real concern about the FIRST fix in this sequence (the `_target` CTM flip
-in `DocumentModel.mm`, above): that fix was justified partly by the claim "the displayed
-NSImage was never affected -- `-drawInRect:` self-orients regardless of a flipped
-destination" -- a claim the very next fix (`CanvasView.mm`) proved WRONG for exactly
-that call. That undermines confidence in the reasoning used to justify the `_target`
-fix's direction, even though it doesn't by itself prove that fix is backwards --- an
-honest re-derivation from Quartz first principles was attempted and produced, once
-again, a result that contradicts the original justification (this time suggesting NO
-flip should have been needed for a freestanding, non-view-backed `CGBitmapContext`,
-since only an AppKit `isFlipped` view's compensating CTM -- not a raw bitmap context --
-would make `-drawInRect:`-style "always draw upright in current user space" logic
-produce an upside-down result). Given this analysis has now flip-flopped multiple times
-under supposedly careful reasoning, and given the CanvasView fix already showed that
-confident-sounding Core Graphics reasoning can be wrong here, theory alone isn't a
-reliable arbiter for this specific question any more.
-
-Rather than guess a third time, added a direct, unambiguous, on-device diagnostic
-instead: `loadImageAtURL:` now `NSLog`s `_target`'s 4 corner colors right after
-building it (`"[GMCORE _target orientation check] TL=... TR=... BL=... BR=..."`).
-Loading `gradient.png` and checking Xcode's console against that file's actual corner
-colors (TL red, TR green, BL blue, BR yellow -- confirmed independently, outside the
-app) settles definitively whether the existing CTM flip is right or backwards, with no
-remaining ambiguity -- unlike inferring it indirectly from how an optimized mesh looks,
-which depends on several other steps (mesh construction, the optimizer, rendering) all
-working correctly too.
-
-The diagnostic settled it: loading `gradient.png` with the flip in place logged
-`TL=(3,3,254) TR=(254,254,3) BL=(254,1,1) BR=(2,254,2)` -- i.e. TL=blue, TR=yellow,
-BL=red, BR=green, exactly top and bottom swapped relative to the file's real corners
-(TL=red, TR=green, BL=blue, BR=yellow). The flip was backwards.
-
-Fix: removed the `CGContextTranslateCTM`/`CGContextScaleCTM(1.0, -1.0)` pair added
-earlier, back to a plain, unflipped `CGContextDrawImage` call. No other change was
-needed -- everything downstream of `_target` (mesh construction, the optimizer,
-`GradientMesh::render`) was independently confirmed to already consistently assume
-"row 0 / y=0 = top" and never introduces its own flip, so once `_target` itself is
-right, the rest of the pipeline should already agree with it.
-
-The takeaway for this whole saga (three rounds: the original `_target` fix, the
-`CanvasView` display fix, and this correction): Core Graphics' exact flip behavior for
-`CGContextDrawImage` genuinely depends on subtle context (a bare `CGBitmapContext` vs.
-a view-backed one with `isFlipped`), confident-sounding reasoning about it was wrong
-twice in a row even when it cited real, well-known gotchas, and a cheap, direct,
-on-device diagnostic (log 4 known corner colors, compare against ground truth) settled
-in one rebuild what several rounds of documentation research and first-principles
-re-derivation couldn't. The `NSLog` diagnostic is left in place in `loadImageAtURL:`
-as a cheap regression check for this exact class of bug.
-
-**Confirm after rebuilding**: load `gradient.png` fresh (not a mesh/document left over
-from before this fix -- that would still carry stale, pre-fix-era vertex colors), build
-the mesh, and check that it now visually tracks the image correctly both before and
-after optimizing.
-
-### Fixed: reconstruction preview looked washed out on screen, but the exported PNG was correctly saturated
-
-Reported by the user: the optimized reconstruction, as drawn live in `CanvasView`,
-looked visibly lightened/less saturated than expected -- but saving it via File > Export
-PNG and reopening that file showed the colors fully saturated, matching expectations.
-
-Both the on-screen preview and the exported file are built from the exact same call
-(`-[DocumentModel renderReconstructionPreview]`, which rasterizes the mesh into a raw
-RGBA buffer and wraps it in an `NSImage`) -- `-exportPNGToURL:` calls it again and
-writes the resulting `CGImage` straight to a PNG, so the two paths start from
-numerically identical pixel bytes. That ruled out a data/optimizer bug (nothing about
-the mesh, the color solve, or the render math differs between the two) and pointed
-at how the same bytes get *interpreted* differently by two different consumers.
-
-The cause: `renderReconstructionPreview`'s bitmap context was created with
-`CGColorSpaceCreateDeviceRGB()`. Despite the name, this does not mean "use the actual
-display's color response" -- it's legacy CoreGraphics terminology for an
-untagged/ambiguous "generic device" RGB space. When AppKit composites an image tagged
-this way into a modern window's (wide-gamut, typically Display P3) backing store, the
-color-management pipeline has to pick *some* concrete interpretation for that
-ambiguous tag, and can fall back to an old "Generic RGB" ColorSync profile with a
-visibly flatter, less saturated response than sRGB. A PNG file, by contrast, is opened
-by other apps (Preview, QuickLook, etc.) under the modern convention that an
-untagged/generic image means sRGB -- so the identical numeric bytes render with full,
-correct sRGB saturation once reopened from disk. Two different implicit assumptions
-about the same ambiguous tag, in two different code paths, produced two different
-looking results from one set of numbers.
-
-Fix: `CGColorSpaceCreateDeviceRGB()` replaced with the explicit, unambiguous
-`CGColorSpaceCreateWithName(kCGColorSpaceSRGB)` in both
-`renderReconstructionPreview` and `loadImageAtURL:` (the latter builds `_target`'s
-numeric buffer from the source file -- fixed too, for consistency, so the color space
-that actually gets optimized against, rendered, and displayed is the same well-defined
-sRGB space throughout the pipeline, not an ambiguous one at the very first step). No
-change to any optimizer math or file formats -- purely a color-space tag on two
-`CGBitmapContextCreate` calls.
-
-**Confirm after rebuilding**: re-open a photo (ideally one known to be wide-gamut,
-e.g. a recent iPhone photo, which is where this would be most visible), optimize, and
-compare the live `CanvasView` reconstruction against a fresh PNG export side by side --
-they should now look the same, both fully saturated.
-
-### Fixed and verified: useCeresJoint's color-throttling gate bug (the SPARSE_NORMAL_CHOLESKY fix alone wasn't enough)
-
-The user exported the same mesh (6x6 patches on `gradient.png`) as SVG from both
-`--use-ceres-joint` and the hand-rolled path and sent both files. Rather than eyeball
-them, every mesh vertex's color was cross-checked against the true `gradient.png` pixel
-at that vertex's position (parsing the exported `<meshgradient>` stops, which also
-served as a free, exhaustive check that adjacent patches still agree exactly at every
-shared vertex -- position and color disagreement across all 49 shared vertices: zero,
-in both files, confirming the SVG exporter itself is not in question here).
-
-Results: hand-rolled's per-vertex color RMSE was 7.5/255 (0.0295 normalized), with all
-4 mesh corners essentially exact (~0.6/255 error). `--use-ceres-joint`'s was 23.0/255
-(0.0901 normalized) -- about 3x worse -- and, tellingly, the 4 corners were NOT close:
-27-43/255 error each, worse than plenty of interior vertices. That "worse even at the
-corners" detail is the key clue: corner POSITION is hard-fixed (`SubsetManifold`, see
-`fixCornerPositions`) in both paths, so a corner's local fitting problem is about as
-easy as this gets -- there's no plausible reason a correctly-converging solver should
-do noticeably worse there than in the interior. So the SPARSE_NORMAL_CHOLESKY fix
-above, while itself correct and necessary, did not fix the actual reason
-`--use-ceres-joint` underperforms; something else was still throttling color broadly,
-everywhere, corners included.
-
-Found it by comparing `optimizeJointCeres`'s structure against the hand-rolled
-block-coordinate-descent loop it's meant to replace. Hand-rolled re-solves color to its
-*exact* conditional optimum (given the current geometry -- the data term is linear in
-color, so this isn't a linearized approximation, it's the literal minimizer) every
-single outer iteration, completely independent of how well that same outer iteration's
-geometry step goes. `optimizeJointCeres`, by contrast, computes ONE scalar `alpha` from
-the TOTAL combined (geometry + color) energy each of its `geomGaussNewtonItersPerOuter`
-sub-steps, then applies that SAME alpha to interpolate every vertex's geometry AND
-color between `before` and `after`. A geometry difficulty localized to one part of the
-mesh (the harder nonlinear vector-line/boundary terms are the likely candidate) can
-shrink or reject the whole step -- throttling color's progress everywhere, including at
-vertices (like the corners) whose own proposed color update was already fine on its
-own. This is a real structural gap between the two paths, not a residual/Jacobian bug
--- consistent with the exhaustive term-by-term audit done for the previous fix turning
-up nothing.
-
-Fix: factored the hand-rolled exact color solve out of
-`optimizeAtCurrentResolution`'s block-coordinate-descent color step into a new
-standalone `gmcore::solveColorExact(mesh, target, opts)` (declared in
-`MeshOptimizer.h`, defined in `MeshOptimizer.cpp`, used unchanged by the hand-rolled
-path -- purely a refactor there, same code, same behavior). `optimizeJointCeres` now
-calls it unconditionally once, after its own gated geometry+color sub-steps settle
-(accepted at some alpha, or fully reverted). Ceres's joint LM step is still what
-*chooses where to move* -- preserving the position/color coupling that's the whole
-point of `useCeresJoint` (e.g. for the paper's Fig. 4 pinch) -- but color's value going
-forward is now always the exact solve, never left wherever the shared alpha gate
-happened to strand it.
-
-Syntax-checked (`g++ -fsyntax-only`) and link-checked (both object files compile,
-with `solveColorExact` correctly `T` (defined) in `MeshOptimizer.o` and `U` (undefined,
-resolved at link time) in `MeshOptimizerCeres.o` -- confirming it isn't accidentally
-stuck in the anonymous namespace both files otherwise use for their private helpers)
-before being sent for a real rebuild.
-
-**Verified against a real Ceres build.** The user rebuilt, re-exported the exact same
-mesh from `--use-ceres-joint`, and sent the new SVG for the same per-vertex check.
-Result: per-vertex color RMSE dropped from 23.0/255 (0.0901) to 8.0/255 (0.0312) --
-right in line with hand-rolled's 7.5/255 (0.0295), closing essentially the whole gap.
-The 4 corners now fit almost exactly (0.0-0.8/255 error, matching hand-rolled's
-corner precision). What error remains is concentrated at the same couple of interior
-vertices where hand-rolled *also* has its own worst fit (a genuinely hard local
-feature in `gradient.png` -- a sharp transition around x~100-120 in the top rows, not
-a mesh-resolution or solver artifact) -- i.e. the remaining error is shared with
-hand-rolled's own hardest spot, not something specific to the joint path anymore. This
-confirms the diagnosis: the gate bug, not the residual math, was the actual reason
-`--use-ceres-joint` underperformed.
-
-### Corrected, debug-data-verified 9x9 comparison -- and a real, smaller gap found and (unverified) addressed
-
-A later report ("как то не очень", a 9x9 mesh) turned out to rest on a misread filename
-(`rmse0234` was 0.0234, read as 0.234 -- a spurious 10x). The Auto-export debug data
-checkbox (see above) made it possible to check properly: exporting full debug JSON for
-hand-rolled, `useCeresGeometry`, and `useCeresJoint` on the SAME 9x9 mesh/image and
-re-implementing `evalPos`/`evalColor`/`reconstructionRMSE` independently in Python from
-the exported `P`/`Pu`/`Pv`/`C`/`Cu`/`Cv`/`Cuv` data matched the app's own `lastRMSE` to
-full double precision on all three files -- confirming both the export and the
-independent re-implementation are correct, and enabling a trustworthy comparison:
-
-| solver | RMSE | wall-clock |
-|---|---|---|
-| hand-rolled | 0.0156 | 47.8s |
-| `useCeresGeometry` | 0.0166 (+6.6%) | 57.1s |
-| `useCeresJoint` | 0.0234 (+50%) | 101.1s |
-
-All three had `solver.builtWithCeres: true` and `solver.effective == solver.requested`,
-so Ceres genuinely ran in all cases -- not a silent fallback. `useCeresGeometry` (Ceres
-for position/tangents only, color still solved exactly via `solveColorExact`, same
-alternating scheme as hand-rolled) stays close to hand-rolled. `useCeresJoint` is a real
-~50% RMSE gap and ~2x slower -- a much smaller gap than the earlier (misread) numbers
-suggested, but a genuine, still-unresolved one. Comparing vertex data directly in the
-image's hardest region (the same sharp white->green/blue transition around x~100-130
-noted above): `useCeresJoint`'s vertex positions diverge from hand-rolled's/
-`useCeresGeometry`'s by up to ~15px, and `Pu`/`Pv` tangent magnitudes run ~30-40%
-smaller, concentrated exactly where its per-patch RMSE was worst -- not a degenerate/
-collapsed mesh, just a different, worse local optimum.
-
-Diagnosis: `useCeresJoint`'s combined 18-unknowns-per-vertex (position+color) linearized
-step can improve the dense data-term residual (49 quadrature samples per patch, see
-`GradientMesh::reconstructionRMSE`) just as effectively by moving WHERE a sample lands
-on the target image as by improving the color comparison there -- something neither
-hand-rolled's alternating scheme nor `useCeresGeometry`'s frozen-color residual can do,
-since neither ever has position and "the thing being matched against" both free in the
-SAME linearized step. Nothing in the residual math is wrong; it's an emergent property
-of solving position and color jointly against a small, discrete sample set.
-
-Addressed (not yet verified against a real build) by adding
-`OptimizerOptions::jointGeomStepDampingWeight` (`MeshOptimizerCeres.cpp`'s new
-`JointGeomStepDampingCostFunction`): a soft per-vertex penalty, inside `jointSolveOnce`'s
-own `ceres::Problem`, on how far `P`/`Pu`/`Pv` move within a single joint solve relative
-to the mesh state that solve started from -- makes moving geometry "cost" something in
-the joint objective (same idea as `geomTangentPriorWeight`/`colorDerivRidge` already
-keeping other unknowns grounded), so Ceres's own LM iterations are discouraged from
-proposing such a step in the first place, rather than only catching it after the fact via
-`optimizeJointCeres`'s existing alpha-backtracking gate (which still runs unchanged, and
-now also folds this same penalty into `computeTrueJointEnergy` via a new
-`geomStepReference` parameter, so the accept/reject energy stays consistent with what
-the Ceres problem actually minimized -- same line-search-consistency reason every other
-term in that function already follows). Explicitly kept as an addition, not a
-replacement of true joint solving (position and color still solved together in one
-`ceres::Problem`) -- decoupling them into an alternating scheme instead was considered
-and rejected: it would leave `useCeresJoint` functionally almost identical to
-`useCeresGeometry` (differing only in how often color gets re-solved within an outer
-iteration), which defeats the point of offering it as a separate mode.
-
-The starting weight (`0.3`) is a reasoned guess, NOT a measured optimum -- there is no
-Ceres build in the sandbox this was developed in to tune it against. **If you rebuild
-and re-run `useCeresJoint` on the same mesh/image, please compare its new
-Auto-export-debug-data RMSE and per-vertex position spread against the 0.0234/~15px
-baseline above.** If the gap closes without meaningfully hurting `useCeresJoint`'s
-wall-clock or convergence, leave it; if it overshoots (RMSE now worse, or `useCeresJoint`
-starts looking suspiciously identical to `useCeresGeometry`), try lowering the weight; if
-the gap barely moves, try raising it.
-
-### Verified: `useCeresGeometry` then `useCeresJoint` -- staged, run once each -- beats every single-solver option
-
-Real on-device runs (git `81784c3-dirty`, the step-damping commit above) with the
-Auto-export debug data checkbox on, same 9x9 mesh/image throughout:
-
-| sequence | final RMSE | joint stage wall-clock |
-|---|---|---|
-| hand-rolled (single Optimize) | 0.01559 | -- |
-| `useCeresGeometry` x1 (fresh mesh) | 0.01662 | -- |
-| `useCeresGeometry` x2 (Optimize clicked twice) | 0.01557 | -- |
-| ...then switch to `useCeresJoint`, Optimize once | **0.01494** | 21.5-21.8s |
-| ...then `useCeresJoint` again (same mesh) | 0.01692 | 23.7s |
-| ...then `useCeresJoint` a third time | 0.01732 | 23.7s |
-
-Two independent repeats of the full "fresh mesh -> geometry -> geometry -> joint once"
-sequence produced the identical final RMSE (`0.014935881251664193`, matching past the
-last bit of double precision both times) -- the solver is fully deterministic, and this
-specific staged sequence reproducibly beats every single-solver run tried so far,
-including hand-rolled alone. It also makes the `useCeresJoint` stage itself much
-cheaper (~22s vs. the ~101s a from-scratch `useCeresJoint` run took, see above): most of
-the position/tangent work is already done by the geometry passes, so joint only needs a
-short, cheap final pass to pull color and position into agreement, which the
-step-damping fix's smaller allowed movement suits well.
-
-**But joint gets WORSE if you keep running it.** Clicking Optimize a second and third
-time with `useCeresJoint` already selected, on the already-joint-refined mesh, moved
-RMSE 0.01494 -> 0.01692 -> 0.01732 -- monotonically away from the good point it had just
-reached, not further toward it. So `jointGeomStepDampingWeight`'s per-substep damping
-(new above) reins in any ONE proposed step, but doesn't fully stop joint's combined
-position+color coupling from slowly drifting toward a worse configuration over MANY
-outer iterations even starting from an already-good mesh -- consistent with the same
-underlying mechanism (trading position accuracy for local color fit at the dense
-quadrature samples), just needing more outer iterations to accumulate when there's less
-room to move per step. **Practical recipe until this is understood/fixed further: run
-`useCeresGeometry` (ideally twice), then `useCeresJoint` exactly ONCE, then stop --
-don't keep re-optimizing with joint selected.**
-
-Also fixed in this round: `-exportDebugDataToURL:error:`'s JSON was missing
-`jointGeomStepDampingWeight` from its `optimizerOptions` dump (the field was added to
-`OptimizerOptions` but the export dictionary literal in `DocumentModel.mm` wasn't
-updated to match) -- present in exports from now on; the runs in the table above predate
-the fix, so their own JSON files don't show the weight actually in effect (0.3, this
-build's default -- there's no UI to change it yet).
-
-### Confirmed independently: a scripted, reproducible repeated-call drift probe
-
-The "joint gets WORSE if you keep running it" finding above came from manually
-clicking Optimize in the app -- real, but a one-off, hand-driven sequence on one
-specific mesh/build (`81784c3-dirty`). Added `spike/ceres_joint_drift_probe.cpp` (a
-throwaway, uncommitted-to-build spike, same convention as the other two `spike/*.cpp`
-files) to check the same claim in a controlled, scripted, anyone-can-rerun way: it
-builds ONE fresh mesh, then calls `MeshOptimizer::optimizeCoarseToFine` on that SAME
-mesh object repeatedly (never rebuilding it between calls -- exactly what repeatedly
-clicking "Optimize" does), for hand-rolled, `useCeresGeometry`, and `useCeresJoint`
-side by side, logging RMSE and mean/max control-point displacement after each repeat.
-This project's usual Linux sandbox has no Ceres, so this had to be built and run
-directly on a real Mac (`bash spike/run_joint_drift_probe.sh`, using the Homebrew
-Ceres install) -- first real run of `useCeresJoint` this project has been able to do
-outside the app itself.
-
-5x5 mesh, `gradient.png`, 6 repeats (RMSE, % reduction from the initial 0.081338):
-
-| repeat | hand-rolled | `useCeresGeometry` | `useCeresJoint` |
-|---|---|---|---|
-| 1 | 0.029447 (63.8%) | 0.031010 (61.9%) | 0.026574 (67.3%) |
-| 2 | 0.026283 (67.7%) | 0.026066 (68.0%) | 0.029339 (63.9%) |
-| 3 | 0.026243 (67.7%) | 0.025845 (68.2%) | 0.029696 (63.5%) |
-| 4 | 0.027590 (66.1%) | 0.025888 (68.2%) | 0.029773 (**63.4%, joint's worst point**) |
-| 5 | 0.027860 (65.7%) | 0.025956 (68.1%) | 0.028177 (65.4%) |
-| 6 | 0.027876 (65.7%) | 0.025827 (**68.2%, best of all 18 cells**) | 0.028435 (65.0%) |
-
-9x9 mesh, same image, 6 repeats (RMSE, % reduction from the initial 0.039873):
-
-| repeat | hand-rolled | `useCeresGeometry` | `useCeresJoint` |
-|---|---|---|---|
-| 1 | 0.017001 (57.4%) | 0.018686 (53.1%) | 0.015530 (61.1%) |
-| 2 | 0.015337 (61.5%) | 0.016045 (59.8%) | 0.015521 (**61.1%, tied best**) |
-| 3 | 0.015516 (61.1%) | 0.016395 (58.9%) | 0.015521 (**61.1%, tied best**) |
-| 4 | 0.015930 (60.0%) | 0.016321 (59.1%) | 0.015988 (59.9%) |
-| 5 | 0.015006 (**62.4%**) | 0.016275 (59.2%) | 0.015877 (60.2%) |
-| 6 | 0.015329 (61.6%) | 0.016204 (**59.4%**) | 0.015914 (60.1%) |
-
-Ranking all 18 cells of the 5x5 table by RMSE, `useCeresGeometry` actually dominates
-(its worst repeat, 1, is the only one beaten by hand-rolled/joint's best moments) --
-so this is NOT a case of joint reaching the best result and then losing it. Both
-hand-rolled and `useCeresGeometry` wobble by a percentage point or two run to run
-(ordinary GN/quadrature noise as the mesh keeps making small adjustments) but never
-show a clear, sustained regression -- their best and worst repeats stay close together
-and neither trends worse over time. `useCeresJoint` is different in exactly the way the
-manual-clicking finding above described, just judged against its OWN earlier repeats
-rather than against the other two solvers: its repeat-1 result (0.026574) is its best
-of the run, sitting between hand-rolled's and `useCeresGeometry`'s own repeats -- an
-unremarkable start, not a win -- and then it gets steadily WORSE for three more repeats
-(0.029339 -> 0.029696 -> 0.029773, a real ~12% relative RMSE regression from its own
-repeat-1 result) before a partial recovery at repeats 5-6 that never fully returns to
-repeat 1's quality. Control-point displacement (`meanDisp`/`maxDisp` in the tool's own
-output) keeps shrinking the whole time, confirming this isn't the solver failing to
-converge numerically -- it converges, just to a worse configuration than the one it had
-already found. The 9x9 mesh shows the same self-regression shape in miniature:
-`useCeresJoint` settles beautifully by repeat 3 (displacement down to 0.12px, RMSE
-0.015521, its best value on this mesh), then at repeat 4 the mesh moves substantially
-again (displacement jumps back up to 0.44px) for no RMSE benefit at all (0.015521 ->
-0.015988, worse) and never fully re-settles over the remaining repeats -- a much
-smaller regression in absolute terms than the 5x5 case (~3% vs. ~12%), but the same
-shape: real movement that makes things worse, not just noise.
-
-This is a second, independent, scripted confirmation of the same failure mode already
-documented above from real app usage -- not a new discovery, but real empirical
-evidence (this project's first actual `useCeresJoint` Ceres run outside the app) that
-the phenomenon isn't specific to one build, one mesh, or manual-clicking noise, and is
-consistent with the mechanism `JointGeomStepDampingCostFunction`'s own comment already
-names: its damping reference snapshot is retaken fresh at the very start of every
-single top-level `optimizeJointCeres`/`jointSolveOnce` call, so it damps a large jump
-WITHIN one call but does nothing to stop slow drift ACROSS separate calls. Reproduce
-with `bash spike/run_joint_drift_probe.sh` (needs Ceres; add `--rows N --cols N
---repeats N` to `ceres_joint_drift_probe`'s own invocation for other mesh sizes).
-Practical guidance is unchanged from above: run `useCeresGeometry`, then `useCeresJoint`
-once, then stop -- don't keep re-optimizing with joint already selected. Actually
-persisting the damping snapshot across separate top-level calls (so repeated clicks
-would damp against the ORIGINAL pre-joint mesh, not just within-call) is a real
-candidate fix, not attempted here -- this was a verification pass, not a fix.
-
-### Follow-up: `smoothGeomEdgeGain` sweep on the Fig. 4 edge-snapping gap -- real improvement, but a real trade-off, not adopted as a new default
-
-Revisited "Deeper finding: coarse meshes still don't snap to an edge the way Fig. 4
-does" (above) now that `--geom-data-weight` exists in `gmesh_cli` and this project has a
-device that can actually run the hand-rolled solver directly (no Xcode/Ceres needed for
-this -- `smoothGeomEdgeGain` only affects the hand-rolled geometry Gauss-Newton path).
-First, located the same 5x5/`gradient.png` test's actual target edge directly (a small
-one-off probe measuring the sharpest per-row colour gradient, not eyeballed): the true
-edge sits at approximately x=115, 114, 88, 135, 125 for the mesh's 5 rows (top to
-bottom) -- confirming the "true edge's x spans ~89-138" figure quoted in the original
-finding, and giving exact per-row targets to compare against instead of just a min/max
-range.
-
-Baseline (current defaults, `smoothGeomEdgeGain=40`): interior column (col 2) x =
-107.6, 107.2, 103.3, 108.7, 115.3 (range 12.0px) against a true target of
-115, 114, 88, 135, 125 (range 47px) -- i.e. today's defaults recover only the faintest
-hint of the actual shape (barely dips at row 2, barely rises at row 3), consistent with
-the original finding.
-
-Swept `--edge-gain` (`smoothGeomEdgeGain`) from 40 up to 400 on the same case:
-
-| `--edge-gain` | col-2 x by row | range | final RMSE |
-|---|---|---|---|
-| 40 (current default) | 107.6, 107.2, 103.3, 108.7, 115.3 | 12.0 | 0.03067 (62.3%) |
-| 100 | 115.4, 114.0, 95.4, 104.1, 115.2 | 20.0 | 0.02802 (65.6%) |
-| **150** | 115.3, 114.8, 96.3, 107.7, 112.0 | 19.0 | 0.02815 (65.4%) |
-| 200 | 115.3, 114.8, 96.0, 107.8, 112.0 | 19.3 | 0.02815 (65.4%) |
-| 300 | 108.2, 107.3, 96.9, 110.2, 111.5 | 14.5 | 0.03026 (62.8%) |
-| 150 + `--pyramid-restarts 3` | 115.4, 114.0, 92.3, 106.7, 115.7 | 23.4 | 0.02622 (**67.8%**) |
-
-150-200 is a clear sweet spot (400+ trails back off, matching the earlier
-`smoothWeightGeom` sweep's own shape: too little regularization becomes its own
-problem). At `--edge-gain 150 --pyramid-restarts 3`, the mesh's row-0/row-1 values
-(115.4, 114.0) now match the true edge (115, 114) almost exactly, and row 2's dip
-(92.3 vs true 88) and row 4's rise (115.7 vs true 125) both move substantially in the
-right direction -- a real, qualitative improvement in tracking the notch's actual shape,
-not just a wider but still-wrong range. Row 3 (106.7 vs true 135) remains the biggest
-remaining gap; edge-gain alone doesn't close it.
-
-**But this is not a free win -- regression-checked exactly the way this project always
-checks a change like this, and it is NOT clean:**
-
-| test case | default (`edge-gain=40`) | `edge-gain=150, restarts=3` |
-|---|---|---|
-| 5x5 `gradient.png` (the case above) | RMSE 0.03067 (62.3%) | RMSE 0.02622 (**67.8%**, better) |
-| 25x25 `gradient.png` (finer mesh, same image) | RMSE 0.00601 (65.6%) | RMSE 0.00601 (65.7%, a wash) |
-| 9x9 synthetic sphere (smooth image, no sharp edges) | RMSE 0.03944 (56.5%) | RMSE 0.04298 (**52.6%, worse**) |
-
-Raising `smoothGeomEdgeGain` measurably helps a COARSE mesh snap onto a real sharp edge
-(the whole point of this investigation), is roughly neutral on a finer mesh of the same
-image (makes sense: a 25x25 mesh already has enough control points that individual
-patches are small relative to the edge, so this specific coarse-mesh failure mode
-barely applies), but measurably HURTS a smooth image with no real edges at all -- almost
-certainly because "relax smoothing near a strong local image gradient" starts
-mistaking ordinary smooth shading/noise gradients for edges once the gain is high
-enough, over-relaxing regularization somewhere it shouldn't. This is exactly the kind
-of trade-off a global default change would silently impose on every image, sharp-edged
-or not -- so **not adopted as a new default**. Given this real, per-image trade-off,
-the right fix is exposing it as a UI-tunable weight rather than changing what every
-image gets by default -- done in the app as `smoothGeomEdgeGain`, DocumentModel's
-eighth tunable `OptimizerOptions` weight (its own "Edge gain:" field in
-MainWindowController's geometry-weights row, mirroring `geomDataWeight`'s field at
-every touch point: `-optimize:`'s read, `-resetWeights:`'s and preset-load's reload,
-and the preset JSON round-trip -- see `DocumentModel.h`'s comment on the property for
-this same sweep summary), still defaulting to 40.0, so someone working on a specific
-sharp-edged image can dial it up deliberately in the UI (not just via
-`gmesh_cli --edge-gain`) without changing what every other image gets by default.
-
-The bigger remaining gap (row 3's 106.7 vs true 135, still the largest miss even at the
-best setting found) still points at the same conclusion the original finding reached:
-an annealed `smoothWeightGeom` schedule (or some other mechanism that isn't just "turn
-one existing knob up") is probably still needed to close this fully -- not attempted
-yet, flagged here as the next real candidate.
-
-## A real cutout tool: Lazy-Snapping-style graph-cut segmentation
-
-Task 3 in this project's current priority order (regression tests, then paper-fidelity
-accuracy work, then a real selection tool -- both earlier items are done, see "Regression
-tests" above and the Ceres/`smoothGeomEdgeGain` sections). This is the item "Known
-simplifications" already flagged: *"The 'cutout tool' is plain click-tracing... the
-paper cites a separate Lazy-Snapping-style interactive segmentation tool."* Part 1
-(below) added the actual segmentation ALGORITHM as pure, tested `core/` C++ before any
-UI code was written against it -- the goal was getting the algorithm itself right and
-verified first. Part 2 (further below) wires it into `CanvasView`/`MainWindowController`.
-
-### Part 1: the segmentation algorithm (`core/`, no UI)
-
-**Design.** Three new, independent, dependency-free `core/` modules:
-
-* `MaxFlowGraph.h/.cpp` -- a generic Dinic's maximum-flow algorithm over a directed
-  graph with real-valued capacities. Segmentation-agnostic (knows nothing about pixels
-  or colour); by max-flow/min-cut duality, the nodes still reachable from the source in
-  the final residual graph after `maxFlow()` runs ARE one minimum s-t cut. Chose Dinic's
-  over the closely-related Boykov-Kolmogorov algorithm (the other standard choice for
-  interactive segmentation) deliberately: BK's main edge over Dinic's is warm-starting a
-  new solve from a previous one's search trees when only a few terminal weights change
-  (useful for truly-live scribble editing); this tool instead re-solves once per
-  "Segment" click on a complete, fixed scribble set, so that advantage doesn't apply,
-  and Dinic's textbook level-graph + blocking-flow structure is meaningfully simpler to
-  implement and verify correctly from scratch.
-* `LazySnapping.h/.cpp` -- `segmentForeground(image, scribbles)`: builds a small k-means
-  colour-cluster model (8 clusters, deterministic seeding) from each of the
-  foreground/background scribbles, then a graph over the image's pixels with the
-  standard Boykov & Jolly (2001) *"Interactive Graph Cuts"* energy -- implemented from
-  that general graph-cuts formulation (which Lazy Snapping's own graph-cut step is built
-  on), not re-derived from the original Lazy Snapping paper's exact text, an honest
-  distinction worth flagging given this project's paper-fidelity focus: a unary data
-  term (cost of a label proportional to colour distance from THAT label's own cluster
-  set -- i.e. a -log-likelihood-style term) plus a contrast-sensitive 8-connected
-  pairwise smoothness term (`smoothnessWeight * exp(-colourDistSq / (2*sigma^2))`,
-  `sigma^2` auto-estimated as the image's own mean squared neighbour-pixel colour
-  distance, the standard Boykov-Jolly auto-tuning trick) that pulls the cut boundary
-  toward real image edges. Scribbled pixels get a hard terminal constraint instead of
-  the soft cluster-based cost.
-* `ContourTracing.h/.cpp` -- `traceOuterContour` (Moore-neighbor tracing with Gonzalez &
-  Woods' stopping criterion, over the LARGEST 8-connected component of the resulting
-  mask) turns the binary mask into an ordered pixel-boundary polygon, and
-  `simplifyClosedPolygon` (Ramer-Douglas-Peucker, adapted to a closed loop by splitting
-  it into two open chains at two anchor points) reduces that from thousands of
-  one-per-pixel points down to a small, clickable number -- so that the output plugs
-  directly into the EXISTING `-setBoundaryPolygonPoints:`/`-fitBoundaryWithCornerIndices:`
-  pipeline `CanvasView`'s corner-picking + per-side Bezier fit already implements. Lazy
-  Snapping only replaces how this polygon is OBTAINED; everything downstream (corner
-  picking, Bezier fitting, mesh building) is untouched and already paper-faithful.
-
-**Two real bugs found and fixed by the new tests** (`core/tests/test_main.cpp`'s
-`maxflow_*`/`segmentation_*`/`contour_tracing_*` cases, 6 new test functions):
-
-1. `segmentForeground`'s fg/bg cluster distances were initially swapped -- an easy
-   polarity mistake (cost of a label must be proportional to distance from THAT SAME
-   label's own cluster set, not the opposite one). With the bug,
-   `test_segmentation_separates_two_color_blocks` (a trivial, huge-contrast synthetic
-   case: solid red left half, solid blue right half, a handful of scribbles deep in
-   each) returned only the literal scribbled pixels as foreground -- 5 out of 400 pixels
-   on the correct side, instead of ~400/400 -- because with the swap, every pixel's
-   "cost of being background" came out near zero deep inside the TRUE foreground region,
-   making it cheap for the graph cut to sever almost every non-scribbled pixel to
-   background. Fixed; the same test now gets 400/400 and 400/400.
-2. `traceOuterContour`'s stopping criterion compared the current backtrack DIRECTION to
-   an arbitrary initial guess (the pixel's west neighbor), which only accidentally
-   matches when a shape happens to be re-entered from the west -- for a plain 5x5 filled
-   square, the trace naturally returns to its start corner from the NORTH instead, so
-   the direction comparison never matched and the loop spun around the same ~20-pixel
-   perimeter until hitting a safety cap, producing 866 points instead of ~17.
-   Corrected to Gonzalez & Woods' actual textbook criterion: remember s1 (the second
-   boundary point ever found), and stop when the trace is back at s0 and about to
-   re-find s1 next -- regardless of which direction it re-arrived at s0 from.
-
-**Verified performance** (this device, real Ceres/cmake unrelated -- this is plain
-`g++`, no external dependency): segmenting the project's own 213x213 `gradient.png`
-test image with ~40 scribble pixels of each colour took 119ms; a synthetic 500x500
-two-colour-block image took 44ms, and 1000x1000 took 227ms. All comfortably interactive
-for this project's typical image sizes -- though these are all high-colour-contrast,
-low-texture cases (the easiest kind for a graph cut to converge quickly on); a real
-photo with more texture/noise will need more augmenting paths and take longer -- not
-measured here, since this was run against the same easy synthetic/test cases part 1
-was verified against, before part 2's UI existed to test with real user photos.
-
-### Part 2: wired into the UI
-
-`DocumentModel` gained foreground/
-background scribble storage (`_fgScribbles`/`_bgScribbles`, reusing the existing
-`VectorLine` polyline struct purely for convenience -- these have nothing to do with the
-vector guide lines) plus `-segmentBoundaryFromScribblesWithError:`, which rasterizes
-each stored stroke into pixel-coordinate scribble sets (stamping a filled radius-4 disc
-around every stored point so a drag reads as a solid band rather than a dotted line to
-the graph cut), runs `segmentForeground` against the raw sRGB image (segmentation is a
-pre-mesh-building step, so `useCIELUVColorSpace` doesn't apply here), traces the largest
-resulting component with `traceOuterContour`, simplifies it with `simplifyClosedPolygon`
-(epsilon 2.0px), and feeds the result into the EXACT SAME `-setBoundaryPolygonPoints:`
-entry point manual click-tracing already produces -- so corner-picking and Bezier
-fitting needed zero changes, exactly as planned in part 1.
-
-`CanvasView` gained two new `GMToolMode` cases, `GMToolModeScribbleForeground`/
-`GMToolModeScribbleBackground` -- click-drag (or a single click, for a one-pixel "dab")
-paints a stroke in green (foreground) or pink (background), denser-sampled (3px) than
-the existing vector-line tool's 4px since consecutive scribble points need to overlap
-once rasterized into discs. `MainWindowController`'s tool-mode segmented control grew
-from 4 to 6 segments (`1. Trace Boundary / 1. Scribble FG / 1. Scribble BG / 2. Pick 4
-Corners / 3. Vector Line / 4. Edit Mesh` -- the "1." prefix repeats deliberately: manual
-tracing and scribbling are two alternative ways to do the same step 1), with a new
-"Segment"/"Clear Scribbles" button row underneath the tool selector.
-
-**A real, pre-existing bug this surfaced (found and fixed before it ever reached the
-UI in a working state):** `CanvasView`'s `-drawBoundary` method, and separately its
-corner-pick-dot-rendering loop, both referenced `_boundaryDraft` (the array manual
-click-tracing appends to as the user clicks) unconditionally. `GMToolModeCorners`'s own
-`mouseDown:` handler already fell back to `dm.boundaryPolygonPoints` when
-`_boundaryDraft` was empty (for finding which point was clicked), but the two *drawing*
-code paths didn't -- meaning a segmentation-produced polygon, which only ever populates
-`dm.boundaryPolygonPoints` directly and never touches `_boundaryDraft`, would have been
-completely invisible on screen, and picked corner markers would never have rendered
-either. This was latent and harmless before scribbles existed (nothing previously set
-`boundaryPolygonPoints` without also driving `_boundaryDraft` through the same
-click-tracing flow), but would have been a real, confusing failure the first time
-someone tried Lazy Snapping. Fixed by giving both drawing code paths the same
-`_boundaryDraft.count > 0 ? _boundaryDraft : dm.boundaryPolygonPoints` fallback the
-mouse handler already used.
-
-**Verification.** No Xcode/AppKit compiler is available in this sandbox, so this
-`.mm`-only UI work could not be compiled or run end-to-end here -- verification was
-limited to careful brace/paren/bracket-balance checks, targeted greps for consistency
-(no leftover references to the old 4-segment tool-mode numbering, every `forSegment:`
-call site updated), and re-running `gmcore_tests` (`core/` itself is untouched by this
-change, so this is cheap insurance, not a real test of the new UI code -- 17/17 test
-cases, 3349/3349 checks still pass). The user's own Xcode build/run is the only way to
-truly confirm the new tool modes and "Segment" button work end-to-end; that hasn't
-happened yet as of this write-up.
-
-## Adaptive multi-segment boundary fitting
-
-A real bug the user found by actually using Lazy Snapping in Xcode: after segmenting a
-non-rectangular object and picking its 4 corners, the fitted boundary visibly diverged
-from the accurate segmentation contour. First instinct -- "let the boundary points move
-freely" -- turned out to be the wrong fix: boundary mesh vertices are deliberately
-constrained to slide ALONG their assigned boundary spline during optimization, never off
-it (`computeGeometryEnergy`'s normal-only residual, both hand-rolled and Ceres; see
-`boundary_vertices_stay_on_spline_after_optimize`), which is correct per the paper and
-already regression-tested -- loosening it would let image-gradient forces pull boundary
-vertices off the true silhouette. The actual bug was upstream: each of the mesh's 4
-boundary sides was fit as a SINGLE cubic Bezier (`fitCubicBezier`), which has at most one
-inflection point -- nowhere near enough to track a non-convex silhouette. `CanvasView.mm`
-already quoted the paper on this (Sec. 4: *"each boundary consists of one or more cubic
-Bezier splines"*) without ever implementing the "or more" case.
-
-Added `BezierSpline` (`BezierSpline.h`) -- a chain of one-or-more `CubicBezier` segments
-sharing one global `t` in `[0,1]`, exposing the identical `eval`/`evalDeriv`/`closestT`
-interface `CubicBezier` already had -- and `fitBezierSpline`: a Graphics-Gems-style
-recursive splitter that starts from the existing single-cubic fit and only subdivides (at
-the point of largest deviation, sharing that point so segments always join exactly) when
-the fit exceeds `maxErrorPixels` (default 3.0px, chosen relative to `ContourTracing.h`'s
-own 2.0px simplification epsilon -- not yet verified against real photos). An
-already-smooth input still fits as exactly one segment, so this is a strict superset of
-the old behavior, not a separate code path.
-
-Wired through in 3 commits, one per layer: (1) `BezierSpline`/`fitBezierSpline` in
-`core/`, with 3 new dedicated regression tests -- a straight line doesn't get needlessly
-split; a sharp 5-leg zigzag (a synthetic stand-in for a real non-convex silhouette, since
-a single cubic structurally cannot track it) does split, stays within `maxErrorPixels`,
-keeps exact endpoints, and every segment joint is exactly continuous; `closestT`
-round-trips correctly across segment joints, since that's exactly what
-`MeshOptimizer`/`MeshOptimizerCeres` call every outer iteration to re-project boundary
-vertices. (2) `GradientMesh::boundary` changed from `std::array<CubicBezier,4>` to
-`std::array<BezierSpline,4>`, with `MeshOptimizer.cpp`/`MeshOptimizerCeres.cpp` needing
-only a type substitution at their 8 total call sites (same 3-method interface, so no
-logic changed) -- `gmcore_tests` confirms the hand-rolled optimizer path runs correctly
-end to end against the new type, not just compiles; the Ceres path could only be verified
-by manual review against the identical, actually-tested hand-rolled pattern, since this
-sandbox has no Ceres to compile that `#ifdef GMCORE_WITH_CERES` body. (3)
-`DocumentModel`/`CanvasView`: `-fitBoundaryWithCornerIndices:` now calls
-`fitBezierSpline` instead of `fitCubicBezier` (this is the actual fix -- both the manual
-click-tracing path and Lazy Snapping's `-segmentBoundaryFromScribblesWithError:` go
-through it); `-useRectangularBoundaryWithMargin:` (the "Auto, no markup" path) is
-unaffected in behavior, since a rectangle's sides are already exactly straight and are
-built as single-segment splines directly; `-fittedBoundaryCurves` flattens every side's
-one-or-more segments into one in-order list, and `CanvasView`'s `-drawBoundary` needed
-ZERO changes since it already just chains `curveToPoint:` for whatever it's handed.
-
-20/20 `gmcore_tests` cases, 3387/3387 checks pass after all 3 steps. As with all `.mm`
-work this session, there is no Xcode compiler available to verify the UI layer actually
-builds and runs -- this needs the user's own Xcode build, and ideally a re-test of the
-exact scenario that surfaced the original bug (segment a genuinely non-convex object,
-pick corners, compare the fitted boundary against the segmentation contour visually).
-
-## Optional CIELUV colour space (colour interpolation, not geometry)
-
-Added after reading Hogervorst (2017), *"Colour Interpolation in Gradient Meshes"*
-(Bachelor's thesis, University of Groningen) -- a from-scratch extension of an earlier
-gradient-mesh tool that specifically compared colour spaces and interpolation functions
-for gradient-mesh colour fitting. Its headline finding (own user study included):
-CIELUV is the best colour space for this -- it's perceptually uniform (raw/linear sRGB
-isn't), and unlike CIELAB it doesn't show an unnatural blue->purple->green artifact on
-some transitions. Its own baseline tool already worked in a perceptually uniform space
-(CIELAB); the paper's real interpolation-*function* finding (cubic beats linear/"flat"
-variants, since flat/"half-flat" settings intentionally produce blocky, non-gradient-like
-patches) is exactly the bicubic Hermite patch this project already uses, so nothing
-needed to change there. Explicitly NOT adopted: assigning colours directly to
-derivatives as a manual creative control -- the paper's own conclusion is that it "does
-not yield the effect users expect" and isn't a meaningful feature.
-
-New: `DocumentModel.useCIELUVColorSpace` (UI: "CIELUV color space" checkbox next to the
-solver picker). When on, the NEXT "Build Initial Mesh"/"Auto" builds the mesh against a
-CIELUV conversion of the loaded image instead of raw sRGB, and every subsequent Optimize
-run fits that same converted target -- so the mesh's `C`/`Cu`/`Cv`/`Cuv` fields end up
-holding `(L*,u*,v*)` rather than `(r,g,b)`.
-
-This needed surprisingly little to change in `gmcore` itself: `GradientMesh`/
-`MeshOptimizer`/`MeshOptimizerCeres` never interpret `Color.r/g/b` as literally
-red/green/blue -- every use is generic linear algebra (sums, differences, dot products;
-see `FergusonPatch.h`'s `evalHermitePatch<T>`, templated on the color/position type). So
-converting the *target image* once at the boundary and running the existing,
-byte-for-byte-unmodified optimizer against it is enough -- new
-`core/include/gmcore/ColorSpace.h` + `core/src/ColorSpace.cpp` hold the actual
-`srgbToCIELUV`/`cieluvToSRGB` conversions (standard CIE 1976 L*u*v* formulas, D65 white,
-verified round-tripping every primary/secondary sRGB colour to <2e-6 error, including
-deliberately out-of-[0,1]/out-of-gamut inputs -- both the sRGB gamma curve and the L*
-cube-root are sign-extended via `std::cbrt` rather than clamped, since `Color` values go
-unclamped and can overshoot mid-optimization by design, see `Color.h`), plus
-`imageSRGBToCIELUV`/`imageCIELUVToSRGB` for whole-`Image` conversion. `DocumentModel.mm`
-converts back to sRGB only at the few places that need an actually-displayable colour:
-the on-screen/PNG raster (`-renderReconstructionPreview`), the SVG exporter's per-corner
-stop colours (`exportGradientMeshSVG` gained a `sourceIsCIELUV` parameter), and the mesh
-vertex colour swatch/picker. Only ever the POINT VALUE gets converted this way, never a
-derivative (`Cu`/`Cv`/`Cuv`) -- a "colour derivative" only means something within the
-space it was computed in; naively running it through the same nonlinear per-component
-formula as a point value would be mathematically wrong (the real derivative transform
-needs the map's Jacobian, not a substitution). `GradientMesh::render()`'s rasterizer
-naturally produces only point values (it's already done all its patch interpolation by
-the time a pixel comes out), so converting its whole output `Image` at the end is exact.
-
-Correctness hazard this had to be designed around: the *mesh's* colour space and
-whatever target `-optimizeWithPyramidLevels:...` fits it against must always match, or
-the data term silently compares apples to oranges. Since the checkbox is a live,
-independently-togglable property, `DocumentModel` snapshots it into a private
-`_meshColorSpaceIsCIELUV` ivar at `-buildInitialMeshRows:cols:` time and reads *that*
-(never the live property) everywhere the mesh's colours are touched afterwards --
-optimize, render, SVG export, debug export, the vertex colour picker. So toggling the
-checkbox after a mesh already exists is inert until the next rebuild, by construction,
-rather than a trap.
-
-Also: a CIELUV run's `currentRMSE`/exported `lastRMSE` is measured in CIELUV units (L*
-roughly 0..100) and is **not** directly comparable by raw number to an sRGB run's --
-exactly the kind of misread this project already made once with a solver-RMSE digit (see
-above). Flagged three ways so it can't quietly slip past: the exported debug JSON gets a
-new top-level `"colorSpace": "CIELUV"|"sRGB"` field (absent in JSONs from before this
-existed, which are all implicitly `"sRGB"`), the auto-export filename gets a `_cieluv`
-tag (`gm_debug_ceres_joint_cieluv_9x9_...json`), and every RMSE status string in the UI
-appends `(CIELUV units)` when applicable.
-
-Verified algorithmically (no local Ceres/Xcode build in this sandbox, same limitation as
-everywhere else in this project -- see below): a small standalone harness built the
-existing `gmcore` library, ran `buildInitial`+`optimizeCoarseToFine` (hand-rolled solver)
-against both a raw-sRGB target and its CIELUV conversion of the same 64x64 synthetic
-test image, unmodified. Both runs reduced RMSE normally in their own native units (sRGB
-0.0349 -> 0.0285; CIELUV 6.53 -> 3.05 -- confirming by inspection that these are simply
-different units, not a regression), no NaNs/crashes, and `srgbToCIELUV`/`cieluvToSRGB`
-round-tripped every sRGB primary/secondary colour AND deliberately out-of-range inputs
-(e.g. `(-0.1, 0.3, 1.2)`) to double-precision-scale error. Rendering the CIELUV-fitted
-mesh and converting the raster back to sRGB produced a sane, comparable-order-of-magnitude
-image (not visually broken/inverted) when checked against the original sRGB target
-directly. **Not yet verified**: real photos, on-device, through the actual Ceres solvers
-and the real AppKit image-loading path -- needs an on-device rebuild (this is a new
-source file, `core/src/ColorSpace.cpp`; the CMake source list is a glob, so a plain
-`cmake --build` picks it up automatically, but a stale already-generated Xcode project
-may need `rm -rf build_xcode && cmake -G Xcode -B build_xcode .` first, same as any new
-file added to `core/src/`) and a real side-by-side look at whether CIELUV actually gives
-visibly sharper/cleaner colour transitions on real images, which is the actual point.
-
-### Follow-up: CIELUV working-scale fix, and a new `geomDataWeight` knob to trade it off
-
-On-device testing (real photo, not the synthetic gradient) surfaced two things the
-harness above couldn't: raw/unscaled CIELUV gave visibly *sharper* colour boundaries
-than sRGB (matching the original photo closely) but also visible border artifacts and a
-disordered/shuffled patch layout, and `lastRMSE` came out ~2 orders of magnitude bigger
-than sRGB's own -- confirmed as a real units mismatch, not a solver bug: raw CIELUV's
-`L*` spans roughly `[0,100]` (~100x sRGB's `[0,1]`), while every `OptimizerOptions`
-weight (`smoothWeightColor`, `colorDerivRidge`, `boundaryWeight`,
-`smoothWeightGeom`, `geomTangentPriorWeight`, `vectorLineWeight`) is a fixed absolute
-constant tuned for sRGB's scale. Added `ColorSpace.h`'s `kCIELUVWorkingScale = 100.0`
-(divides `srgbToCIELUV`'s output, multiplies `cieluvToSRGB`'s input -- so the working
-representation stored in `MeshVertex::C`/`Cu`/`Cv`/`Cuv` is raw CIELUV / 100, not
-textbook CIELUV) to rebalance this. Verified via a standalone e2e harness: CIELUV-mode
-RMSE went from ~100x sRGB-mode down to ~1.7x: sane, comparable units.
-
-This fix also visibly cost the sharpness (confirmed by a real on-device before/after,
-not assumed) -- expected, since it shares the same root cause, which turned out to sit
-entirely on the geometry side, not the color side. Reading `MeshOptimizer.cpp`'s exact
-Gauss-Newton accumulation (`accumulateGNRow`'s `H += weight*coeff^2`) pins it down:
-`smoothWeightColor`/`colorDerivRidge` live inside `solveColorExact`'s *linear* solve,
-where both the data-term Jacobian pattern and the regularizers' Jacobian patterns are
-purely structural (never reference `C`'s own magnitude) -- rescaling `C` scales the
-right-hand side only, so their relative balance is provably scale-invariant and these
-two needed no change. The geometry Gauss-Newton step's photometric term is different:
-its Jacobian is built from `target.sampleGradient(...)`, the *target image's* local
-colour gradient, which scales linearly with whatever colour-space magnitude the target
-is in -- so this one term's contribution to `H` scales with that magnitude *squared*,
-while `boundaryWeight`/`smoothWeightGeom`/`geomTangentPriorWeight`/`vectorLineWeight`
-are pure position quantities untouched by any of this. Raw CIELUV (~100x sRGB) made the
-photometric term ~10000x stronger relative to those four regularizers than sRGB ever
-was -- geometry bent aggressively onto real edges (sharp, but unstable: border
-artifacts, shuffled patches); `kCIELUVWorkingScale` undoes exactly that 10000x, which is
-also why it flattened the sharpness back out.
-
-Rather than requiring four regularizer fields to be hand-divided by 10000 to get that
-imbalance back deliberately (numerically awkward, easy to get one field wrong), added
-`OptimizerOptions::geomDataWeight` (default `1.0`, UI: "Data:" field in the Geometry
-weights row) as a single direct multiplier on *only* the geometry step's photometric
-term -- `w * opts.geomDataWeight` in `MeshOptimizer.cpp`'s `computeGeometryEnergy` and
-`optimizeAtCurrentResolution`, mirrored as `sw = sqrt(w * geomDataWeight)` in
-`MeshOptimizerCeres.cpp`'s `PatchDataCostFunction` (used by `useCeresGeometry`) and
-`JointPatchDataCostFunction` (used by `useCeresJoint` -- note this one residual is
-differentiated w.r.t. both geometry AND colour parameter blocks in the joint solver, so
-there `geomDataWeight` also strengthens the colour fit against
-`smoothWeightColor`/`colorDerivRidge`, a real difference from the other two solver
-modes, not an oversight). Setting it to `~10000` with the other six weights left at
-their defaults is the direct way to reproduce the pre-`kCIELUVWorkingScale` behaviour
-(border artifacts + sharp edges) without touching `ColorSpace.cpp` at all.
-
-**Verified** (this was previously an unverified derivation from reading the
-accumulation code -- now confirmed with a real on-device run): added a
-`--geom-data-weight W` flag to `gmesh_cli` (there wasn't one before, unlike every
-other `OptimizerOptions` field) and ran the same 5x5/`gradient.png` case from the
-tables above, sRGB throughout (no CIELUV involved at all), comparing the default
-`geomDataWeight=1.0` against `10000`:
-
-| `--geom-data-weight` | interior column (col=2) x across rows | other symptoms |
-|---|---|---|
-| 1.0 (current default) | 103.3-115.8 (~12.5px), monotonic-ish | none; matches the "new defaults" row in the earlier table |
-| 10000 | 96.3-115.8 (~19.5px), but row 2 dips to 96.3 between rows 1 (115.5) and 3 (109.5) -- non-monotonic | row 3's `y` (165.94) overshoots the mesh's own bottom-right neighbors; per-vertex `Pv` tangent magnitudes swing as high as ~195 (vs ~50 at default) -- visibly unstable |
-
-This reproduces exactly the predicted shape: wider geometric movement, but
-non-monotonic/disordered rather than a clean sharper snap, plus tangent
-magnitudes blowing up -- the same "sharp, but unstable: border artifacts,
-shuffled patches" signature the original raw-CIELUV run produced, now shown to
-be reproducible from `geomDataWeight` alone in plain sRGB, confirming this
-field's effect is exactly what its comment (and `kCIELUVWorkingScale`'s own
-derivation) claims. Final RMSE also dropped further (0.03067 -> 0.02265, a
-72.2% reduction vs. the default's 62.3%) -- i.e. `geomDataWeight=10000` finds a
-*lower-energy* configuration by the optimizer's own metric, it's just a worse
-one geometrically (a real, useful caution for anyone tempted to just crank this
-value for a "better" RMSE number). Not adopted as a new default -- this
-confirms the mechanism, it doesn't argue for using it; the practical edge-
-snapping gap below still needs a real fix, not just amplifying the data term
-until it dominates and destabilizes.
-
-## How this was tested
-
-`gmesh_cli` (no image needed -- it can generate a synthetic shaded-sphere test image)
-was built and run repeatedly on Linux while developing `gmcore`:
+`gmesh_cli` runs the same coarse-to-fine optimiser as the app, in its "auto" mode (a plain rectangular boundary and a regular grid over the whole image). With no `--input` it generates a synthetic shaded-sphere test image, so it works with zero setup:
 
 ```sh
-cmake -B build . && cmake --build build -j
 ./build/gmesh_cli --rows 9 --cols 9 --pyramid-levels 4
+./build/gmesh_cli --input photo.png --rows 12 --cols 12 --pyramid-levels 4 --out-prefix photo
 ```
 
-This confirmed: the mesh initializes correctly (transfinite/Coons interpolation between
-4 boundary curves), the optimizer reduces reconstruction RMSE substantially (a 9x9 mesh
-against a 220x220 synthetic image went from RMSE 0.091 to 0.049, a ~46% reduction, in
-under 2 seconds), the rendered reconstruction visually resembles the input (verified by
-converting the PPM output to PNG and inspecting it), and the SVG export is well-formed
-XML with the expected `<meshgradient>`/`<meshpatch>` structure. Tune `OptimizerOptions`
-in `MeshOptimizer.h` (smoothness/boundary/vector-line weights, iteration counts,
-damping) if you want tighter fits on real photos -- the defaults were picked for
-reasonable behavior on a variety of images, not tuned per-image.
+It writes `<prefix>_reconstruction.ppm`, `<prefix>_mesh.svg` and `<prefix>_mesh_points.csv`. Run `gmesh_cli --help` for every option (mesh size, pyramid levels, energy weights, convergence tolerances, `--use-ceres` and `--use-ceres-joint` when built with Ceres).
 
-## Third-party code
+### C++ library
 
-None. `gmcore` is 100% original code against the C++ standard library. The macOS app
-uses only Apple system frameworks (Cocoa/AppKit, ImageIO, CoreGraphics,
-UniformTypeIdentifiers). `gmesh_cli` optionally links the system `libpng` (if CMake
-finds it) purely as a developer convenience for reading/writing real PNGs from the
-command line; the app never needs it.
+A complete minimal program: load an image, fit a 9×9 gradient mesh, rasterise it and export it to SVG.
+
+```cpp
+#include "gmcore/GradientMesh.h"
+#include "gmcore/MeshOptimizer.h"
+#include "gmcore/SVGExporter.h"
+#include <cstdio>
+#include <fstream>
+
+using namespace gmcore;
+
+int main() {
+    // 1. Load a raster image (PPM always; PNG too when libpng is available).
+    Image target = Image::load("gradient.png");
+
+    // 2. Describe the outline the mesh is fitted inside: 4 sides, each a
+    //    BezierSpline of one or more cubic segments (here: a plain rectangle).
+    const double x0 = 0, y0 = 0, x1 = target.width, y1 = target.height;
+    auto side = [](Vec2 a, Vec2 b) {
+        BezierSpline s;
+        s.segments = {CubicBezier{a, a + (b - a) * (1.0 / 3), a + (b - a) * (2.0 / 3), b}};
+        return s;
+    };
+    std::array<BezierSpline, 4> boundary = {
+        side({x0, y0}, {x1, y0}),  // top
+        side({x1, y0}, {x1, y1}),  // right
+        side({x1, y1}, {x0, y1}),  // bottom
+        side({x0, y1}, {x0, y0}),  // left
+    };
+
+    // 3. Build a regular 9x9 control-point grid, then optimise it against the
+    //    image with the coarse-to-fine (Gaussian pyramid) solver.
+    GradientMesh mesh = GradientMesh::buildInitial(9, 9, boundary, target);
+    OptimizerOptions opts;  // defaults follow the paper
+    MeshOptimizer::optimizeCoarseToFine(mesh, target, /*vectorLines=*/{}, /*pyramidLevels=*/4, opts,
+        [](const OptimizerProgress& p) { std::printf("RMSE %.5f\n", p.rmse); });
+
+    // 4. Rasterise the mesh, or export it as an SVG2 <meshgradient> document.
+    mesh.render(target.width, target.height).savePPM("reconstruction.ppm");
+    std::ofstream("mesh.svg") << exportGradientMeshSVG(mesh, target.width, target.height);
+}
+```
+
+To use `gmcore` from your own CMake project:
+
+```cmake
+add_subdirectory(gradient-mesh EXCLUDE_FROM_ALL)
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE gmcore)   # include paths and optional libpng/Ceres come with it
+```
+
+### macOS app
+
+1. **Open Image…** and load a photo.
+2. Get an outline: **Trace Boundary** by clicking around the object (double-click closes the loop), or mark it with **Scribble FG / Scribble BG** and let the graph-cut cut-out find the edge — or press **Auto (no markup)** for a quick, unattended run.
+3. **Pick 4 Corners** on the outline, set **Rows/Cols**, and click **Build Initial Mesh**.
+4. *(Optional)* draw a **Vector Line** along a highlight or fold to steer nearby mesh edges.
+5. **Optimize** — the status bar shows live RMSE per pyramid level and iteration.
+6. **Edit Mesh** to drag control points; double-click one to repaint its colour.
+7. **Export PNG…** rasterises the mesh; **Export SVG…** writes the SVG2 mesh gradient. Click **Animate Mesh** to see the mesh move.
+
+## How it works
+
+The project implements Sun et al., *"Image Vectorization using Optimized Gradient Meshes"* (SIGGRAPH 2007 / ACM TOG 26(3)). A gradient mesh stores position and colour at every control point of a grid; each cell is a bicubic Hermite patch, so the image becomes a compact grid of control points instead of millions of pixels, and it scales to any resolution without loss.
+
+| Paper concept (Sec. 3–4) | Code |
+|---|---|
+| Ferguson patch (bicubic Hermite, 16 corner values) | `FergusonPatch.h` |
+| Gradient mesh (grid of control points) | `GradientMesh.h/.cpp` |
+| Boundary curves the mesh is fitted within | `BezierSpline.h/.cpp` |
+| Energy minimisation (data + smoothness + boundary + vector-line terms) | `MeshOptimizer.h/.cpp` |
+| Coarse-to-fine (Gaussian pyramid) | `Image::buildPyramid`, `MeshOptimizer::optimizeCoarseToFine` |
+| User-drawn directional constraint | `VectorLine.h` and the vector-line term in `MeshOptimizer.cpp` |
+| Scalable vector output | `SVGExporter.h/.cpp` (SVG2 `<meshgradient>`) |
+| Interactive object selection (cited by the paper) | `LazySnapping.h/.cpp`, `MaxFlowGraph.h/.cpp`, `ContourTracing.h/.cpp` |
+
+Every deviation from the paper, with the experiments behind it, is written down in the [development log](docs/DEVELOPMENT_LOG.md#known-simplifications-vs-the-paper).
+
+## Project layout
+
+```
+core/                gmcore: the portable C++17 algorithm library
+  include/gmcore/    public headers
+  src/               implementation (mesh, optimiser, Bézier fitting, segmentation, SVG export, …)
+  tests/test_main.cpp  gmcore_tests: dependency-free regression suite
+cli/main_cli.cpp     gmesh_cli: command-line harness
+mac/                 GradientMeshStudio.app (AppKit, Objective-C++, macOS only)
+spike/               Ceres solver experiments and probes
+docs/                development log and media
+CMakeLists.txt       builds gmcore + gmesh_cli + gmcore_tests everywhere; the app on Apple platforms
+```
+
+## Testing
+
+```sh
+cmake -B build . && cmake --build build -j --target gmcore_tests
+./build/gmcore_tests
+# e.g. 20/20 test cases passed (3387/3387 individual checks passed)
+```
+
+The suite is dependency-free (no test framework) and covers Bézier fitting, colour-space round trips, patch evaluation, the block-sparse solver against a dense reference, optimiser convergence, boundary constraints, max-flow and segmentation, contour tracing and SVG export. Details are in the [development log](docs/DEVELOPMENT_LOG.md#regression-tests).
+
+## Known limitations
+
+- **Coarse meshes soften sharp internal edges.** The paper's Fig. 4 behaviour — a low-resolution mesh snapping to a hard colour edge — is only partly reproduced; the [development log](docs/DEVELOPMENT_LOG.md) records what was tried and what trade-offs remain. Use a denser mesh, a traced outline or a vector line along the edge.
+- **The GUI is macOS-only** (AppKit). The algorithm library, CLI and tests are portable C++17, built and tested on Linux and macOS; other platforms are untested.
+- **SVG2 mesh gradients are not rendered by every viewer.** Support varies by application; Inkscape handles them, browsers generally do not.
+
+## FAQ
+
+**What is a gradient mesh?**
+A grid of control points carrying position and colour, joined by smooth patches. Colour blends continuously across each patch, which is how artists paint photorealistic shading as vectors in tools like Adobe Illustrator and Inkscape.
+
+**What does this project do?**
+It automates the hard part: given a raster image, it finds a gradient mesh whose rendering matches it, by optimising control-point positions, tangents and colours.
+
+**Can it export to SVG?**
+Yes. `exportGradientMeshSVG` writes standards-based SVG2 `<meshgradient>`/`<meshpatch>` elements; the CLI and the app both use it.
+
+**Does it run on Linux or Windows?**
+The library, CLI and tests build with CMake and any C++17 compiler; Linux and macOS are the tested platforms. The interactive app requires macOS.
+
+**Do I need Ceres or libpng?**
+No. Both are optional: libpng only adds PNG I/O to the CLI, and Ceres only adds alternative solver backends.
+
+**Where is the deep technical history?**
+In the [development log](docs/DEVELOPMENT_LOG.md): every bug found, experiment run and deviation from the paper.
+
+## Citation
+
+If you use the algorithm, cite the original paper:
+
+```bibtex
+@article{sun2007gradientmesh,
+  author  = {Sun, Jian and Liang, Lin and Wen, Fang and Shum, Heung-Yeung},
+  title   = {Image Vectorization using Optimized Gradient Meshes},
+  journal = {ACM Transactions on Graphics},
+  volume  = {26},
+  number  = {3},
+  year    = {2007},
+  note    = {SIGGRAPH 2007}
+}
+```
