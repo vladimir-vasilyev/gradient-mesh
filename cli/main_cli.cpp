@@ -164,15 +164,17 @@ int main(int argc, char** argv) {
     }
 
     double x0 = margin, y0 = margin, x1 = target.width - margin, y1 = target.height - margin;
-    std::array<CubicBezier, 4> boundary;
+    // Each side is a BezierSpline (one or more cubic segments, see
+    // BezierSpline.h); here every side is a single straight cubic segment.
+    std::array<BezierSpline, 4> boundary;
     // top: (x0,y0)->(x1,y0)
-    boundary[0] = {Vec2{x0, y0}, Vec2{x0 + (x1 - x0) / 3, y0}, Vec2{x0 + 2 * (x1 - x0) / 3, y0}, Vec2{x1, y0}};
+    boundary[0].segments = {CubicBezier{Vec2{x0, y0}, Vec2{x0 + (x1 - x0) / 3, y0}, Vec2{x0 + 2 * (x1 - x0) / 3, y0}, Vec2{x1, y0}}};
     // right: (x1,y0)->(x1,y1)
-    boundary[1] = {Vec2{x1, y0}, Vec2{x1, y0 + (y1 - y0) / 3}, Vec2{x1, y0 + 2 * (y1 - y0) / 3}, Vec2{x1, y1}};
+    boundary[1].segments = {CubicBezier{Vec2{x1, y0}, Vec2{x1, y0 + (y1 - y0) / 3}, Vec2{x1, y0 + 2 * (y1 - y0) / 3}, Vec2{x1, y1}}};
     // bottom: (x1,y1)->(x0,y1)
-    boundary[2] = {Vec2{x1, y1}, Vec2{x0 + 2 * (x1 - x0) / 3, y1}, Vec2{x0 + (x1 - x0) / 3, y1}, Vec2{x0, y1}};
+    boundary[2].segments = {CubicBezier{Vec2{x1, y1}, Vec2{x0 + 2 * (x1 - x0) / 3, y1}, Vec2{x0 + (x1 - x0) / 3, y1}, Vec2{x0, y1}}};
     // left: (x0,y1)->(x0,y0)
-    boundary[3] = {Vec2{x0, y1}, Vec2{x0, y0 + 2 * (y1 - y0) / 3}, Vec2{x0, y0 + (y1 - y0) / 3}, Vec2{x0, y0}};
+    boundary[3].segments = {CubicBezier{Vec2{x0, y1}, Vec2{x0, y0 + 2 * (y1 - y0) / 3}, Vec2{x0, y0 + (y1 - y0) / 3}, Vec2{x0, y0}}};
 
     GradientMesh mesh = GradientMesh::buildInitial(rows, cols, boundary, target);
     double rmseBefore = mesh.reconstructionRMSE(target, 6);
