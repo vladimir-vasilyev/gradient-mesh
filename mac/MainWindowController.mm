@@ -599,11 +599,9 @@
     NSOpenPanel* panel = [NSOpenPanel openPanel];
     panel.allowsMultipleSelection = NO;
     panel.canChooseDirectories = NO;
-    if (@available(macOS 11.0, *)) {
-        panel.allowedContentTypes = @[UTTypeImage];
-    } else {
-        panel.allowedFileTypes = @[@"png", @"jpg", @"jpeg", @"tiff", @"bmp", @"heic"];
-    }
+    // The deployment target is macOS 12 (CMakeLists.txt), so the pre-11
+    // -allowedFileTypes: fallback (deprecated since 12) was dead code.
+    panel.allowedContentTypes = @[UTTypeImage];
     __weak typeof(self) weakSelf = self;
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
         if (result != NSModalResponseOK) return;
@@ -1117,11 +1115,14 @@
         @"Loaded preset “%@”. Takes effect on the next “Optimize” (and, for CIELUV, the next “Build Initial Mesh”).", name];
 }
 
-- (void)presentError:(NSError*)error {
+// Overrides -[NSResponder presentError:], which returns BOOL (the old `void`
+// signature triggered -Wmismatched-return-types). YES: the error was presented.
+- (BOOL)presentError:(NSError*)error {
     NSAlert* alert = [[NSAlert alloc] init];
     alert.messageText = @"Gradient Mesh Studio";
     alert.informativeText = error.localizedDescription ?: @"An unknown error occurred.";
     [alert beginSheetModalForWindow:self.window completionHandler:nil];
+    return YES;
 }
 
 @end
