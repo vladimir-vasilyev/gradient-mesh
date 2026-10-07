@@ -101,6 +101,13 @@
 @property (nonatomic, strong) NSButton* animDisableContinuousCheckbox;
 @end
 
+// Sets the same tooltip on every given view (a control and its label, so
+// hovering either one explains it). Tooltips show with zero delay -- see
+// main.mm, which sets NSInitialToolTipDelay before the app starts.
+static void GMTip(NSString* text, NSArray<NSView*>* views) {
+    for (NSView* v in views) v.toolTip = text;
+}
+
 @implementation MainWindowController
 
 - (instancetype)init {
@@ -174,12 +181,19 @@
 
     NSButton* clearLineBtn = [self buttonTitled:@"Clear Last Line" action:@selector(clearLastLine:)];
 
+    GMTip(@"Load an image to vectorize.", @[openBtn]);
+    GMTip(@"Fit a mesh to the whole image without any boundary or corner markup.", @[autoBtn]);
+    GMTip(@"Active tool. 1: trace the region boundary, or scribble foreground/background and press Segment; "
+          "2: pick the 4 mesh corners; 3: draw vector lines the mesh must follow; 4: edit the mesh.", @[self.toolSegmented]);
+    GMTip(@"Remove the most recently drawn vector line.", @[clearLineBtn]);
     for (NSView* v in @[openBtn, autoBtn, self.toolSegmented, clearLineBtn]) [controlsRow1 addSubview:v];
 
     // --- Row 1b: Lazy-Snapping-style segmentation (scribble tools above) ---
     NSButton* segmentBtn = [self buttonTitled:@"Segment" action:@selector(segmentBoundary:)];
     NSButton* clearScribblesBtn = [self buttonTitled:@"Clear Scribbles" action:@selector(clearScribbles:)];
     NSTextField* scribbleHintLabel = [self makeLabel:@"(scribble foreground/background above, then Segment)"];
+    GMTip(@"Cut out the region marked by the foreground/background scribbles (Lazy Snapping).", @[segmentBtn]);
+    GMTip(@"Discard all foreground and background scribbles.", @[clearScribblesBtn]);
     for (NSView* v in @[segmentBtn, clearScribblesBtn, scribbleHintLabel]) [controlsRow1b addSubview:v];
 
     // --- Row 2: mesh + optimize + export ---
@@ -215,6 +229,18 @@
     self.statusLabel = [self makeLabel:@"Open an image to begin."];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
+    GMTip(@"Number of mesh rows. Takes effect on the next Build Initial Mesh.", @[rowsLabel, self.rowsField]);
+    GMTip(@"Number of mesh columns. Takes effect on the next Build Initial Mesh.", @[colsLabel, self.colsField]);
+    GMTip(@"Build the initial mesh from the corners and boundary, before optimization.", @[self.buildMeshButton]);
+    GMTip(@"Fit the mesh to the image (optimizer, Sec. 4 of the paper) using the solver and weights below.", @[self.optimizeButton]);
+    GMTip(@"Draw the image reconstructed from the mesh instead of the original.", @[self.previewCheckbox]);
+    GMTip(@"Render the reconstruction on the GPU with OpenGL instead of the CPU. Only used while Show reconstruction is on.", @[self.gpuPreviewCheckbox]);
+    GMTip(@"Overlay the mesh grid on the canvas.", @[self.meshCheckbox]);
+    GMTip(@"Overlay the tangent handles of the mesh vertices.", @[self.tangentsCheckbox]);
+    GMTip(@"Redraw the in-progress mesh while Optimize runs. Costs one small mesh copy and a redraw per outer iteration.", @[self.livePreviewCheckbox]);
+    GMTip(@"Export the reconstruction rendered on the CPU as a PNG.", @[self.exportPNGButton]);
+    GMTip(@"Export the mesh as an SVG gradient mesh.", @[self.exportSVGButton]);
+    GMTip(@"Export the reconstruction rendered on the GPU as a PNG.", @[self.exportGPUPNGButton]);
     for (NSView* v in @[rowsLabel, self.rowsField, colsLabel, self.colsField, self.buildMeshButton,
                          self.optimizeButton, self.progressSpinner, self.previewCheckbox, self.gpuPreviewCheckbox,
                          self.meshCheckbox, self.tangentsCheckbox, self.livePreviewCheckbox, self.exportPNGButton, self.exportSVGButton,
@@ -260,6 +286,10 @@
     self.ceresMultithreadedCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.ceresMultithreadedCheckbox.state = NSControlStateValueOn;
 
+    GMTip(@"Optimizer: Hand-rolled (built in), Ceres (geometry) or Ceres (joint). The Ceres modes need a build with Ceres found; otherwise they do nothing and print a console warning.", @[solverLabel, self.solverPopup]);
+    GMTip(@"After each Optimize run, write a timestamped JSON with the run's debug data into a DebugOut folder next to the loaded image.", @[self.autoDebugCheckbox]);
+    GMTip(@"Build and fit the mesh in CIELUV instead of sRGB. Takes effect on the next Build Initial Mesh.", @[self.cieluvCheckbox]);
+    GMTip(@"Let the Ceres solvers use every CPU core. No effect on the hand-rolled solver.", @[self.ceresMultithreadedCheckbox]);
     for (NSView* v in @[solverLabel, self.solverPopup, solverHint, self.autoDebugCheckbox, self.cieluvCheckbox, self.ceresMultithreadedCheckbox])
         [controlsRow3 addSubview:v];
 
@@ -303,6 +333,13 @@
     self.vectorLineWeightField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight]];
 
+    GMTip(@"Weights of the geometry optimization step. A typed value takes effect on the next Optimize.", @[geomWeightsLabel]);
+    GMTip(@"Smoothness of the mesh geometry. Higher gives a smoother, less image-following mesh.", @[smoothGeomLabel, self.smoothWeightGeomField]);
+    GMTip(@"Multiplier of the geometry step's photometric (image-fit) term against the other weights. 1 = default.", @[geomDataLabel, self.geomDataWeightField]);
+    GMTip(@"Makes Smooth anisotropic: relaxes it near strong image edges so the mesh snaps to them tighter. 0 = isotropic; 40 = default.", @[edgeGainLabel, self.smoothGeomEdgeGainField]);
+    GMTip(@"Weight keeping boundary vertices on their boundary curve.", @[boundaryLabel, self.boundaryWeightField]);
+    GMTip(@"Weight of the prior on the tangent handles (Pu, Pv) in the geometry step.", @[tangentPriorLabel, self.geomTangentPriorWeightField]);
+    GMTip(@"Weight pulling the mesh edges onto the vector lines drawn with tool 3.", @[vectorLineLabel, self.vectorLineWeightField]);
     for (NSView* v in @[geomWeightsLabel, smoothGeomLabel, self.smoothWeightGeomField, geomDataLabel,
                          self.geomDataWeightField, edgeGainLabel, self.smoothGeomEdgeGainField, boundaryLabel,
                          self.boundaryWeightField, tangentPriorLabel, self.geomTangentPriorWeightField,
@@ -319,6 +356,10 @@
         [NSString stringWithFormat:@"%g", self.documentModel.colorDerivRidge]];
     NSButton* resetWeightsBtn = [self buttonTitled:@"Reset weights to defaults" action:@selector(resetWeights:)];
 
+    GMTip(@"Weights of the color optimization step. A typed value takes effect on the next Optimize.", @[colorWeightsLabel]);
+    GMTip(@"Smoothness of the vertex colors across the mesh.", @[smoothColorLabel, self.smoothWeightColorField]);
+    GMTip(@"Ridge regularization on the color derivatives (Cu, Cv, Cuv).", @[colorRidgeLabel, self.colorDerivRidgeField]);
+    GMTip(@"Restore all eight geometry and color weights to the compiled-in defaults.", @[resetWeightsBtn]);
     for (NSView* v in @[colorWeightsLabel, smoothColorLabel, self.smoothWeightColorField, colorRidgeLabel,
                          self.colorDerivRidgeField, resetWeightsBtn])
         [controlsRow5 addSubview:v];
@@ -347,6 +388,10 @@
     animHintLabel.textColor = [NSColor secondaryLabelColor];
     animHintLabel.font = [NSFont systemFontOfSize:11];
 
+    GMTip(@"Start or stop a cosmetic wiggle of the fitted mesh. The mesh itself is not modified. The fields on this row and the next are read when you start it.", @[self.animateMeshButton]);
+    GMTip(@"Maximum vertex displacement, in image pixels. 0 keeps every vertex in place.", @[animAmplitudeLabel, self.animAmplitudeField]);
+    GMTip(@"Jitter only. Low = calm (few vertices move much); high = chaotic (nearly all swing close to full amplitude). Must be > 0.", @[animTemperatureLabel, self.animTemperatureField]);
+    GMTip(@"Minimum distance, in pixels, kept between two different mesh edges. 0 checks only for literal crossings.", @[animClearanceLabel, self.animClearanceField]);
     for (NSView* v in @[self.animateMeshButton, animAmplitudeLabel, self.animAmplitudeField,
                          animTemperatureLabel, self.animTemperatureField, animClearanceLabel,
                          self.animClearanceField, animHintLabel])
@@ -374,6 +419,8 @@
     animStyleHintLabel.textColor = [NSColor secondaryLabelColor];
     animStyleHintLabel.font = [NSFont systemFontOfSize:11];
 
+    GMTip(@"Animation style: Jitter, Wave, Breathing or Squash & Stretch.", @[animStyleLabel, self.animStylePopup]);
+    GMTip(@"Wave only. Direction the ripple travels, in degrees: 0 = left to right, 90 = +Y.", @[animDirectionLabel, self.animDirectionField]);
     for (NSView* v in @[animStyleLabel, self.animStylePopup, animDirectionLabel, self.animDirectionField, animStyleHintLabel])
         [controlsRow7 addSubview:v];
 
@@ -395,6 +442,7 @@
     animDisableContinuousHintLabel.textColor = [NSColor secondaryLabelColor];
     animDisableContinuousHintLabel.font = [NSFont systemFontOfSize:11];
 
+    GMTip(@"Diagnostic. Skips the continuous damping and the temporal smoothing, leaving only the exact self-intersection check.", @[self.animDisableContinuousCheckbox]);
     for (NSView* v in @[self.animDisableContinuousCheckbox, animDisableContinuousHintLabel])
         [controlsRow7b addSubview:v];
 
@@ -427,6 +475,8 @@
     self.presetsPopup.action = @selector(presetSelected:);
     self.presetsPopup.menu.delegate = self;
 
+    GMTip(@"Save the settings of the last completed Optimize run to a timestamped JSON in a Presets folder next to the loaded image.", @[self.savePresetButton]);
+    GMTip(@"Load a preset saved next to the current image, newest first.", @[self.presetsPopup]);
     NSView* presetSidebar = [[NSView alloc] initWithFrame:NSZeroRect];
     presetSidebar.translatesAutoresizingMaskIntoConstraints = NO;
     [presetSidebar addSubview:self.savePresetButton];
