@@ -6,7 +6,16 @@
 #import <CoreGraphics/CoreGraphics.h>  // CGImageDestinationRef etc. for -exportGPUPNG: (mirrors DocumentModel.mm's -exportPNGToURL:)
 #import <ImageIO/ImageIO.h>            // CGImageDestinationCreateWithURL/AddImage/Finalize
 
-@interface MainWindowController () <NSWindowDelegate, NSMenuDelegate, NSToolbarDelegate>
+// Flipped (top-left origin) container used as the inspector scroll view's
+// document view: a non-flipped document view that is shorter than the clip
+// view sinks to the bottom of it instead of sitting at the top.
+@interface GMFlippedView : NSView
+@end
+@implementation GMFlippedView
+- (BOOL)isFlipped { return YES; }
+@end
+
+@interface MainWindowController () <NSWindowDelegate, NSMenuDelegate, NSToolbarDelegate, NSMenuItemValidation>
 @property (nonatomic, strong) DocumentModel* documentModel;
 @property (nonatomic, strong) CanvasView* canvasView;
 // GPU (OpenGL) counterpart to canvasView's CPU reconstruction preview --
@@ -32,13 +41,13 @@
 @property (nonatomic, strong) NSButton* livePreviewCheckbox;
 @property (nonatomic, strong) NSButton* buildMeshButton;
 @property (nonatomic, strong) NSButton* optimizeButton;
-@property (nonatomic, strong) NSButton* exportPNGButton;
-@property (nonatomic, strong) NSButton* exportSVGButton;
-// Saves exactly what glReconstructionView renders (GPU/OpenGL, exact
-// per-pixel Hermite color) rather than DocumentModel's CPU rasterization
-// -- see -exportGPUPNG: and GLReconstructionView.renderToImageWithWidth:height:.
+// Open / Save Preset / Export live in the File menu (AppDelegate), which
+// calls -openImage:, -savePreset:, -exportPNG:, -exportSVG: and
+// -exportGPUPNG: on this controller (declared in MainWindowController.h).
+// -exportGPUPNG: saves exactly what glReconstructionView renders (GPU/
+// OpenGL, exact per-pixel Hermite color) rather than DocumentModel's CPU
+// rasterization -- see GLReconstructionView.renderToImageWithWidth:height:.
 // Independent of whether the on-screen GPU preview toggle is currently on.
-@property (nonatomic, strong) NSButton* exportGPUPNGButton;
 // Solver picker: Hand-rolled (default) / Ceres (geometry) / Ceres (joint) --
 // mirrors gmcore::OptimizerOptions::useCeresGeometry/useCeresJoint via
 // DocumentModel's properties of the same name. See -solverChanged:.
@@ -61,12 +70,11 @@
 @property (nonatomic, strong) NSTextField* vectorLineWeightField;
 @property (nonatomic, strong) NSTextField* smoothWeightColorField;
 @property (nonatomic, strong) NSTextField* colorDerivRidgeField;
-// Small sidebar to the right of canvasView (see -buildUI's canvasRow) --
-// "Save Preset…" snapshots the settings the last completed Optimize run
-// used (see DocumentModel -savePresetToURL:error:); the popup below it
-// lists+loads any preset previously saved next to the current image. See
-// -savePreset:/-presetsPopupWillOpen:/-presetSelected:.
-@property (nonatomic, strong) NSButton* savePresetButton;
+// File > Save Preset… (-savePreset:) snapshots the settings the last
+// completed Optimize run used (see DocumentModel -savePresetToURL:error:);
+// this popup (inspector's Presets section) lists+loads any preset
+// previously saved next to the current image. See
+// -menuNeedsUpdate:/-presetSelected:.
 @property (nonatomic, strong) NSPopUpButton* presetsPopup;
 // "Animate Mesh" -- see DocumentModel.h's isAnimatingMesh/
 // startMeshAnimationWithRedraw:/stopMeshAnimation and -toggleAnimateMesh:.
@@ -105,6 +113,16 @@
 // Toolbar item identifier -> the control shown in that item (see
 // -toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar: and -buildToolbar).
 @property (nonatomic, strong) NSDictionary<NSString*, NSView*>* toolbarViews;
+@property (nonatomic, strong) NSScrollView* inspectorScrollView;
+@property (nonatomic, strong) NSLayoutConstraint* inspectorWidthConstraint;
+// Floating tool-specific button groups over the canvas's top-left corner,
+// shown only while their tool is selected (see -updateContextualControls).
+@property (nonatomic, strong) NSView* scribbleOverlay;
+@property (nonatomic, strong) NSView* vectorLineOverlay;
+// Animate-row labels dimmed together with their field when the selected
+// style ignores that field (see -updateAnimationFieldAvailability).
+@property (nonatomic, strong) NSTextField* animTemperatureLabel;
+@property (nonatomic, strong) NSTextField* animDirectionLabel;
 @end
 
 // Sets the same tooltip on every given view (a control and its label, so
@@ -123,11 +141,17 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
                                                                 NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
                                                        backing:NSBackingStoreBuffered
                                                          defer:NO];
-    window.title = @"Gradient Mesh Studio";
-    // The toolbar needs the width the title would take.
+    // HIG: don't title a window with the app name. The title is the loaded
+    // image's file name (see -openImage:); hidden inline because the toolbar
+    // needs the width, but it still names the window in the Window menu and
+    // Mission Control.
+    window.title = @"Untitled";
     window.titleVisibility = NSWindowTitleHidden;
-    window.minSize = NSMakeSize(900, 560);
+    window.toolbarStyle = NSWindowToolbarStyleUnified;
+    window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;    // Wide enough that the toolbar does not overflow by default (HIG).
+    window.minSize = NSMakeSize(1240, 560);
     [window center];
+    [window setFrameAutosaveName:@"GMMainWindow"];  // restores position/size on relaunch
 
     if ((self = [super initWithWindow:window])) {
         window.delegate = self;
@@ -148,11 +172,9 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
 - (void)buildUI {
     NSView* content = self.window.contentView;
 
-    NSView* controlsRow1b = [self makeRow];
 
     // --- Row 1: file + tool selection ---
-    NSButton* openBtn = [self buttonTitled:@"Open Image…" action:@selector(openImage:)];
-    NSButton* autoBtn = [self buttonTitled:@"Auto (no markup)" action:@selector(autoMesh:)];
+    NSButton* autoBtn = [self buttonTitled:@"Auto Mesh" action:@selector(autoMesh:)];
 
     self.toolSegmented = [[NSSegmentedControl alloc] init];
     self.toolSegmented.translatesAutoresizingMaskIntoConstraints = NO;
@@ -160,31 +182,34 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     // Scribble FG/BG are the new Lazy-Snapping-style cutout tool (see
     // -segmentBoundary: below); Corners/Vector Line/Edit Mesh are
     // renumbered 3/4 to make room but are otherwise unchanged.
-    NSArray* labels = @[@"1. Trace Boundary", @"1. Scribble FG", @"1. Scribble BG",
-                        @"2. Pick 4 Corners", @"3. Vector Line", @"4. Edit Mesh"];
+    // HIG: noun labels, equal segment widths. Workflow order is kept (and
+    // each tool has a Command-1...6 shortcut in the Tool menu).
+    NSArray* labels = @[@"Boundary", @"Foreground", @"Background", @"Corners", @"Vector Line", @"Edit Mesh"];
     for (NSUInteger i = 0; i < labels.count; ++i) {
         [self.toolSegmented setLabel:labels[i] forSegment:i];
-        [self.toolSegmented setWidth:0 forSegment:i];  // 0 = fit the label
+        [self.toolSegmented setWidth:96 forSegment:i];
     }
+    NSArray* toolTips = @[@"Click points around the object; double-click to close the boundary",
+                          @"Paint over the object to keep", @"Paint over the background to remove",
+                          @"Click the four mesh corners in order", @"Draw a line the mesh edges should follow",
+                          @"Adjust mesh vertices by hand"];
+    for (NSUInteger i = 0; i < toolTips.count; ++i) [self.toolSegmented setToolTip:toolTips[i] forSegment:i];
     self.toolSegmented.target = self;
     self.toolSegmented.action = @selector(toolChanged:);
 
     NSButton* clearLineBtn = [self buttonTitled:@"Clear Last Line" action:@selector(clearLastLine:)];
 
-    GMTip(@"Load an image to vectorize.", @[openBtn]);
-    GMTip(@"Fit a mesh to the whole image without any boundary or corner markup.", @[autoBtn]);
-    GMTip(@"Active tool. 1: trace the region boundary, or scribble foreground/background and press Segment; "
-          "2: pick the 4 mesh corners; 3: draw vector lines the mesh must follow; 4: edit the mesh.", @[self.toolSegmented]);
-    GMTip(@"Remove the most recently drawn vector line.", @[clearLineBtn]);
+    GMTip(@"Fit a mesh to the whole image, no markup needed", @[autoBtn]);
+    GMTip(@"Remove the most recent vector line", @[clearLineBtn]);
     // Row 1 became the window toolbar -- see -buildToolbar (called below, once Build/Optimize/Animate exist).
 
     // --- Row 1b: Lazy-Snapping-style segmentation (scribble tools above) ---
     NSButton* segmentBtn = [self buttonTitled:@"Segment" action:@selector(segmentBoundary:)];
     NSButton* clearScribblesBtn = [self buttonTitled:@"Clear Scribbles" action:@selector(clearScribbles:)];
-    NSTextField* scribbleHintLabel = [self makeLabel:@"(scribble foreground/background above, then Segment)"];
-    GMTip(@"Cut out the region marked by the foreground/background scribbles (Lazy Snapping).", @[segmentBtn]);
-    GMTip(@"Discard all foreground and background scribbles.", @[clearScribblesBtn]);
-    for (NSView* v in @[segmentBtn, clearScribblesBtn, clearLineBtn, scribbleHintLabel]) [controlsRow1b addSubview:v];
+    GMTip(@"Cut out the marked region (Lazy Snapping)", @[segmentBtn]);
+    GMTip(@"Discard all foreground and background marks", @[clearScribblesBtn]);
+    self.scribbleOverlay = [self overlayWithButtons:@[segmentBtn, clearScribblesBtn]];
+    self.vectorLineOverlay = [self overlayWithButtons:@[clearLineBtn]];
 
     // --- Row 2: mesh + optimize + export ---
     NSTextField* rowsLabel = [self makeLabel:@"Rows:"];
@@ -208,29 +233,23 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.tangentsCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.livePreviewCheckbox = [NSButton checkboxWithTitle:@"Live mesh preview" target:self action:@selector(toggleLivePreview:)];
     self.livePreviewCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
-    self.exportPNGButton = [self buttonTitled:@"Export PNG…" action:@selector(exportPNG:)];
-    self.exportSVGButton = [self buttonTitled:@"Export SVG…" action:@selector(exportSVG:)];
-    self.exportGPUPNGButton = [self buttonTitled:@"Export GPU PNG…" action:@selector(exportGPUPNG:)];
     self.progressSpinner = [[NSProgressIndicator alloc] init];
     self.progressSpinner.translatesAutoresizingMaskIntoConstraints = NO;
     self.progressSpinner.style = NSProgressIndicatorStyleSpinning;
     self.progressSpinner.controlSize = NSControlSizeSmall;
     self.progressSpinner.displayedWhenStopped = NO;
-    self.statusLabel = [self makeLabel:@"Open an image to begin."];
+    self.statusLabel = [self makeLabel:@"Open an image to begin (File ▸ Open Image…, ⌘O)."];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
-    GMTip(@"Number of mesh rows. Takes effect on the next Build Initial Mesh.", @[rowsLabel, self.rowsField]);
-    GMTip(@"Number of mesh columns. Takes effect on the next Build Initial Mesh.", @[colsLabel, self.colsField]);
-    GMTip(@"Build the initial mesh from the corners and boundary, before optimization.", @[self.buildMeshButton]);
-    GMTip(@"Fit the mesh to the image (optimizer, Sec. 4 of the paper) using the solver and weights below.", @[self.optimizeButton]);
-    GMTip(@"Draw the image reconstructed from the mesh instead of the original.", @[self.previewCheckbox]);
-    GMTip(@"Render the reconstruction on the GPU with OpenGL instead of the CPU. Only used while Show reconstruction is on.", @[self.gpuPreviewCheckbox]);
-    GMTip(@"Overlay the mesh grid on the canvas.", @[self.meshCheckbox]);
-    GMTip(@"Overlay the tangent handles of the mesh vertices.", @[self.tangentsCheckbox]);
-    GMTip(@"Redraw the in-progress mesh while Optimize runs. Costs one small mesh copy and a redraw per outer iteration.", @[self.livePreviewCheckbox]);
-    GMTip(@"Export the reconstruction rendered on the CPU as a PNG.", @[self.exportPNGButton]);
-    GMTip(@"Export the mesh as an SVG gradient mesh.", @[self.exportSVGButton]);
-    GMTip(@"Export the reconstruction rendered on the GPU as a PNG.", @[self.exportGPUPNGButton]);
+    GMTip(@"Mesh rows; applied at the next build", @[rowsLabel, self.rowsField]);
+    GMTip(@"Mesh columns; applied at the next build", @[colsLabel, self.colsField]);
+    GMTip(@"Create the initial mesh from the boundary and corners", @[self.buildMeshButton]);
+    GMTip(@"Fit the mesh to the image using the settings in the inspector", @[self.optimizeButton]);
+    GMTip(@"Draw the mesh reconstruction instead of the original image", @[self.previewCheckbox]);
+    GMTip(@"Render the reconstruction with OpenGL; needs reconstruction on", @[self.gpuPreviewCheckbox]);
+    GMTip(@"Overlay the mesh grid", @[self.meshCheckbox]);
+    GMTip(@"Overlay vertex tangent handles", @[self.tangentsCheckbox]);
+    GMTip(@"Redraw the mesh while optimizing; slightly slower", @[self.livePreviewCheckbox]);
 
     // --- Row 3: solver picker (hand-rolled vs Ceres geometry-only vs Ceres joint) ---
     NSTextField* solverLabel = [self makeLabel:@"Solver:"];
@@ -268,10 +287,10 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.ceresMultithreadedCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
     self.ceresMultithreadedCheckbox.state = NSControlStateValueOn;
 
-    GMTip(@"Optimizer: Hand-rolled (built in), Ceres (geometry) or Ceres (joint). The Ceres modes need a build with Ceres found; otherwise they do nothing and print a console warning.", @[solverLabel, self.solverPopup]);
-    GMTip(@"After each Optimize run, write a timestamped JSON with the run's debug data into a DebugOut folder next to the loaded image.", @[self.autoDebugCheckbox]);
-    GMTip(@"Build and fit the mesh in CIELUV instead of sRGB. Takes effect on the next Build Initial Mesh.", @[self.cieluvCheckbox]);
-    GMTip(@"Let the Ceres solvers use every CPU core. No effect on the hand-rolled solver.", @[self.ceresMultithreadedCheckbox]);
+    GMTip(@"Optimizer backend; Ceres modes need a Ceres build", @[solverLabel, self.solverPopup]);
+    GMTip(@"Write debug JSON next to the image after each run", @[self.autoDebugCheckbox]);
+    GMTip(@"Fit in CIELUV instead of sRGB; applied at the next build", @[self.cieluvCheckbox]);
+    GMTip(@"Use all CPU cores; Ceres solvers only", @[self.ceresMultithreadedCheckbox]);
 
     // --- Row 4: geometry energy weights -- see DocumentModel.h's comment
     // on these properties (mirrors gmcore::OptimizerOptions, MeshOptimizer.h
@@ -313,13 +332,13 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.vectorLineWeightField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.vectorLineWeight]];
 
-    GMTip(@"Weights of the geometry optimization step. A typed value takes effect on the next Optimize.", @[geomWeightsLabel]);
-    GMTip(@"Smoothness of the mesh geometry. Higher gives a smoother, less image-following mesh.", @[smoothGeomLabel, self.smoothWeightGeomField]);
-    GMTip(@"Multiplier of the geometry step's photometric (image-fit) term against the other weights. 1 = default.", @[geomDataLabel, self.geomDataWeightField]);
-    GMTip(@"Makes Smooth anisotropic: relaxes it near strong image edges so the mesh snaps to them tighter. 0 = isotropic; 40 = default.", @[edgeGainLabel, self.smoothGeomEdgeGainField]);
-    GMTip(@"Weight keeping boundary vertices on their boundary curve.", @[boundaryLabel, self.boundaryWeightField]);
-    GMTip(@"Weight of the prior on the tangent handles (Pu, Pv) in the geometry step.", @[tangentPriorLabel, self.geomTangentPriorWeightField]);
-    GMTip(@"Weight pulling the mesh edges onto the vector lines drawn with tool 3.", @[vectorLineLabel, self.vectorLineWeightField]);
+    GMTip(@"Geometry-step weights; applied at the next Optimize", @[geomWeightsLabel]);
+    GMTip(@"Mesh smoothness; higher is smoother, less image-following", @[smoothGeomLabel, self.smoothWeightGeomField]);
+    GMTip(@"Weight of the image-fit term in the geometry step; 1 = default", @[geomDataLabel, self.geomDataWeightField]);
+    GMTip(@"Relax smoothing near strong edges; 0 = off, 40 = default", @[edgeGainLabel, self.smoothGeomEdgeGainField]);
+    GMTip(@"Hold boundary vertices on their curve", @[boundaryLabel, self.boundaryWeightField]);
+    GMTip(@"Prior on the tangent handles", @[tangentPriorLabel, self.geomTangentPriorWeightField]);
+    GMTip(@"Pull mesh edges onto drawn vector lines", @[vectorLineLabel, self.vectorLineWeightField]);
 
     // --- Row 5: colour energy weights, + a shared reset for all eight ---
     NSTextField* colorWeightsLabel = [self makeLabel:@"Color weights —"];
@@ -331,10 +350,10 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
         [NSString stringWithFormat:@"%g", self.documentModel.colorDerivRidge]];
     NSButton* resetWeightsBtn = [self buttonTitled:@"Reset weights to defaults" action:@selector(resetWeights:)];
 
-    GMTip(@"Weights of the color optimization step. A typed value takes effect on the next Optimize.", @[colorWeightsLabel]);
-    GMTip(@"Smoothness of the vertex colors across the mesh.", @[smoothColorLabel, self.smoothWeightColorField]);
-    GMTip(@"Ridge regularization on the color derivatives (Cu, Cv, Cuv).", @[colorRidgeLabel, self.colorDerivRidgeField]);
-    GMTip(@"Restore all eight geometry and color weights to the compiled-in defaults.", @[resetWeightsBtn]);
+    GMTip(@"Color-step weights; applied at the next Optimize", @[colorWeightsLabel]);
+    GMTip(@"Color smoothness across the mesh", @[smoothColorLabel, self.smoothWeightColorField]);
+    GMTip(@"Regularize color derivatives", @[colorRidgeLabel, self.colorDerivRidgeField]);
+    GMTip(@"Restore all eight weights to their defaults", @[resetWeightsBtn]);
 
     // --- Row 6: "Animate Mesh" -- a purely cosmetic, non-destructive
     // real-time wiggle of the current mesh's vertex positions, entirely
@@ -347,6 +366,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.animAmplitudeField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationMaxAmplitude]];
     NSTextField* animTemperatureLabel = [self makeLabel:@"Temperature:"];
+    self.animTemperatureLabel = animTemperatureLabel;
     self.animTemperatureField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationTemperature]];
     // Minimum required separation (px) between two DIFFERENT mesh edges'
@@ -357,32 +377,38 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.animClearanceField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationMinClearanceDistance]];
 
-    GMTip(@"Start or stop a cosmetic wiggle of the fitted mesh. The mesh itself is not modified. The fields on this row and the next are read when you start it.", @[self.animateMeshButton]);
-    GMTip(@"Maximum vertex displacement, in image pixels. 0 keeps every vertex in place.", @[animAmplitudeLabel, self.animAmplitudeField]);
-    GMTip(@"Jitter only. Low = calm (few vertices move much); high = chaotic (nearly all swing close to full amplitude). Must be > 0.", @[animTemperatureLabel, self.animTemperatureField]);
-    GMTip(@"Minimum distance, in pixels, kept between two different mesh edges. 0 checks only for literal crossings.", @[animClearanceLabel, self.animClearanceField]);
+    GMTip(@"Start or stop the cosmetic mesh wiggle; settings apply at start", @[self.animateMeshButton]);
+    GMTip(@"Maximum vertex displacement, in pixels", @[animAmplitudeLabel, self.animAmplitudeField]);
+    GMTip(@"Jitter only; low = calm, high = chaotic", @[animTemperatureLabel, self.animTemperatureField]);
+    GMTip(@"Minimum pixel gap between mesh edges; 0 checks crossings only", @[animClearanceLabel, self.animClearanceField]);
 
     // --- Row 7: animation STYLE (Jitter/Wave/Breathing/Squash & Stretch)
     // -- see GMMeshAnimationStyle in DocumentModel.h. A plain (pullsDown:
-    // NO) popup, same pattern as self.solverPopup above: no target/action
-    // wired up, since -- like every other field on this row -- it's only
-    // ever read at "Animate Mesh" press time (-toggleAnimateMesh:), not
-    // live. Item order matches the enum's raw values exactly.
+    // NO) popup, same pattern as self.solverPopup above. Its VALUE is, like
+    // every other field on this row, only read at "Animate Mesh" press time
+    // (-toggleAnimateMesh:), not live; the action below merely greys out the
+    // fields the chosen style ignores. Item order matches the enum's raw
+    // values exactly.
     NSTextField* animStyleLabel = [self makeLabel:@"Style:"];
     self.animStylePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     self.animStylePopup.translatesAutoresizingMaskIntoConstraints = NO;
     [self.animStylePopup addItemsWithTitles:@[@"Jitter", @"Wave", @"Breathing", @"Squash & Stretch"]];
     [self.animStylePopup selectItemAtIndex:(NSInteger)self.documentModel.meshAnimationStyle];
+    // Only to grey out the fields the chosen style ignores; the style itself
+    // is still read at "Animate Mesh" press time (-toggleAnimateMesh:).
+    self.animStylePopup.target = self;
+    self.animStylePopup.action = @selector(animStyleChanged:);
     // Direction only matters for Wave -- see
     // meshAnimationWaveDirectionDegrees's doc comment in DocumentModel.h
     // for the 0/90-degree convention and why there's no separate
     // wavelength control.
     NSTextField* animDirectionLabel = [self makeLabel:@"Direction, °:"];
+    self.animDirectionLabel = animDirectionLabel;
     self.animDirectionField = [self makeWeightFieldWithValue:
         [NSString stringWithFormat:@"%g", self.documentModel.meshAnimationWaveDirectionDegrees]];
 
-    GMTip(@"Animation style: Jitter, Wave, Breathing or Squash & Stretch.", @[animStyleLabel, self.animStylePopup]);
-    GMTip(@"Wave only. Direction the ripple travels, in degrees: 0 = left to right, 90 = +Y.", @[animDirectionLabel, self.animDirectionField]);
+    GMTip(@"Wiggle style", @[animStyleLabel, self.animStylePopup]);
+    GMTip(@"Wave only; ripple direction in degrees, 0 = left to right", @[animDirectionLabel, self.animDirectionField]);
 
     // --- Row 7b: debug-only "disable continuous stages" checkbox -- see
     // DocumentModel.h's meshAnimationDebugDisableContinuousStages doc
@@ -398,7 +424,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.animDisableContinuousCheckbox.state = self.documentModel.meshAnimationDebugDisableContinuousStages
         ? NSControlStateValueOn : NSControlStateValueOff;
 
-    GMTip(@"Debug. Isolates whether unevenness comes from the plain self-intersection guard or from damping/smoothing. Skips the continuous damping and the temporal smoothing, leaving only the exact self-intersection check.", @[self.animDisableContinuousCheckbox]);
+    GMTip(@"Skip damping and smoothing; keep only the self-intersection check", @[self.animDisableContinuousCheckbox]);
 
     self.canvasView = [[CanvasView alloc] initWithFrame:NSZeroRect];
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -421,7 +447,6 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     // to the current image -- its items are rebuilt from
     // -availablePresetNames right before it opens (see -menuNeedsUpdate:),
     // so a preset saved a moment ago always shows up without relaunching.
-    self.savePresetButton = [self buttonTitled:@"Save Preset…" action:@selector(savePreset:)];
     self.presetsPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:YES];
     self.presetsPopup.translatesAutoresizingMaskIntoConstraints = NO;
     [self.presetsPopup addItemWithTitle:@"Load Preset…"];
@@ -429,8 +454,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.presetsPopup.action = @selector(presetSelected:);
     self.presetsPopup.menu.delegate = self;
 
-    GMTip(@"Save the settings of the last completed Optimize run to a timestamped JSON in a Presets folder next to the loaded image.", @[self.savePresetButton]);
-    GMTip(@"Load a preset saved next to the current image, newest first.", @[self.presetsPopup]);
+    GMTip(@"Load a preset saved next to this image", @[self.presetsPopup]);
     // --- Inspector (right-hand panel): collapsible sections, in the order
     // the work goes -- mesh, optimize, view, animate, presets, export.
     // Replaces the old stack of seven control rows and the preset sidebar.
@@ -460,35 +484,41 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     NSGridView* animGrid = [self gridWithLabels:@[animStyleLabel, animAmplitudeLabel, animTemperatureLabel, animClearanceLabel, animDirectionLabel]
                                          fields:@[self.animStylePopup, self.animAmplitudeField, self.animTemperatureField,
                                                   self.animClearanceField, self.animDirectionField]];
-    NSView* animAdvanced = [self sectionTitled:@"Advanced" expanded:NO nested:YES content:@[self.animDisableContinuousCheckbox]];
+    NSView* animAdvanced = [self sectionTitled:@"Debug Options" expanded:NO nested:YES content:@[self.animDisableContinuousCheckbox]];
     NSView* animateSection = [self sectionTitled:@"Animate" expanded:YES nested:NO content:@[
         animGrid, animAdvanced]];
-    NSView* presetsSection = [self sectionTitled:@"Presets" expanded:YES nested:NO content:@[
-        self.savePresetButton, self.presetsPopup]];
-    NSView* exportSection = [self sectionTitled:@"Export" expanded:YES nested:NO content:@[
-        self.exportPNGButton, self.exportSVGButton, self.exportGPUPNGButton]];
+    NSView* presetsSection = [self sectionTitled:@"Presets" expanded:YES nested:NO content:@[self.presetsPopup]];
 
     NSStackView* inspector = [NSStackView stackViewWithViews:@[meshSection, optimizeSection, viewSection,
-                                                               animateSection, presetsSection, exportSection]];
+                                                               animateSection, presetsSection]];
     inspector.orientation = NSUserInterfaceLayoutOrientationVertical;
     inspector.alignment = NSLayoutAttributeLeading;
     inspector.spacing = 14;
     inspector.edgeInsets = NSEdgeInsetsMake(10, 10, 10, 10);
     inspector.translatesAutoresizingMaskIntoConstraints = NO;
-    for (NSView* section in inspector.arrangedSubviews)
-        [section.widthAnchor constraintEqualToAnchor:inspector.widthAnchor constant:-20].active = YES;
+    for (NSView* section in inspector.arrangedSubviews) {
+        NSLayoutConstraint* w = [section.widthAnchor constraintEqualToAnchor:inspector.widthAnchor constant:-20];
+        w.priority = 999;  // lets the inspector collapse to zero width without a constraint conflict
+        w.active = YES;
+    }
 
     NSScrollView* inspectorScroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
     inspectorScroll.translatesAutoresizingMaskIntoConstraints = NO;
     inspectorScroll.hasVerticalScroller = YES;
     inspectorScroll.drawsBackground = NO;
-    inspectorScroll.documentView = inspector;
-    // Pin the document view to the clip view's top/sides so a short
-    // inspector sits at the top instead of the bottom (stack views are not
-    // flipped); its height stays intrinsic and scrolls when taller.
-    [inspector.topAnchor constraintEqualToAnchor:inspectorScroll.contentView.topAnchor].active = YES;
-    [inspector.leadingAnchor constraintEqualToAnchor:inspectorScroll.contentView.leadingAnchor].active = YES;
-    [inspector.trailingAnchor constraintEqualToAnchor:inspectorScroll.contentView.trailingAnchor].active = YES;
+    GMFlippedView* inspectorDoc = [[GMFlippedView alloc] initWithFrame:NSZeroRect];
+    inspectorDoc.translatesAutoresizingMaskIntoConstraints = NO;
+    [inspectorDoc addSubview:inspector];
+    inspectorScroll.documentView = inspectorDoc;
+    // The document follows the clip view's top and width; its height is the
+    // inspector's own, so it scrolls when taller than the window.
+    [inspectorDoc.topAnchor constraintEqualToAnchor:inspectorScroll.contentView.topAnchor].active = YES;
+    [inspectorDoc.leadingAnchor constraintEqualToAnchor:inspectorScroll.contentView.leadingAnchor].active = YES;
+    [inspectorDoc.trailingAnchor constraintEqualToAnchor:inspectorScroll.contentView.trailingAnchor].active = YES;
+    [inspector.topAnchor constraintEqualToAnchor:inspectorDoc.topAnchor].active = YES;
+    [inspector.bottomAnchor constraintEqualToAnchor:inspectorDoc.bottomAnchor].active = YES;
+    [inspector.leadingAnchor constraintEqualToAnchor:inspectorDoc.leadingAnchor].active = YES;
+    [inspector.trailingAnchor constraintEqualToAnchor:inspectorDoc.trailingAnchor].active = YES;
 
     // canvasRow: canvasView + inspector side by side, replacing
     // canvasView's old direct placement in the outer vertical stack below
@@ -500,6 +530,11 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     [canvasRow addSubview:self.canvasView];
     [canvasRow addSubview:self.glReconstructionView];
     [canvasRow addSubview:inspectorScroll];
+    for (NSView* overlay in @[self.scribbleOverlay, self.vectorLineOverlay]) {
+        [canvasRow addSubview:overlay];  // after canvasView / glReconstructionView, so drawn above them
+        [overlay.topAnchor constraintEqualToAnchor:self.canvasView.topAnchor constant:10].active = YES;
+        [overlay.leadingAnchor constraintEqualToAnchor:self.canvasView.leadingAnchor constant:10].active = YES;
+    }
     // glReconstructionView exactly overlays canvasView (not part of the
     // visual-format layout below, which only positions _canvasView/
     // presetSidebar within canvasRow) -- see -refreshActivePreview for how
@@ -509,38 +544,34 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     [self.glReconstructionView.topAnchor constraintEqualToAnchor:self.canvasView.topAnchor].active = YES;
     [self.glReconstructionView.bottomAnchor constraintEqualToAnchor:self.canvasView.bottomAnchor].active = YES;
     NSDictionary* canvasRowViews = NSDictionaryOfVariableBindings(_canvasView, inspectorScroll);
-    [canvasRow addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-8-[inspectorScroll(320)]-0-|"
+    [canvasRow addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[_canvasView]-0-[inspectorScroll]-0-|"
                                                                        options:0 metrics:nil views:canvasRowViews]];
+    self.inspectorScrollView = inspectorScroll;
+    self.inspectorWidthConstraint = [inspectorScroll.widthAnchor constraintEqualToConstant:320];
+    self.inspectorWidthConstraint.active = YES;
     [self.canvasView.topAnchor constraintEqualToAnchor:canvasRow.topAnchor].active = YES;
     [self.canvasView.bottomAnchor constraintEqualToAnchor:canvasRow.bottomAnchor].active = YES;
     [inspectorScroll.topAnchor constraintEqualToAnchor:canvasRow.topAnchor].active = YES;
     [inspectorScroll.bottomAnchor constraintEqualToAnchor:canvasRow.bottomAnchor].active = YES;
 
-    [content addSubview:controlsRow1b];
     [content addSubview:canvasRow];
     [content addSubview:self.statusLabel];
 
-    NSDictionary* views = NSDictionaryOfVariableBindings(controlsRow1b, canvasRow, _statusLabel);
-    [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[controlsRow1b]-8-|" options:0 metrics:nil views:views]];
+    NSDictionary* views = NSDictionaryOfVariableBindings(canvasRow, _statusLabel);
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-0-[canvasRow]-0-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:@"H:|-8-[_statusLabel]-8-|" options:0 metrics:nil views:views]];
     [content addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
-        @"V:|-8-[controlsRow1b(28)]-6-[canvasRow]-4-[_statusLabel(18)]-6-|"
+        @"V:|-0-[canvasRow]-4-[_statusLabel(18)]-6-|"
                                                                     options:0 metrics:nil views:views]];
 
-    [self layoutRowChildren:controlsRow1b];
     self.toolbarViews = @{
-        @"open": openBtn, @"auto": autoBtn, @"tools": self.toolSegmented,
+        @"auto": autoBtn, @"tools": self.toolSegmented,
         @"build": self.buildMeshButton, @"optimize": self.optimizeButton, @"spinner": self.progressSpinner,
         @"animate": self.animateMeshButton,
     };
     [self buildToolbar];
-}
-
-- (NSView*)makeRow {
-    NSView* v = [[NSView alloc] initWithFrame:NSZeroRect];
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    return v;
+    [self updateContextualControls];
+    [self updateAnimationFieldAvailability];
 }
 
 - (NSTextField*)makeLabel:(NSString*)text {
@@ -575,7 +606,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
 // "row 1" and the Mesh/Optimize/Animate buttons of the inspector. Order
 // follows the workflow: open, tool, then build / optimize / animate.
 - (NSArray<NSString*>*)toolbarIdentifiers {
-    return @[@"open", @"auto", @"tools", NSToolbarFlexibleSpaceItemIdentifier,
+    return @[@"auto", @"tools", NSToolbarFlexibleSpaceItemIdentifier,
              @"build", @"optimize", @"spinner", @"animate"];
 }
 
@@ -596,10 +627,117 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     if (!view) return nil;
     NSToolbarItem* item = [[NSToolbarItem alloc] initWithItemIdentifier:identifier];
     item.view = view;
-    NSDictionary* names = @{@"open": @"Open Image", @"auto": @"Auto Mesh", @"tools": @"Tool", @"build": @"Build Initial Mesh",
+    NSDictionary* names = @{@"auto": @"Auto Mesh", @"tools": @"Tool", @"build": @"Build Initial Mesh",
                             @"optimize": @"Optimize", @"spinner": @"Progress", @"animate": @"Animate Mesh"};
     item.label = names[identifier] ?: identifier;
     return item;
+}
+
+// A small HUD-style bar holding tool-specific buttons, floated over the
+// canvas. Hidden until -updateContextualControls shows it.
+- (NSView*)overlayWithButtons:(NSArray<NSView*>*)buttons {
+    NSVisualEffectView* bar = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    bar.material = NSVisualEffectMaterialHUDWindow;
+    bar.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    bar.state = NSVisualEffectStateActive;
+    bar.wantsLayer = YES;
+    bar.layer.cornerRadius = 8;
+    bar.layer.masksToBounds = YES;
+    NSStackView* row = [self hStack:buttons];
+    row.edgeInsets = NSEdgeInsetsMake(6, 8, 6, 8);
+    [bar addSubview:row];
+    [row.topAnchor constraintEqualToAnchor:bar.topAnchor].active = YES;
+    [row.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor].active = YES;
+    [row.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor].active = YES;
+    [row.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor].active = YES;
+    bar.hidden = YES;
+    return bar;
+}
+
+// Show only the canvas overlay that belongs to the selected tool:
+// Segment / Clear Scribbles for the two scribble tools (segments 1, 2),
+// Clear Last Line for Vector Line (segment 4).
+- (void)updateContextualControls {
+    NSInteger tool = self.toolSegmented.selectedSegment;
+    self.scribbleOverlay.hidden = !(tool == 1 || tool == 2);
+    self.vectorLineOverlay.hidden = (tool != 4);
+}
+
+// Temperature is used by Jitter only and Direction by Wave only (see
+// DocumentModel.h); grey out whichever the selected style ignores instead
+// of explaining it in a hint label. The values stay in the fields.
+- (void)updateAnimationFieldAvailability {
+    NSInteger style = self.animStylePopup.indexOfSelectedItem;
+    BOOL jitter = (style == GMMeshAnimationStyleJitter);
+    BOOL wave = (style == GMMeshAnimationStyleWave);
+    self.animTemperatureField.enabled = jitter;
+    self.animTemperatureLabel.textColor = jitter ? [NSColor labelColor] : [NSColor disabledControlTextColor];
+    self.animDirectionField.enabled = wave;
+    self.animDirectionLabel.textColor = wave ? [NSColor labelColor] : [NSColor disabledControlTextColor];
+}
+
+- (void)animStyleChanged:(id)sender {
+    [self updateAnimationFieldAvailability];
+}
+
+#pragma mark - Menu support
+
+// Tool menu items: tag = segment index (see -buildUI).
+- (void)selectTool:(NSMenuItem*)sender {
+    self.toolSegmented.selectedSegment = sender.tag;
+    [self toolChanged:self.toolSegmented];
+}
+
+- (void)toggleInspector:(id)sender {
+    BOOL hide = !self.inspectorScrollView.hidden;
+    self.inspectorScrollView.hidden = hide;
+    self.inspectorWidthConstraint.constant = hide ? 0 : 320;
+}
+
+- (NSButton*)viewOptionCheckboxForTag:(NSInteger)tag {
+    switch (tag) {
+        case 1: return self.previewCheckbox;
+        case 2: return self.gpuPreviewCheckbox;
+        case 3: return self.meshCheckbox;
+        case 4: return self.tangentsCheckbox;
+        case 5: return self.livePreviewCheckbox;
+    }
+    return nil;
+}
+
+// View-menu toggles drive the inspector's checkboxes, so the checkbox, its
+// action and the menu checkmark can never disagree.
+- (void)toggleViewOption:(NSMenuItem*)sender {
+    [[self viewOptionCheckboxForTag:sender.tag] performClick:nil];
+}
+
+// Enable/disable and check menu items from the live UI state (HIG: keep every
+// item visible, disable what does not apply, show toggle state).
+- (BOOL)validateMenuItem:(NSMenuItem*)item {
+    SEL a = item.action;
+    NSInteger tool = self.toolSegmented.selectedSegment;
+    if (a == @selector(selectTool:)) {
+        item.state = (tool == item.tag) ? NSControlStateValueOn : NSControlStateValueOff;
+        return YES;
+    }
+    if (a == @selector(segmentBoundary:) || a == @selector(clearScribbles:)) return tool == 1 || tool == 2;
+    if (a == @selector(clearLastLine:)) return tool == 4;
+    if (a == @selector(toggleViewOption:)) {
+        item.state = [self viewOptionCheckboxForTag:item.tag].state;
+        return item.tag != 2 || self.previewCheckbox.state == NSControlStateValueOn;  // GPU needs reconstruction on
+    }
+    if (a == @selector(toggleInspector:)) {
+        item.title = self.inspectorScrollView.hidden ? @"Show Inspector" : @"Hide Inspector";
+        return YES;
+    }
+    if (a == @selector(toggleAnimateMesh:)) {
+        item.title = self.documentModel.isAnimatingMesh ? @"Stop Animation" : @"Animate Mesh";
+        return self.animateMeshButton.enabled;
+    }
+    if (a == @selector(buildMesh:)) return self.buildMeshButton.enabled;
+    if (a == @selector(optimize:)) return self.optimizeButton.enabled;
+    return YES;
 }
 
 // Horizontal row of controls for the inspector.
@@ -663,21 +801,6 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     self.sectionBodies[(NSUInteger)sender.tag].hidden = (sender.state != NSControlStateValueOn);
 }
 
-// Lays out a row's children left-to-right with simple fixed spacing using
-// their own leading/trailing/centerY anchors against the row view.
-- (void)layoutRowChildren:(NSView*)row {
-    NSView* prev = nil;
-    for (NSView* v in row.subviews) {
-        [v.centerYAnchor constraintEqualToAnchor:row.centerYAnchor].active = YES;
-        if (prev) {
-            [v.leadingAnchor constraintEqualToAnchor:prev.trailingAnchor constant:10].active = YES;
-        } else {
-            [v.leadingAnchor constraintEqualToAnchor:row.leadingAnchor].active = YES;
-        }
-        prev = v;
-    }
-}
-
 #pragma mark - Canvas callbacks
 
 - (void)wireCanvasCallbacks {
@@ -694,7 +817,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
         // ran by the time this callback fires.
         [weakSelf.canvasView resetBoundaryDrawing];
         [weakSelf.canvasView resetCornerPicking];
-        weakSelf.statusLabel.stringValue = @"Boundary traced. Switch to “Pick 4 Corners” and click the 4 corner points (in order).";
+        weakSelf.statusLabel.stringValue = @"Boundary traced. Switch to the “Corners” tool and click the 4 corner points (in order).";
         [weakSelf.canvasView setNeedsDisplay:YES];
     };
     self.canvasView.onCornersPicked = ^(NSArray<NSNumber*>* indices) {
@@ -742,7 +865,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
         // A new image drops the old mesh, which -loadImageAtURL:error:
         // already stops any running animation of (see DocumentModel.mm's
         // -stopMeshAnimation callers) -- reset this button's own title/
-        // enabled state to match, since "Open Image…" isn't disabled while
+        // enabled state to match, since File > Open Image… isn't disabled while
         // animating the way Optimize/Build Mesh are (see -toggleAnimateMesh:).
         weakSelf.animateMeshButton.title = @"Animate Mesh";
         weakSelf.animateMeshButton.enabled = YES;
@@ -756,7 +879,10 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
         weakSelf.glReconstructionView.hidden = YES;
         weakSelf.canvasView.toolMode = GMToolModeBoundary;
         [weakSelf.toolSegmented setSelected:YES forSegment:0];
-        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Loaded %ld×%ld image. Trace the object boundary (click points, double-click to close), or use “Auto (no markup)”.",
+        [weakSelf updateContextualControls];
+        weakSelf.window.title = panel.URL.lastPathComponent;
+        weakSelf.window.representedURL = panel.URL;
+        weakSelf.statusLabel.stringValue = [NSString stringWithFormat:@"Loaded %ld×%ld image. Trace the object boundary (click points, double-click to close), or use “Auto Mesh”.",
                                              (long)weakSelf.documentModel.imageWidth, (long)weakSelf.documentModel.imageHeight];
         [weakSelf.canvasView setNeedsDisplay:YES];
     }];
@@ -771,6 +897,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
         case 4: self.canvasView.toolMode = GMToolModeVectorLine; break;
         case 5: self.canvasView.toolMode = GMToolModeEditMesh; break;
     }
+    [self updateContextualControls];
 }
 
 - (void)clearLastLine:(id)sender {
@@ -794,7 +921,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     // inside -setBoundaryPolygonPoints: itself.
     [self.canvasView resetBoundaryDrawing];
     [self.canvasView resetCornerPicking];
-    self.statusLabel.stringValue = @"Boundary segmented from scribbles. Switch to “Pick 4 Corners” and click the 4 corner points (in order).";
+    self.statusLabel.stringValue = @"Boundary segmented from scribbles. Switch to the “Corners” tool and click the 4 corner points (in order).";
     [self.canvasView setNeedsDisplay:YES];
 }
 
@@ -816,6 +943,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
     [self.toolSegmented setSelected:YES forSegment:5];
+    [self updateContextualControls];
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Auto rectangular boundary + %ldx%ld grid built. RMSE=%.4f  MAE=%.4f%@. Click Optimize.",
                                      (long)rows, (long)cols, self.documentModel.currentRMSE, self.documentModel.currentMAE,
                                      self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
@@ -828,6 +956,7 @@ static void GMTip(NSString* text, NSArray<NSView*>* views) {
     [self.documentModel buildInitialMeshRows:rows cols:cols];
     self.canvasView.toolMode = GMToolModeEditMesh;
     [self.toolSegmented setSelected:YES forSegment:5];
+    [self updateContextualControls];
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Initial %ldx%ld mesh built. RMSE=%.4f  MAE=%.4f%@. Optionally draw vector lines, then click Optimize.",
                                      (long)rows, (long)cols, self.documentModel.currentRMSE, self.documentModel.currentMAE,
                                      self.documentModel.meshColorSpaceIsCIELUV ? @" (CIELUV units)" : @""];
