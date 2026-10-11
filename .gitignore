@@ -6,3 +6,6 @@ xcuserdata/
 build_xcode/
 out/
 spike/ceres_joint_drift_probe_output.txt
+build_deps/
+build_release/
+build_baseline/

@@ -74,6 +74,11 @@ target_link_libraries(gmcore_tests PRIVATE gmcore)
 if(APPLE)
   file(GLOB GMSTUDIO_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/mac/*.mm)
   add_executable(GradientMeshStudio MACOSX_BUNDLE ${GMSTUDIO_SOURCES})
+  # BSD-3-Clause (this project) and the third-party licenses must travel with
+  # the binary: copy both into Contents/Resources.
+  set(GMSTUDIO_LEGAL ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md)
+  set_source_files_properties(${GMSTUDIO_LEGAL} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+  target_sources(GradientMeshStudio PRIVATE ${GMSTUDIO_LEGAL})
   target_link_libraries(GradientMeshStudio PRIVATE gmcore
     "-framework Cocoa" "-framework AppKit" "-framework QuartzCore" "-framework CoreGraphics" "-framework ImageIO" "-framework UniformTypeIdentifiers"
     "-framework OpenGL")  # GLReconstructionView.mm's NSOpenGLView/CGL-based GPU reconstruction preview (optional, toggleable -- see mac/GLReconstructionView.h)

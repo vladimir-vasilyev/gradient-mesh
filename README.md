@@ -11,7 +11,7 @@
 [![Platforms](https://img.shields.io/badge/core-Linux%20%7C%20macOS-lightgrey)](#how-to-build)
 [![App](https://img.shields.io/badge/app-macOS%2012%2B%20(AppKit)-black?logo=apple)](#build-the-macos-app)
 [![Tests](https://img.shields.io/badge/regression%20suite-gmcore__tests-brightgreen)](#testing)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: BSD 3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 **Contents:** [Features](#features) · [Demo](#demo) · [Dependencies](#dependencies) · [How to Build](#how-to-build) · [Usage](#usage) · [How it works](#how-it-works) · [Project layout](#project-layout) · [Testing](#testing) · [Known limitations](#known-limitations) · [FAQ](#faq) · [Citation](#citation) · [License](#license)
 
@@ -267,4 +267,4 @@ If you use the algorithm, cite the original paper:
 
 ## License
 
-Released under the [MIT License](LICENSE). The algorithm is from the paper cited above; the code in this repository is original.
+Released under the [BSD 3-Clause License](LICENSE). Third-party components (Ceres Solver, glog, gflags, Eigen, libpng) and their license texts are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The algorithm is from the paper cited above; the code in this repository is original.

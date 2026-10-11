@@ -23,6 +23,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Built from Sun, Liang, Wen, Shum, "Image Vectorization using Optimized Gradient Meshes" (ACM TOG 2007).</string>
+    <string>Copyright © 2026 Vladimir Vasilyev. BSD 3-Clause License. Built from Sun, Liang, Wen, Shum, "Image Vectorization using Optimized Gradient Meshes" (ACM TOG 2007). Third-party licenses: see THIRD_PARTY_NOTICES.md in the app's Resources.</string>
 </dict>
 </plist>

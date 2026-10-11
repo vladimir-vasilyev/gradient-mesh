@@ -137,6 +137,6 @@ remove an assumption; consider adding it.
   "Row 7b" in `MainWindowController.mm`, plus the `GM_ANIM_DISABLE_CONTINUOUS`/property plumbing in
   `DocumentModel`) were written without ever being compiled. Build with Xcode/CMake, fix any errors,
   and note that `window.minSize` (720×560) was not adjusted for the extra row — the user checks the layout.
-- Housekeeping done recently: README rewritten (old one is `docs/DEVELOPMENT_LOG.md`), MIT `LICENSE`
+- Housekeeping done recently: README rewritten (old one is `docs/DEVELOPMENT_LOG.md`), BSD-3-Clause `LICENSE` (relicensed from MIT) + `THIRD_PARTY_NOTICES.md`
   added, `.gitignore` extended. Still to do on GitHub by the user: repo description/topics and the
   social-preview image (`docs/media/social-preview.png`).
