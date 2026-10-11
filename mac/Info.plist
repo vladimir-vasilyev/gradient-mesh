@@ -3,7 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>${EXECUTABLE_NAME}</string>
+    <string>GradientMeshStudio</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.graphics-design</string>
     <key>CFBundleIdentifier</key>
     <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
     <key>CFBundleName</key>
@@ -19,7 +23,7 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>LSMinimumSystemVersion</key>
-    <string>${MACOSX_DEPLOYMENT_TARGET}</string>
+    <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
